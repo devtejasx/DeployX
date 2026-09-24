@@ -1,0 +1,82 @@
+# DeployX local development stack (Phase 1).
+#
+#   docker compose up --build      # everything
+#   docker compose up -d postgres redis   # infrastructure only
+#
+# Values come from .env when it exists; the defaults below match .env.example.
+
+name: deployx
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-deployx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deployx}
+      POSTGRES_DB: ${POSTGRES_DB:-deployx}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build: ./server
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 5000
+      CLIENT_URL: ${CLIENT_URL:-http://localhost:3000}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-deployx}:${POSTGRES_PASSWORD:-deployx}@postgres:5432/${POSTGRES_DB:-deployx}
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "${PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  client:
+    build: ./client
+    restart: unless-stopped
+    environment:
+      API_PROXY_TARGET: http://server:5000
+    ports:
+      - "3000:3000"
+    depends_on:
+      server:
+        condition: service_healthy
+
+  worker:
+    build: ./worker
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+
+volumes:
+  postgres-data:
+  redis-data:
