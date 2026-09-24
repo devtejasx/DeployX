@@ -14,6 +14,8 @@ const config = {
   env: process.env.NODE_ENV || 'development',
   port: Number(process.env.PORT) || 5000,
   clientUrl: process.env.CLIENT_URL || 'http://localhost:3000',
+  databaseUrl: process.env.DATABASE_URL || 'postgresql://deployx:deployx@localhost:5432/deployx',
+  redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
 };
 
 export default config;
