@@ -1,0 +1,21 @@
+{
+  "name": "deployx",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeployX - self-service deployment platform",
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install && npm --prefix worker install",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "dev:worker": "npm --prefix worker run dev",
+    "build:client": "npm --prefix client run build",
+    "infra:up": "docker compose up -d postgres redis",
+    "infra:down": "docker compose down",
+    "docker:up": "docker compose up --build",
+    "docker:down": "docker compose down"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "license": "MIT"
+}
