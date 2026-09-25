@@ -16,6 +16,11 @@ const config = {
   clientUrl: process.env.CLIENT_URL || 'http://localhost:3000',
   databaseUrl: process.env.DATABASE_URL || 'postgresql://deployx:deployx@localhost:5432/deployx',
   redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
+  // Temporary stand-in for authentication (see middleware/devUser.js).
+  devUser: {
+    email: (process.env.DEV_USER_EMAIL || 'dev@deployx.local').toLowerCase(),
+    name: process.env.DEV_USER_NAME || 'DeployX Developer',
+  },
 };
 
 export default config;
