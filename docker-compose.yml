@@ -59,6 +59,9 @@ services:
       CLIENT_URL: ${CLIENT_URL:-http://localhost:3000}
       DATABASE_URL: postgresql://${POSTGRES_USER:-deployx}:${POSTGRES_PASSWORD:-deployx}@postgres:5432/${POSTGRES_DB:-deployx}
       REDIS_URL: redis://redis:6379
+      QUEUE_PREFIX: ${QUEUE_PREFIX:-deployx}
+      DEPLOYMENT_JOB_ATTEMPTS: ${DEPLOYMENT_JOB_ATTEMPTS:-3}
+      DEPLOYMENT_JOB_BACKOFF_MS: ${DEPLOYMENT_JOB_BACKOFF_MS:-2000}
     ports:
       - "${PORT:-5000}:5000"
     depends_on:
@@ -90,6 +93,19 @@ services:
     restart: unless-stopped
     environment:
       NODE_ENV: ${NODE_ENV:-development}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-deployx}:${POSTGRES_PASSWORD:-deployx}@postgres:5432/${POSTGRES_DB:-deployx}
+      REDIS_URL: redis://redis:6379
+      QUEUE_PREFIX: ${QUEUE_PREFIX:-deployx}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      WORKER_SHUTDOWN_TIMEOUT_MS: ${WORKER_SHUTDOWN_TIMEOUT_MS:-25000}
+      SIMULATION_STEP_MS: ${SIMULATION_STEP_MS:-2000}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    # Give running jobs time to finish on `docker compose stop` (default is 10s).
+    stop_grace_period: 30s
 
 volumes:
   postgres-data:

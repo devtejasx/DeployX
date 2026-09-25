@@ -12,5 +12,10 @@
   "engines": {
     "node": ">=20.12"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "bullmq": "^6.3.8",
+    "ioredis": "^5.11.1",
+    "pg": "^8.23.0"
+  }
 }
