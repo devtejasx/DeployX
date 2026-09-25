@@ -2,7 +2,7 @@
 
 A self-service deployment platform: connect a GitHub repository, build it into a Docker image, deploy it, watch it run and roll back automatically when a release goes bad.
 
-> **Status: Phase 2 of 8. Database and REST API.** DeployX is being built one phase at a time. The platform now stores projects, deployments and deployment logs, but it doesn't build or deploy anything yet. A deployment is only a database record until later phases add the build pipeline.
+> **Status: Phase 3 of 8. Job queue and deployment worker.** DeployX is being built one phase at a time. Creating a deployment now queues a real background job (BullMQ on Redis), which a separate worker process picks up, retries and tracks in PostgreSQL. **The deployment work itself is still simulated.** The worker doesn't clone repositories, build images or start containers yet. That's Phase 4.
 
 ## Overview
 
@@ -23,6 +23,15 @@ A self-service deployment platform: connect a GitHub repository, build it into a
 - **Validation** for every request body and ID, and a single response format across the API
 - An **integration test suite** that runs against a real PostgreSQL database
 
+**Phase 3 (job queue and worker)**
+
+- A **BullMQ `deployments` queue** on the existing Redis
+- `POST /api/projects/:projectId/deployments` **queues a job** and returns immediately
+- A **worker** that processes jobs **2 at a time**, moving each deployment through its statuses and writing logs
+- **Retries** with exponential backoff (3 attempts), then a clean `FAILED`
+- **Duplicate protection** (job ID = deployment ID) and **graceful shutdown**
+- **End-to-end tests** covering the API, the queue, the worker and PostgreSQL
+
 ## Architecture
 
 ```text
@@ -34,23 +43,27 @@ A self-service deployment platform: connect a GitHub repository, build it into a
                 ┌──────────────────────────┐
                 │  server  (Express API)   │  :5000
                 │  routes → controllers →  │
-                │  services → db           │
+                │  services → db / queues  │
                 └──────┬────────────┬──────┘
-                       │            │
-                  SQL  │            │  PING
-                       ▼            ▼
-             ┌──────────────┐  ┌──────────┐
-             │  PostgreSQL  │  │  Redis   │
-             │    :5432     │  │  :6379   │
-             └──────▲───────┘  └──────────┘
+                       │            │ add job (BullMQ)
+                  SQL  │            ▼
+                       │       ┌──────────┐
+                       │       │  Redis   │  :6379   "deployments" queue
+                       │       └────┬─────┘
+                       │            │ next job (BullMQ, concurrency 2)
+                       │            ▼
+                       │  ┌──────────────────────────┐
+                       │  │  worker  (Node.js)       │  simulated pipeline
+                       │  └────────────┬─────────────┘
+                       ▼               │ status + logs (SQL)
+             ┌──────────────┐          │
+             │  PostgreSQL  │◀─────────┘
+             │    :5432     │
+             └──────▲───────┘
                     │ applies migrations, then exits
              ┌──────┴───────┐
              │   migrate    │  (one-shot job in Docker Compose)
              └──────────────┘
-
-                ┌──────────────────────────┐
-                │  worker  (Node.js)       │  starts and idles (jobs come in Phase 3)
-                └──────────────────────────┘
 ```
 
 The browser only talks to the client. The Vite dev server forwards `/api/*` requests to the API, so the frontend never contains a hard-coded backend URL.
@@ -64,6 +77,7 @@ Each API request passes through these layers:
 | Controllers | `controllers/` | translate HTTP ⇄ service calls, pick the status code |
 | Services | `services/` | business rules and parameterized SQL |
 | DB | `db/` | connection pool, Redis client, migrations |
+| Queues | `queues/` | BullMQ producer for deployment jobs |
 
 ## Tech Stack
 
@@ -74,9 +88,9 @@ Each API request passes through these layers:
 | Validation     | zod 4                                        |
 | Database       | PostgreSQL 17 (`pg` driver)                  |
 | Migrations     | node-pg-migrate 9 (plain SQL files)          |
-| Cache / queue  | Redis 7 (`redis` client)                     |
+| Cache / queue  | Redis 7, BullMQ 6, `ioredis` 5               |
 | Tests          | Node.js built-in test runner (`node:test`)   |
-| Worker         | Node.js (no dependencies yet)                |
+| Worker         | Node.js, BullMQ 6, `ioredis`, `pg`           |
 | Local infra    | Docker, Docker Compose                       |
 
 ## Database
@@ -178,6 +192,143 @@ docker compose run --rm migrate         # apply pending migrations
 
 `docker compose up` runs the `migrate` service automatically, and the API starts only after it has finished successfully.
 
+## Deployment Jobs (BullMQ)
+
+### Flow
+
+```text
+POST /api/projects/:projectId/deployments
+ │
+ ▼
+API ── 1. validate project (exists, ACTIVE)
+ │     2. INSERT deployment (status QUEUED) + log "Deployment created"
+ │     3. add job to BullMQ   (jobId = deployment ID)
+ │     4. respond 201 { deployment, jobId }       ← returns in ~20 ms
+ ▼
+BullMQ
+ │
+ ▼
+Redis  ── queue "deployments" (keys under QUEUE_PREFIX, default "deployx")
+ │
+ ▼
+Worker ── up to WORKER_CONCURRENCY jobs at a time (default 2)
+ │        QUEUED → BUILDING → DEPLOYING → SUCCESS      (simulated stages)
+ ▼
+PostgreSQL ── deployments.status / started_at / finished_at + deployment_logs
+```
+
+The API never does deployment work itself. It stores the record, queues the job and returns. The only coupling between the API and the worker is the queue (name `deployments`, job name `deploy`, and the shared `QUEUE_PREFIX`) plus the shared PostgreSQL tables.
+
+### Job payload
+
+```json
+{ "deploymentId": "69bb15c5-…", "projectId": "391710c4-…", "commitSha": "abc1234", "branch": "main" }
+```
+
+The payload contains identifiers only, no credentials. The worker reads everything else from PostgreSQL.
+
+### Job lifecycle
+
+A successful deployment writes these logs:
+
+```text
+10:58:14.784 INFO  Deployment created                                        ← API
+10:58:14.812 INFO  Deployment job started (attempt 1 of 3)                   ← worker
+10:58:14.818 INFO  Deployment is now building                                  status BUILDING, started_at set
+10:58:15.829 INFO  Build simulation completed (no image was built)
+10:58:15.834 INFO  Deployment is now deploying                                 status DEPLOYING
+10:58:16.850 INFO  Deployment simulation completed (no container was started)
+10:58:16.860 INFO  Deployment completed successfully                           status SUCCESS, finished_at set
+```
+
+`HEALTH_CHECK` is not used yet. It arrives with real health checks in Phase 6.
+
+> **Simulation.** [`deploymentProcessor.js`](worker/src/processors/deploymentProcessor.js) only waits `SIMULATION_STEP_MS` per stage. It doesn't run `git`, `docker` or anything on AWS. Phase 4 replaces the simulated stages with the real build and run pipeline.
+
+### Retries
+
+| Setting | Value | Configured by |
+| ------- | ----- | ------------- |
+| Attempts | 3 (first run included) | `DEPLOYMENT_JOB_ATTEMPTS` (API) |
+| Backoff | exponential: 2 s, then 4 s | `DEPLOYMENT_JOB_BACKOFF_MS` (API) |
+
+When an attempt fails:
+
+1. The worker logs `ERROR Attempt n of 3 failed: <reason>`.
+2. If attempts remain, the deployment goes back to **`QUEUED`** and gets `WARN Retrying in 2s (attempt 2 of 3)`. `started_at` keeps the time of the first attempt. BullMQ re-runs the job after the backoff.
+3. After the last attempt, the deployment becomes **`FAILED`** (with `finished_at`) and gets `ERROR Deployment failed after maximum retry attempts`. The BullMQ job ends in its `failed` state.
+
+Some errors can't be fixed by trying again, so they fail right away without retries. Examples: the deployment was deleted while the job ran, or the job has an unknown name.
+
+**Deterministic test failures (simulation only).** The deployment's branch decides:
+
+| Branch | Behaviour |
+| ------ | --------- |
+| `simulate/fail` | the simulated build fails on every attempt, so the deployment ends `FAILED` after 3 attempts |
+| `simulate/flaky` | fails on attempts 1 and 2 and succeeds on attempt 3, so it ends `SUCCESS` |
+| anything else | never fails |
+
+### Failure handling
+
+- An error in one job is caught by BullMQ and handled as described above. Other jobs and the worker process carry on.
+- If the worker can't write its failure logs (for example, PostgreSQL is briefly unavailable), it logs that to the console and still reports the original error to BullMQ, so retries keep working.
+- A `failed` event handler catches jobs that BullMQ fails outside the processor, such as a job that stalled too often. The deployment is still marked `FAILED`. A deployment that already has a final status is never overwritten.
+- **Queue unavailable:** if the API can't add the job (Redis down, 3 s timeout), it marks the new deployment `FAILED`, logs `Could not add the deployment job to the queue`, and returns **503**. Otherwise the deployment would sit in `QUEUED` with no job to pick it up.
+
+### Concurrency
+
+```text
+WORKER_CONCURRENCY=2
+
+Job A ──► Worker  (running)
+Job B ──► Worker  (running)
+Job C ──► Redis   (waiting)
+Job D ──► Redis   (waiting)   → C and D start as A or B finish
+```
+
+To handle more load, run more worker containers (`docker compose up --scale worker=3`). Each one takes jobs from the same queue. There is no autoscaling.
+
+### Duplicates and idempotency
+
+- **Job ID = deployment ID.** BullMQ stores at most one job per ID, so adding the same deployment again while its job exists (waiting, running, retrying or kept after finishing) returns the existing job instead of creating a second one.
+- **Final deployments are never redone.** Finished jobs are removed after a while (completed: 24 h / 1000 jobs, failed: 7 days). If a job for the same deployment is added after that, the worker sees the deployment is already `SUCCESS` or `FAILED` and completes the job without doing anything.
+- **Deleted deployments are skipped.** If the project was deleted before the job ran, the job completes and is marked as skipped.
+- Distributed locking beyond BullMQ's own job locks is out of scope for this phase. A manual `PATCH …/status` while a job is running is not coordinated with that job.
+
+### Redis connections
+
+- **API:** a single ioredis connection ([`server/src/db/redis.js`](server/src/db/redis.js)), used by both `/api/system/status` and the BullMQ queue. Commands fail fast while disconnected.
+- **Worker:** one ioredis connection ([`worker/src/config/redis.js`](worker/src/config/redis.js)), which BullMQ duplicates once for its blocking "wait for next job" call.
+- Everything comes from `REDIS_URL`. There are no hard-coded hosts or credentials.
+
+### Worker startup and shutdown
+
+```bash
+npm run dev:worker                 # local, with .env
+docker compose up -d worker        # in Docker
+```
+
+On startup the worker connects to Redis and PostgreSQL and logs:
+
+```text
+DeployX Worker started (development, pid 1) - queue "deployments", concurrency 2
+```
+
+On `SIGTERM` or `SIGINT` (for example, `docker compose stop worker`) it:
+
+1. stops taking new jobs,
+2. **waits for running jobs to finish**,
+3. closes Redis and PostgreSQL, logs `DeployX Worker stopped`, and exits with code 0.
+
+If running jobs don't finish within `WORKER_SHUTDOWN_TIMEOUT_MS` (25 s), the worker exits with code 1. Their locks expire, and BullMQ hands the jobs to the next worker that starts. Compose gives the worker a 30 s `stop_grace_period` so this timeout gets to run.
+
+```text
+worker-1  | [worker] job a89d07b9-… started (attempt 1 of 3)
+worker-1  | DeployX Worker received SIGTERM, finishing running jobs before exit
+worker-1  | [worker] job a89d07b9-… completed
+worker-1  | DeployX Worker stopped
+```
+
 ## Project Structure
 
 ```text
@@ -209,15 +360,30 @@ DeployX/
 │   │   ├── utils/                  # ApiError, sendSuccess
 │   │   ├── db/
 │   │   │   ├── postgres.js         # pool + query()
-│   │   │   ├── redis.js
+│   │   │   ├── redis.js            # the API's single ioredis connection
 │   │   │   ├── migrate.js          # migration runner (CLI + programmatic)
 │   │   │   └── migrations/         # versioned SQL
+│   │   ├── queues/
+│   │   │   └── deploymentQueue.js  # BullMQ producer: enqueueDeployment()
 │   │   ├── app.js                  # Express app
 │   │   └── server.js               # entry point: listen + graceful shutdown
-│   ├── test/                       # integration tests (node:test)
+│   ├── test/                       # integration + end-to-end tests (node:test)
 │   └── Dockerfile
 │
-├── worker/                         # background worker (foundation only)
+├── worker/                         # deployment worker
+│   ├── src/
+│   │   ├── index.js                # entry point: start, SIGTERM/SIGINT shutdown
+│   │   ├── worker.js               # BullMQ Worker, concurrency, event handlers
+│   │   ├── processors/
+│   │   │   ├── deploymentProcessor.js  # SIMULATED pipeline + retry bookkeeping
+│   │   │   └── simulatedFailures.js    # deterministic failures for testing
+│   │   ├── services/
+│   │   │   └── deploymentService.js    # status updates + logs in PostgreSQL
+│   │   ├── config/
+│   │   │   ├── index.js            # environment configuration
+│   │   │   └── redis.js            # ioredis connection factory
+│   │   └── db/postgres.js
+│   └── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
 └── package.json                    # convenience scripts for the whole repo
@@ -242,8 +408,14 @@ cp .env.example .env
 | `NODE_ENV`          | `development`                                          | server, worker             |
 | `PORT`              | `5000`                                                 | server (also host port)    |
 | `CLIENT_URL`        | `http://localhost:3000`                                | server (CORS origin)       |
-| `DATABASE_URL`      | `postgresql://deployx:deployx@localhost:5432/deployx`  | server, migrations (local) |
-| `REDIS_URL`         | `redis://localhost:6379`                               | server (local)             |
+| `DATABASE_URL`      | `postgresql://deployx:deployx@localhost:5432/deployx`  | server, worker, migrations (local) |
+| `REDIS_URL`         | `redis://localhost:6379`                               | server, worker (local)     |
+| `QUEUE_PREFIX`      | `deployx`                                              | server + worker (must match) |
+| `DEPLOYMENT_JOB_ATTEMPTS` | `3`                                              | server (job options)       |
+| `DEPLOYMENT_JOB_BACKOFF_MS` | `2000`                                         | server (exponential base)  |
+| `WORKER_CONCURRENCY` | `2`                                                   | worker                     |
+| `WORKER_SHUTDOWN_TIMEOUT_MS` | `25000`                                       | worker                     |
+| `SIMULATION_STEP_MS` | `2000`                                                | worker (simulated stage length) |
 | `DEV_USER_EMAIL`    | `dev@deployx.local`                                    | temporary current user     |
 | `DEV_USER_NAME`     | `DeployX Developer`                                    | temporary current user     |
 | `POSTGRES_USER`     | `deployx`                                              | postgres container         |
@@ -253,7 +425,7 @@ cp .env.example .env
 | `REDIS_PORT`        | `6379`                                                 | host port for Redis        |
 | `TEST_DATABASE_URL` | `DATABASE_URL` + `_test`                               | integration tests only     |
 
-Inside Docker Compose the API and the migrate job get `DATABASE_URL` and `REDIS_URL` pointing at the `postgres` and `redis` containers automatically.
+Inside Docker Compose the API, the worker and the migrate job get `DATABASE_URL` and `REDIS_URL` pointing at the `postgres` and `redis` containers automatically.
 
 ### Temporary user (no authentication yet)
 
@@ -270,7 +442,7 @@ npm run migrate           # apply database migrations
 # in separate terminals
 npm run dev:server        # API on http://localhost:5000 (node --watch)
 npm run dev:client        # dashboard on http://localhost:3000
-npm run dev:worker
+npm run dev:worker        # processes deployment jobs
 ```
 
 ## Running with Docker Compose
@@ -287,11 +459,12 @@ docker compose up --build
 | `migrate`  | `./server`           | -         | applies migrations, then exits with code 0         |
 | `server`   | `./server`           | 5000      | starts after `migrate` succeeds and the DBs are healthy |
 | `client`   | `./client`           | 3000      | Vite dev server, proxies `/api` to `server`        |
-| `worker`   | `./worker`           | -         | starts and idles                                   |
+| `worker`   | `./worker`           | -         | processes deployment jobs; starts after `migrate`; 30 s stop grace period |
 
 ```bash
 docker compose ps -a              # service status (including the finished migrate job)
 docker compose logs -f server     # follow API logs
+docker compose logs -f worker     # follow job processing
 docker compose down               # stop everything (keeps data volumes)
 docker compose down -v            # stop and delete the database/redis volumes
 ```
@@ -332,7 +505,7 @@ Validation failures add `details`, with one readable message per problem:
 | 404 | resource or route not found |
 | 409 | conflict: duplicate project name, or deploying an inactive project |
 | 500 | unexpected error; the response says `Internal server error`, and details go only to the server log |
-| 503 | `/api/system/status` only: PostgreSQL or Redis unreachable |
+| 503 | `/api/system/status`: PostgreSQL or Redis unreachable; creating a deployment: job queue unavailable |
 
 Rules that apply to every endpoint:
 
@@ -438,16 +611,16 @@ curl -X PUT http://localhost:5000/api/projects/<id> \
 
 ### Deployments
 
-These endpoints **only create and update records**. They don't clone, build or run anything.
+Creating a deployment queues a background job (see [Deployment Jobs](#deployment-jobs-bullmq)). The API itself never clones, builds or runs anything, and in Phase 3 the worker only simulates those steps.
 
-**Create**: `POST /api/projects/:projectId/deployments` → `201`
+**Create**: `POST /api/projects/:projectId/deployments` → `201` once the job is queued; the response does not wait for the job to run.
 
 | Field | Required | Rules |
 | ----- | -------- | ----- |
 | `commit_sha` | no | 7–40 hex characters (stored lower-case) |
 | `branch` | no | valid git branch name; defaults to the project's `github_branch` |
 
-`status` can't be set here. Every new deployment starts as `QUEUED`. Returns `404` if the project doesn't exist, and `409` if the project is `INACTIVE`.
+`status` can't be set here. Every new deployment starts as `QUEUED`. Returns `404` if the project doesn't exist, `409` if the project is `INACTIVE`, and `503` if the job queue (Redis) is unavailable. In the `503` case the deployment is recorded as `FAILED`.
 
 ```bash
 curl -X POST http://localhost:5000/api/projects/<projectId>/deployments \
@@ -459,20 +632,25 @@ curl -X POST http://localhost:5000/api/projects/<projectId>/deployments \
 {
   "success": true,
   "data": {
-    "id": "69bb15c5-7084-457e-9c6e-8b3a9586927c",
-    "project_id": "391710c4-fda1-48d7-bb50-894de0bf7878",
-    "commit_sha": "abc1234",
-    "branch": "main",
-    "status": "QUEUED",
-    "docker_image": null,
-    "started_at": null,
-    "finished_at": null,
-    "created_at": "2026-09-25T10:07:19.005Z",
-    "updated_at": "2026-09-25T10:07:19.005Z",
-    "project": { "id": "391710c4-fda1-48d7-bb50-894de0bf7878", "name": "My API", "github_repo": "https://github.com/example/my-api" }
+    "deployment": {
+      "id": "69bb15c5-7084-457e-9c6e-8b3a9586927c",
+      "project_id": "391710c4-fda1-48d7-bb50-894de0bf7878",
+      "commit_sha": "abc1234",
+      "branch": "main",
+      "status": "QUEUED",
+      "docker_image": null,
+      "started_at": null,
+      "finished_at": null,
+      "created_at": "2026-09-25T10:07:19.005Z",
+      "updated_at": "2026-09-25T10:07:19.005Z",
+      "project": { "id": "391710c4-fda1-48d7-bb50-894de0bf7878", "name": "My API", "github_repo": "https://github.com/example/my-api" }
+    },
+    "jobId": "69bb15c5-7084-457e-9c6e-8b3a9586927c"
   }
 }
 ```
+
+`jobId` is the BullMQ job ID, which is always the deployment ID. Follow progress with `GET /api/deployments/:deploymentId` and `GET /api/deployments/:deploymentId/logs`.
 
 **List**: `GET /api/projects/:projectId/deployments` → `200`, the project's deployments newest first (`404` if the project doesn't exist).
 
@@ -492,6 +670,8 @@ Only `QUEUED`, `BUILDING`, `DEPLOYING`, `HEALTH_CHECK`, `SUCCESS` and `FAILED` a
 - `finished_at` is set on `SUCCESS` or `FAILED` and cleared for any other status.
 
 Which transitions are allowed (for example, `SUCCESS` → `BUILDING`) is not enforced yet. The deployment state machine is part of a later phase.
+
+Since Phase 3 the **worker** sets these statuses as it processes the job, so this endpoint is a manual override. It isn't coordinated with a job that is currently running, and the worker's next stage overwrites it. Setting `SUCCESS` or `FAILED` before the job starts makes the worker skip it.
 
 ### Deployment logs
 
@@ -527,14 +707,19 @@ Log IDs are 64-bit integers and are returned as strings, so no precision is lost
 
 ## Testing
 
-The integration tests start the real Express app on a random port and send HTTP requests to it. They run against a **separate test database**: `TEST_DATABASE_URL`, or your `DATABASE_URL` with `_test` appended (for example `deployx_test`). The tests create that database if needed, migrate it and empty it before each test file. Your development data is never touched.
+The tests start the real Express app on a random port and send HTTP requests to it. The queue tests also run the **real worker in the same process**. Everything is isolated from development data:
+
+- a **separate test database**: `TEST_DATABASE_URL`, or your `DATABASE_URL` with `_test` appended (for example `deployx_test`). It is created if needed, migrated and emptied before each test file.
+- a **separate queue prefix** (`deployx-test`), emptied before each test file.
+- short timings: simulated stages take 300 ms, and the retry backoff is 200 ms, then 400 ms.
 
 ```bash
-npm run infra:up                  # PostgreSQL + Redis must be running
+npm run install:all       # the queue tests load the worker's dependencies too
+npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The suite (44 tests) covers:
+The suite (55 tests, about 17 s) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
@@ -543,6 +728,39 @@ The suite (44 tests) covers:
 - invalid deployment statuses and log levels
 - the schema itself: tables, indexes, foreign keys, CHECK constraints, and cascade on delete
 - database failures, which must return a generic `500` without leaking internal details
+- **queue:** the job ID, payload and retry options of every queued job; `503` + `FAILED` when the queue is down
+- **single job:** the API answers before the job runs, then `QUEUED → BUILDING → DEPLOYING → SUCCESS` with timestamps and the exact log sequence
+- **concurrency:** 4 deployments give 2 running and 2 waiting, never more than 2 active, and jobs 3–4 start only after one of the first two finishes
+- **retries:** `simulate/fail` shows attempts 1, 2 and 3, then `FAILED`; `simulate/flaky` succeeds on attempt 3
+- **isolation:** a failing job doesn't stop other jobs or the worker
+- **duplicates:** adding the same job twice runs it once; a job re-added for a finished deployment, or for a deleted one, is skipped
+- **graceful shutdown:** `close()` lets the running job finish and leaves new jobs for the next worker
+
+### Manual verification with Docker
+
+```bash
+docker compose up -d --build
+
+# create a project, then 4 normal deployments and 1 that always fails
+curl -s -X POST localhost:5000/api/projects -H "Content-Type: application/json" \
+  -d '{"name":"demo","github_repo":"https://github.com/example/app"}'
+curl -s -X POST localhost:5000/api/projects/<projectId>/deployments -H "Content-Type: application/json" -d '{}'
+curl -s -X POST localhost:5000/api/projects/<projectId>/deployments -H "Content-Type: application/json" \
+  -d '{"branch":"simulate/fail"}'
+
+docker compose logs -f worker                          # watch jobs start, retry, complete
+curl -s localhost:5000/api/projects/<projectId>/deployments   # statuses
+curl -s localhost:5000/api/deployments/<deploymentId>/logs    # stored logs
+
+# graceful shutdown: create a deployment, then stop the worker while it is BUILDING
+docker compose stop worker                             # waits for the job, then "DeployX Worker stopped"
+```
+
+Polling 5 deployments like this (oldest first; Q = `QUEUED`, B = `BUILDING`, D = `DEPLOYING`, S = `SUCCESS`, F = `FAILED`) shows the concurrency limit and the retries of the failing deployment (the fifth):
+
+```text
+BBQQQ  DDQQQ  SSBBQ  SSDDQ  SSSSB  SSSSQ  SSSSB  SSSSQ  SSSSB  SSSSF
+```
 
 To try the API by hand, use the `curl` examples above against `http://localhost:5000`. Through the dashboard's proxy, `http://localhost:3000/api/...` works too.
 
@@ -576,6 +794,19 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 - [x] Request validation and a single response format
 - [x] Integration tests against PostgreSQL
 
+**Phase 3: job queue and worker**
+
+- [x] BullMQ `deployments` queue on the existing Redis (one API connection)
+- [x] Deployment creation queues a job (job ID = deployment ID) and returns immediately
+- [x] Worker with concurrency 2 and a clearly marked simulated pipeline
+- [x] Status and logs written to PostgreSQL at every stage
+- [x] 3 attempts with exponential backoff, final `FAILED` with a log
+- [x] One failed job doesn't affect other jobs or the worker
+- [x] Duplicate jobs are prevented; finished or deleted deployments are skipped
+- [x] Graceful shutdown on `SIGTERM`/`SIGINT`
+- [x] End-to-end tests (API → BullMQ → Redis → worker → PostgreSQL)
+- [x] No Docker builds, git clones, AWS or webhooks (later phases)
+
 ## Future Phases
 
 DeployX is developed incrementally across **8 phases**:
@@ -583,8 +814,8 @@ DeployX is developed incrementally across **8 phases**:
 | Phase | Focus                                                                 |
 | ----- | --------------------------------------------------------------------- |
 | 1     | Project foundation ✅                                                 |
-| **2** | **Data model and REST API (this phase)** ✅                           |
-| 3     | Job queue: BullMQ on Redis, worker job processing, retries, concurrency |
+| 2     | Data model and REST API ✅                                            |
+| **3** | **Job queue: BullMQ on Redis, worker job processing, retries, concurrency (this phase)** ✅ |
 | 4     | Build & run: git clone, Docker build, container deployment            |
 | 5     | Deployment history, state machine, real-time logs (WebSockets/SSE)    |
 | 6     | Health checks for deployed apps, automatic rollback, stable versions  |
