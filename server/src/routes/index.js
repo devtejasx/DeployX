@@ -4,6 +4,7 @@ import healthRoutes from './health.routes.js';
 import systemRoutes from './system.routes.js';
 import projectRoutes from './project.routes.js';
 import deploymentRoutes, { projectDeploymentRoutes } from './deployment.routes.js';
+import logRoutes from './log.routes.js';
 
 const router = Router();
 
@@ -15,5 +16,6 @@ router.use(['/projects', '/deployments'], devUser);
 router.use('/projects', projectRoutes);
 router.use('/projects/:projectId/deployments', projectDeploymentRoutes);
 router.use('/deployments', deploymentRoutes);
+router.use('/deployments/:deploymentId/logs', logRoutes);
 
 export default router;
