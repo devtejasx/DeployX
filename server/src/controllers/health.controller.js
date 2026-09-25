@@ -1,5 +1,7 @@
+import { sendSuccess } from '../utils/response.js';
+
 export function getHealth(req, res) {
-  res.status(200).json({
+  sendSuccess(res, {
     status: 'ok',
     service: 'deployx-api',
     timestamp: new Date().toISOString(),
