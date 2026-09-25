@@ -49,7 +49,7 @@ describe('POST /api/projects/:projectId/deployments', () => {
       branch: 'main',
     });
     assert.equal(job.opts.attempts, 3);
-    assert.deepEqual(job.opts.backoff, { type: 'exponential', delay: 2000 });
+    assert.deepEqual(job.opts.backoff, { type: 'exponential', delay: 200 }); // test config
 
     const logs = await api.get(`/api/deployments/${deployment.id}/logs`);
     assert.deepEqual(

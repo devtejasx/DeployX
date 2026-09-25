@@ -30,6 +30,8 @@ process.env.DATABASE_URL = testDatabaseUrl;
 process.env.NODE_ENV = 'test';
 // Test jobs live under their own Redis key prefix, apart from development.
 process.env.QUEUE_PREFIX = process.env.TEST_QUEUE_PREFIX || 'deployx-test';
+// Short retry backoff (200ms, 400ms) so retry tests finish quickly.
+process.env.DEPLOYMENT_JOB_BACKOFF_MS = '200';
 
 const { default: app } = await import('../src/app.js');
 const { default: pool, closePostgres } = await import('../src/db/postgres.js');
