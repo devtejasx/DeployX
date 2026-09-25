@@ -1,21 +1,23 @@
-import { createClient } from 'redis';
+import IORedis from 'ioredis';
 import config from '../config/index.js';
 
-const redisClient = createClient({
-  url: config.redisUrl,
+// The API's single Redis connection. It serves the system status check and
+// the BullMQ deployment queue (see queues/deploymentQueue.js), so the API
+// never opens more than one connection to Redis.
+const redisConnection = new IORedis(config.redisUrl, {
+  // Connect explicitly from server.js (connectRedis) rather than on import.
+  lazyConnect: true,
   // Fail commands immediately while disconnected instead of queueing them,
-  // so status checks report the outage rather than hanging.
-  disableOfflineQueue: true,
-  socket: {
-    connectTimeout: 3000,
-    reconnectStrategy: (retries) => Math.min(retries * 200, 5000),
-  },
+  // so status checks and job submission report the outage rather than hang.
+  enableOfflineQueue: false,
+  connectTimeout: 3000,
+  retryStrategy: (attempt) => Math.min(attempt * 200, 5000),
 });
 
 let lastErrorMessage = null;
 
-// Without an error listener node-redis would crash the process on connection loss.
-redisClient.on('error', (err) => {
+// Without an error listener ioredis would log unhandled errors on every retry.
+redisConnection.on('error', (err) => {
   const message = err.message || err.code || String(err);
   if (message !== lastErrorMessage) {
     console.error('[redis] connection error:', message);
@@ -23,7 +25,7 @@ redisClient.on('error', (err) => {
   }
 });
 
-redisClient.on('ready', () => {
+redisConnection.on('ready', () => {
   lastErrorMessage = null;
   console.log('[redis] connected');
 });
@@ -31,22 +33,25 @@ redisClient.on('ready', () => {
 // Start connecting in the background. The client keeps retrying on its own,
 // so the API can start even while Redis is down.
 export function connectRedis() {
-  redisClient.connect().catch((err) => {
-    console.error('[redis] initial connection failed:', err.message);
+  if (redisConnection.status !== 'wait') return;
+  redisConnection.connect().catch((err) => {
+    console.error('[redis] initial connection failed:', err.message || err.code);
   });
 }
 
 export async function pingRedis() {
-  if (!redisClient.isReady) {
+  if (redisConnection.status !== 'ready') {
     throw new Error('Redis client is not connected');
   }
-  await redisClient.ping();
+  await redisConnection.ping();
 }
 
 export async function closeRedis() {
-  if (redisClient.isOpen) {
-    await redisClient.quit();
+  if (redisConnection.status === 'ready') {
+    await redisConnection.quit();
+  } else {
+    redisConnection.disconnect();
   }
 }
 
-export default redisClient;
+export default redisConnection;

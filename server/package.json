@@ -18,11 +18,12 @@
   },
   "license": "MIT",
   "dependencies": {
+    "bullmq": "^6.3.8",
     "cors": "^2.8.6",
     "express": "^5.2.1",
+    "ioredis": "^5.11.1",
     "node-pg-migrate": "^9.0.0",
     "pg": "^8.23.0",
-    "redis": "^5.12.1",
     "zod": "^4.6.5"
   }
 }
