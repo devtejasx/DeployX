@@ -10,7 +10,8 @@
     "dev": "node --watch src/server.js",
     "migrate": "node src/db/migrate.js up",
     "migrate:down": "node src/db/migrate.js down",
-    "migrate:create": "node-pg-migrate create -m src/db/migrations --migration-file-language sql"
+    "migrate:create": "node-pg-migrate create -m src/db/migrations --migration-file-language sql",
+    "test": "node --test --test-concurrency=1"
   },
   "engines": {
     "node": ">=20.12"
