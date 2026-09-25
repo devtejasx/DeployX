@@ -37,7 +37,9 @@ export function errorHandler(err, req, res, next) {
 
   // Internal details (SQL, stack traces, connection strings) are only logged,
   // never sent to the client.
-  if (statusCode >= 500) {
+  // Deliberate ApiErrors (e.g. 503 queue unavailable) are logged where they
+  // are raised; only unexpected failures need a stack trace here.
+  if (statusCode >= 500 && !(err instanceof ApiError)) {
     console.error(`[api] ${req.method} ${req.originalUrl} failed:`, err);
   }
 

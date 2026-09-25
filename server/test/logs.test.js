@@ -9,7 +9,7 @@ before(async () => {
   api = await setupTestServer();
   const project = await api.post('/api/projects', projectPayload());
   const created = await api.post(`/api/projects/${project.body.data.id}/deployments`, {});
-  deployment = created.body.data;
+  deployment = created.body.data.deployment;
 });
 
 after(() => api.close());
@@ -17,7 +17,7 @@ after(() => api.close());
 describe('deployment logs', () => {
   test('stores log lines and returns them in chronological order', async () => {
     const lines = [
-      { level: 'INFO', message: 'Deployment created' },
+      { level: 'INFO', message: 'Custom log line' },
       { level: 'WARN', message: '  indented output is kept verbatim' },
       { level: 'ERROR', message: 'Something failed' },
     ];
@@ -33,9 +33,10 @@ describe('deployment logs', () => {
 
     const { status, body } = await api.get(`/api/deployments/${deployment.id}/logs`);
     assert.equal(status, 200);
+    // The API itself logs the creation before any submitted lines.
     assert.deepEqual(
       body.data.map(({ level, message }) => ({ level, message })),
-      lines,
+      [{ level: 'INFO', message: 'Deployment created' }, ...lines],
     );
   });
 

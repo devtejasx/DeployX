@@ -28,13 +28,16 @@ export const testDatabaseUrl = resolveTestDatabaseUrl();
 // already set are never overridden by the .env file.
 process.env.DATABASE_URL = testDatabaseUrl;
 process.env.NODE_ENV = 'test';
+// Test jobs live under their own Redis key prefix, apart from development.
+process.env.QUEUE_PREFIX = process.env.TEST_QUEUE_PREFIX || 'deployx-test';
 
 const { default: app } = await import('../src/app.js');
 const { default: pool, closePostgres } = await import('../src/db/postgres.js');
-const { closeRedis } = await import('../src/db/redis.js');
+const { connectRedis, closeRedis } = await import('../src/db/redis.js');
 const { runMigrations } = await import('../src/db/migrate.js');
+const { getDeploymentQueue, closeDeploymentQueue } = await import('../src/queues/deploymentQueue.js');
 
-export { pool };
+export { pool, getDeploymentQueue };
 
 async function ensureTestDatabase() {
   const url = new URL(testDatabaseUrl);
@@ -57,12 +60,15 @@ async function ensureTestDatabase() {
   }
 }
 
-// Creates + migrates the test database, empties it and starts the API on a
-// random port. Returns a small fetch-based client for that server.
+// Creates + migrates the test database, empties it and the test queue, and
+// starts the API on a random port. Returns a small fetch-based client.
 export async function setupTestServer() {
   await ensureTestDatabase();
   await runMigrations({ databaseUrl: testDatabaseUrl, log: () => {} });
   await pool.query('TRUNCATE users, projects, deployments, deployment_logs RESTART IDENTITY CASCADE');
+
+  connectRedis();
+  await getDeploymentQueue().obliterate({ force: true });
 
   const server = await new Promise((resolve) => {
     const listening = app.listen(0, '127.0.0.1', () => resolve(listening));
@@ -84,6 +90,7 @@ export async function setupTestServer() {
 
   async function close() {
     await new Promise((resolve) => server.close(resolve));
+    await closeDeploymentQueue();
     await Promise.allSettled([closePostgres(), closeRedis()]);
   }
 

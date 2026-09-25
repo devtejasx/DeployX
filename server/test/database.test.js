@@ -57,7 +57,7 @@ describe('schema', () => {
 
   test('deleting a project cascades to its deployments and logs', async () => {
     const project = (await api.post('/api/projects', projectPayload())).body.data;
-    const deployment = (await api.post(`/api/projects/${project.id}/deployments`, {})).body.data;
+    const { deployment } = (await api.post(`/api/projects/${project.id}/deployments`, {})).body.data;
     await api.post(`/api/deployments/${deployment.id}/logs`, { level: 'INFO', message: 'hello' });
 
     assert.equal((await api.delete(`/api/projects/${project.id}`)).status, 200);
