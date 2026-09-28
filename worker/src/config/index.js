@@ -61,11 +61,6 @@ const config = {
     // Build output stored per attempt (see lib/buildLog.js).
     buildLogMaxLines: positiveInt(process.env.BUILD_LOG_MAX_LINES, 150),
   },
-
-  // SIMULATION (Phase 3 only): duration of each simulated stage.
-  simulation: {
-    stepMs: positiveInt(process.env.SIMULATION_STEP_MS, 2000),
-  },
 };
 
 export default config;

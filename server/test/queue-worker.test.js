@@ -2,10 +2,12 @@
 //   API -> BullMQ (Redis) -> worker -> PostgreSQL
 //
 // The real worker (../../worker/src) runs in this process against the test
-// database and the test queue prefix, with short simulated stages. Worker
-// dependencies must be installed (npm run install:all).
+// database and the test queue prefix. Its Docker pipeline is swapped for a
+// fast, deterministic fake (fakePipeline.js): these tests are about the
+// queue, not Docker. Worker dependencies must be installed (npm run install:all).
 import assert from 'node:assert/strict';
 import { after, before, describe, mock, test } from 'node:test';
+import { FAIL_BRANCH, FLAKY_BRANCH, createFakePipeline } from './fakePipeline.js';
 import { getDeploymentQueue, pool, projectPayload, setupTestServer } from './helpers.js';
 
 const STEP_MS = 300;
@@ -40,7 +42,7 @@ after(async () => {
 function startWorker() {
   return createDeploymentWorker({
     concurrency: CONCURRENCY,
-    processor: createDeploymentProcessor({ stepMs: STEP_MS }),
+    processor: createDeploymentProcessor({ pipeline: createFakePipeline({ stepMs: STEP_MS }) }),
   });
 }
 
@@ -94,7 +96,7 @@ describe('single deployment job', () => {
 
     assert.equal(deployment.status, 'QUEUED');
     assert.equal(jobId, deployment.id);
-    // The simulated job takes at least 2 x STEP_MS; the API answers well before.
+    // The job takes at least 2 x STEP_MS; the API answers well before.
     assert.ok(elapsedMs < STEP_MS, `API took ${elapsedMs.toFixed(0)}ms`);
     assert.notEqual(await getStatus(deployment.id), 'SUCCESS');
 
@@ -124,9 +126,9 @@ describe('single deployment job', () => {
       'INFO Deployment created',
       'INFO Deployment job started (attempt 1 of 3)',
       'INFO Deployment is now building',
-      'INFO Build simulation completed (no image was built)',
+      'INFO Fake build completed',
       'INFO Deployment is now deploying',
-      'INFO Deployment simulation completed (no container was started)',
+      'INFO Fake deploy completed',
       'INFO Deployment completed successfully',
     ]);
 
@@ -182,10 +184,10 @@ describe('retries and failures', () => {
   after(() => worker.close());
 
   test('a job that always fails is tried 3 times and the deployment ends FAILED', async () => {
-    const { deployment } = await deploy({ branch: 'simulate/fail' });
+    const { deployment } = await deploy({ branch: FAIL_BRANCH });
     await waitForStatus(deployment.id, ['FAILED']);
 
-    const failure = 'Simulated build failure (branch "simulate/fail" always fails)';
+    const failure = `Fake build failure (branch "${FAIL_BRANCH}" always fails)`;
     const logs = await logMessages(deployment.id);
     assert.deepEqual(
       logs.filter((line) => line.startsWith('ERROR') || line.startsWith('WARN') || line.includes('job started')),
@@ -214,7 +216,7 @@ describe('retries and failures', () => {
   });
 
   test('a job that fails twice succeeds on its last attempt', async () => {
-    const { deployment } = await deploy({ branch: 'simulate/flaky' });
+    const { deployment } = await deploy({ branch: FLAKY_BRANCH });
     await waitForStatus(deployment.id, ['SUCCESS', 'FAILED']);
 
     assert.equal(await getStatus(deployment.id), 'SUCCESS');
@@ -224,7 +226,7 @@ describe('retries and failures', () => {
   });
 
   test('a failing job does not stop other jobs or the worker', async () => {
-    const failing = (await deploy({ branch: 'simulate/fail' })).deployment;
+    const failing = (await deploy({ branch: FAIL_BRANCH })).deployment;
     const healthy = (await deploy({ branch: 'main' })).deployment;
 
     await waitForStatus(healthy.id, ['SUCCESS']);

@@ -8,6 +8,8 @@
 const STEP_LINE = /^#\d+ \[[^\]]+\] |^Step \d+\/\d+ : /;
 // BuildKit result lines and errors.
 const IMPORTANT_LINE = /^#\d+ (ERROR|CANCELED)\b|^#\d+ naming to |^ERROR\b|\berror\b|^Successfully (built|tagged) /i;
+// BuildKit progress bookkeeping that explains nothing on its own.
+const NOISE_LINE = /^#\d+ (DONE|CACHED)\b|^#\d+ transferring |^#0 building with /;
 
 // Hide credentials embedded in URLs (https://user:token@host).
 export function sanitizeLine(line, maxLength) {
@@ -42,9 +44,12 @@ export function createBuildLogCollector({ maxLines = 150, maxLineLength = 1000, 
       stored += 1;
       return sanitizeLine(line, maxLineLength);
     },
-    // The last lines of output, for explaining a failure.
+    // The last lines of output, for explaining a failure (BuildKit progress
+    // noise such as "#1 DONE 0.0s" left out).
     tail() {
-      return tail.map((line) => sanitizeLine(line, maxLineLength));
+      return tail
+        .filter((line) => !NOISE_LINE.test(line))
+        .map((line) => sanitizeLine(line, maxLineLength));
     },
     get dropped() {
       return dropped;

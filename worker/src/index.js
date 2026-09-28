@@ -1,6 +1,8 @@
 // DeployX worker entry point: consumes jobs from the "deployments" queue.
 import config from './config/index.js';
 import { closePostgres } from './db/postgres.js';
+import { runCommand } from './lib/exec.js';
+import { sweepStaleWorkspaces } from './services/workspace.js';
 import { createDeploymentWorker } from './worker.js';
 
 const { worker, close } = createDeploymentWorker();
@@ -45,3 +47,21 @@ console.log(
   `DeployX Worker started (${config.env}, pid ${process.pid}) - queue "${config.queue.name}", ` +
     `concurrency ${config.concurrency}`,
 );
+
+// Deployments need git and a reachable Docker daemon. Report problems at
+// startup instead of on the first job (jobs would fail and be retried).
+for (const [command, args] of [
+  ['git', ['--version']],
+  ['docker', ['version', '--format', 'Docker server {{.Server.Version}}']],
+]) {
+  try {
+    const { code, tail } = await runCommand(command, args, { timeoutMs: 15000 });
+    console.log(code === 0 ? `[worker] ${tail.at(-1)}` : `[worker] WARNING: ${command} is not usable: ${tail.at(-1)}`);
+  } catch (err) {
+    console.error(`[worker] WARNING: ${err.message}`);
+  }
+}
+
+const swept = await sweepStaleWorkspaces().catch(() => 0);
+if (swept > 0) console.log(`[worker] removed ${swept} stale deployment workspace(s)`);
+console.log(`[worker] deployment workspaces in ${config.workspace.root}`);
