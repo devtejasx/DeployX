@@ -1,0 +1,3 @@
+# Build context is the repository root: send only what this image uses.
+*
+!examples/hello-app/server.js
