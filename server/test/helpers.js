@@ -118,6 +118,7 @@ export function projectPayload(overrides = {}) {
     github_repo: 'https://github.com/example/my-api',
     github_branch: 'main',
     dockerfile_path: 'Dockerfile',
+    container_port: 3000,
     ...overrides,
   };
 }

@@ -15,6 +15,7 @@ describe('POST /api/projects', () => {
     const { status, body } = await api.post('/api/projects', {
       name: '  My API  ',
       github_repo: 'https://github.com/example/my-api.git',
+      container_port: 8080,
     });
 
     assert.equal(status, 201);
@@ -25,6 +26,7 @@ describe('POST /api/projects', () => {
     assert.equal(body.data.github_repo, 'https://github.com/example/my-api');
     assert.equal(body.data.github_branch, 'main');
     assert.equal(body.data.dockerfile_path, 'Dockerfile');
+    assert.equal(body.data.container_port, 8080);
     assert.equal(body.data.status, 'ACTIVE');
     assert.ok(body.data.user_id);
     assert.ok(body.data.created_at);
@@ -45,13 +47,29 @@ describe('POST /api/projects', () => {
       'GitHub repository URL must look like https://github.com/<owner>/<repo>',
       'GitHub branch is not a valid git branch name',
       'Dockerfile path must be a relative path inside the repository (no leading "/" or "..")',
+      'Container port is required',
     ]);
   });
 
   test('requires a GitHub repository URL', async () => {
-    const { status, body } = await api.post('/api/projects', { name: 'No repo' });
+    const { status, body } = await api.post('/api/projects', { name: 'No repo', container_port: 3000 });
     assert.equal(status, 400);
     assert.deepEqual(body.error.details, ['GitHub repository URL is required']);
+  });
+
+  test('requires a valid container port instead of guessing one', async () => {
+    const missing = await api.post('/api/projects', { ...projectPayload(), container_port: undefined });
+    assert.equal(missing.status, 400);
+    assert.deepEqual(missing.body.error.details, ['Container port is required']);
+
+    for (const port of [0, 65536, 80.5, -1]) {
+      const { status, body } = await api.post('/api/projects', { ...projectPayload(), container_port: port });
+      assert.equal(status, 400, `port ${port} should be rejected`);
+      assert.deepEqual(body.error.details, ['Container port must be an integer between 1 and 65535']);
+    }
+
+    const asString = await api.post('/api/projects', { ...projectPayload(), container_port: '3000' });
+    assert.deepEqual(asString.body.error.details, ['Container port must be a number']);
   });
 
   test('rejects read-only and unknown fields', async () => {
@@ -122,12 +140,14 @@ describe('PUT /api/projects/:id', () => {
     const { status, body } = await api.put(`/api/projects/${id}`, {
       description: 'After',
       github_branch: 'release/v2',
+      container_port: 8081,
       status: 'INACTIVE',
     });
 
     assert.equal(status, 200);
     assert.equal(body.data.description, 'After');
     assert.equal(body.data.github_branch, 'release/v2');
+    assert.equal(body.data.container_port, 8081);
     assert.equal(body.data.status, 'INACTIVE');
     assert.equal(body.data.name, created.body.data.name);
     assert.equal(body.data.created_at, created.body.data.created_at);

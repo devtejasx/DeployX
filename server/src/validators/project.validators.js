@@ -47,6 +47,17 @@ const dockerfilePath = stringField('Dockerfile path')
 
 const status = enumField('Project status', PROJECT_STATUSES);
 
+// Port the application listens on inside its container. Required: DeployX
+// never guesses it.
+const containerPort = z
+  .number({
+    error: (issue) =>
+      issue.input === undefined ? 'Container port is required' : 'Container port must be a number',
+  })
+  .int({ error: 'Container port must be an integer between 1 and 65535' })
+  .min(1, { error: 'Container port must be an integer between 1 and 65535' })
+  .max(65535, { error: 'Container port must be an integer between 1 and 65535' });
+
 // id, user_id, created_at and updated_at are not accepted: strict objects
 // reject any field not listed here.
 export const createProjectSchema = z.strictObject({
@@ -55,6 +66,7 @@ export const createProjectSchema = z.strictObject({
   github_repo: githubRepo,
   github_branch: branchField('GitHub branch').default('main'),
   dockerfile_path: dockerfilePath.default('Dockerfile'),
+  container_port: containerPort,
   status: status.default('ACTIVE'),
 });
 
@@ -66,6 +78,7 @@ export const updateProjectSchema = z
     github_repo: githubRepo.optional(),
     github_branch: branchField('GitHub branch').optional(),
     dockerfile_path: dockerfilePath.optional(),
+    container_port: containerPort.optional(),
     status: status.optional(),
   })
   .refine((body) => Object.keys(body).length > 0, {

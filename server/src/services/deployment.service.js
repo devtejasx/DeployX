@@ -4,6 +4,7 @@ import { ApiError } from '../utils/ApiError.js';
 import { getProject } from './project.service.js';
 
 const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.commit_sha, d.branch, d.status, d.docker_image,
+  d.container_id, d.container_name, d.host_port, d.container_removed_at, d.error_message,
   d.started_at, d.finished_at, d.created_at, d.updated_at`;
 
 // A single deployment, with a summary of the project it belongs to.

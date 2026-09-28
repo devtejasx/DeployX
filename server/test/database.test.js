@@ -53,6 +53,26 @@ describe('schema', () => {
       pool.query(`UPDATE projects SET status = 'ARCHIVED' WHERE id = $1`, [project.id]),
       { code: '23514' },
     );
+    await assert.rejects(
+      pool.query(`UPDATE projects SET container_port = 70000 WHERE id = $1`, [project.id]),
+      { code: '23514' },
+    );
+    await assert.rejects(
+      pool.query(
+        `INSERT INTO deployments (project_id, branch, container_id) VALUES ($1, 'main', 'not-a-container-id')`,
+        [project.id],
+      ),
+      { code: '23514' },
+    );
+  });
+
+  test('deployments expose container tracking fields', async () => {
+    const project = (await api.post('/api/projects', projectPayload())).body.data;
+    const { deployment } = (await api.post(`/api/projects/${project.id}/deployments`, {})).body.data;
+    for (const field of ['container_id', 'container_name', 'host_port', 'container_removed_at', 'error_message']) {
+      assert.ok(field in deployment, `missing ${field}`);
+      assert.equal(deployment[field], null);
+    }
   });
 
   test('deleting a project cascades to its deployments and logs', async () => {
