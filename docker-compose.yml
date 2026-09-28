@@ -1,10 +1,15 @@
-# DeployX local development stack (Phase 1).
+# DeployX local development stack.
 #
 #   docker compose up --build      # everything (runs migrations first)
 #   docker compose up -d postgres redis   # infrastructure only
 #   docker compose run --rm migrate       # apply migrations on demand
 #
 # Values come from .env when it exists; the defaults below match .env.example.
+#
+# Apps deployed by DeployX are NOT part of this file: the worker starts them
+# through Docker on a separate "deployx-apps" network (see README, Phase 4).
+# Remove them with:
+#   docker rm -f $(docker ps -aq --filter label=deployx.managed=true)
 
 name: deployx
 
@@ -16,8 +21,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-deployx}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deployx}
       POSTGRES_DB: ${POSTGRES_DB:-deployx}
+    # Published on 127.0.0.1 only: reachable from this machine, not the LAN.
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -29,12 +35,17 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # Password required: an unauthenticated Redis would let anything that can
+    # reach it inject or alter deployment jobs.
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-deployx-dev-redis}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\""]
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -58,12 +69,12 @@ services:
       PORT: 5000
       CLIENT_URL: ${CLIENT_URL:-http://localhost:3000}
       DATABASE_URL: postgresql://${POSTGRES_USER:-deployx}:${POSTGRES_PASSWORD:-deployx}@postgres:5432/${POSTGRES_DB:-deployx}
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-deployx-dev-redis}@redis:6379
       QUEUE_PREFIX: ${QUEUE_PREFIX:-deployx}
       DEPLOYMENT_JOB_ATTEMPTS: ${DEPLOYMENT_JOB_ATTEMPTS:-3}
       DEPLOYMENT_JOB_BACKOFF_MS: ${DEPLOYMENT_JOB_BACKOFF_MS:-2000}
     ports:
-      - "${PORT:-5000}:5000"
+      - "127.0.0.1:${PORT:-5000}:5000"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -83,7 +94,7 @@ services:
     environment:
       API_PROXY_TARGET: http://server:5000
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       server:
         condition: service_healthy
@@ -94,11 +105,28 @@ services:
     environment:
       NODE_ENV: ${NODE_ENV:-development}
       DATABASE_URL: postgresql://${POSTGRES_USER:-deployx}:${POSTGRES_PASSWORD:-deployx}@postgres:5432/${POSTGRES_DB:-deployx}
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-deployx-dev-redis}@redis:6379
       QUEUE_PREFIX: ${QUEUE_PREFIX:-deployx}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
       WORKER_SHUTDOWN_TIMEOUT_MS: ${WORKER_SHUTDOWN_TIMEOUT_MS:-25000}
-      SIMULATION_STEP_MS: ${SIMULATION_STEP_MS:-2000}
+      DEPLOYX_APP_NETWORK: ${DEPLOYX_APP_NETWORK:-deployx-apps}
+      DOCKER_BUILD_TIMEOUT_MS: ${DOCKER_BUILD_TIMEOUT_MS:-600000}
+      CONTAINER_STARTUP_GRACE_MS: ${CONTAINER_STARTUP_GRACE_MS:-3000}
+      APP_MEMORY_LIMIT: ${APP_MEMORY_LIMIT:-512m}
+      APP_CPU_LIMIT: ${APP_CPU_LIMIT:-1}
+    # DEVELOPMENT ONLY: the worker drives the host's Docker daemon to build
+    # images and start app containers. Access to this socket is equivalent to
+    # root on the Docker host, so ONLY the worker gets it - never the API,
+    # never deployed apps. See "Security limitations" in the README.
+    # (A filtering socket proxy was evaluated; it blocks BuildKit's gRPC
+    # session, so builds could not run through it.)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The worker runs as the unprivileged "node" user; this adds the group
+    # that owns the socket (0 on Docker Desktop, usually "docker" on Linux:
+    # set DOCKER_SOCKET_GID=$(stat -c %g /var/run/docker.sock)).
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
     depends_on:
       migrate:
         condition: service_completed_successfully
