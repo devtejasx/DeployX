@@ -2,7 +2,7 @@
 
 A self-service deployment platform: connect a GitHub repository, build it into a Docker image, deploy it, watch it run and roll back automatically when a release goes bad.
 
-> **Status: Phase 3 of 8. Job queue and deployment worker.** DeployX is being built one phase at a time. Creating a deployment now queues a real background job (BullMQ on Redis), which a separate worker process picks up, retries and tracks in PostgreSQL. **The deployment work itself is still simulated.** The worker doesn't clone repositories, build images or start containers yet. That's Phase 4.
+> **Status: Phase 4 of 8. Docker-based deployment.** DeployX is being built one phase at a time. Creating a deployment queues a job; the worker clones the public GitHub repository at the requested commit, builds a Docker image and starts it as a container on an isolated network, tracking everything in PostgreSQL. Health checks and rollback (Phase 6), real-time logs (Phase 5), GitHub/AWS integration (Phase 7) and production-grade isolation (Phase 8) come later. See [Security measures and limitations](#security-measures-and-limitations-development-setup) before deploying code you don't trust.
 
 ## Overview
 
@@ -32,6 +32,15 @@ A self-service deployment platform: connect a GitHub repository, build it into a
 - **Duplicate protection** (job ID = deployment ID) and **graceful shutdown**
 - **End-to-end tests** covering the API, the queue, the worker and PostgreSQL
 
+**Phase 4 (Docker-based deployment)**
+
+- The worker **clones the public GitHub repository**, checks out the **exact commit** and **validates the Dockerfile**
+- **`docker build`** into `deployx/<project>-<id>:<commit>`, with limited, meaningful build logs
+- **`docker run`** as an unprivileged, resource-limited container on the isolated **`deployx-apps`** network, on the project's declared **`container_port`**
+- Container tracking (`container_id`, `container_name`, `host_port`), replacement of the previous container, per-deployment workspaces that are always cleaned up
+- Build and startup failures end as `FAILED` with the reason; transient failures use the Phase 3 retries
+- Test apps in [`examples/`](examples) and opt-in **Docker end-to-end tests**
+
 ## Architecture
 
 ```text
@@ -52,17 +61,17 @@ A self-service deployment platform: connect a GitHub repository, build it into a
                        │       └────┬─────┘
                        │            │ next job (BullMQ, concurrency 2)
                        │            ▼
-                       │  ┌──────────────────────────┐
-                       │  │  worker  (Node.js)       │  simulated pipeline
-                       │  └────────────┬─────────────┘
-                       ▼               │ status + logs (SQL)
-             ┌──────────────┐          │
-             │  PostgreSQL  │◀─────────┘
-             │    :5432     │
-             └──────▲───────┘
-                    │ applies migrations, then exits
-             ┌──────┴───────┐
-             │   migrate    │  (one-shot job in Docker Compose)
+                       │  ┌──────────────────────────┐   git clone   ┌────────────┐
+                       │  │  worker  (Node.js)       │◀──────────────│   GitHub   │
+                       │  └──────┬─────────────┬─────┘               └────────────┘
+                       ▼         │ status+logs │ docker build / run (Docker socket)
+             ┌──────────────┐    │             ▼
+             │  PostgreSQL  │◀───┘   ┌────────────────────────────────────────┐
+             │    :5432     │        │  Docker daemon                         │
+             └──────▲───────┘        │   network "deployx-apps" (isolated)    │
+                    │                │    └── app containers  127.0.0.1:<port>│
+             ┌──────┴───────┐        └────────────────────────────────────────┘
+             │   migrate    │  (one-shot job: applies migrations, then exits)
              └──────────────┘
 ```
 
@@ -90,7 +99,7 @@ Each API request passes through these layers:
 | Migrations     | node-pg-migrate 9 (plain SQL files)          |
 | Cache / queue  | Redis 7, BullMQ 6, `ioredis` 5               |
 | Tests          | Node.js built-in test runner (`node:test`)   |
-| Worker         | Node.js, BullMQ 6, `ioredis`, `pg`           |
+| Worker         | Node.js, BullMQ 6, `ioredis`, `pg`, `git`, Docker CLI (BuildKit) |
 | Local infra    | Docker, Docker Compose                       |
 
 ## Database
@@ -137,6 +146,7 @@ Every foreign key cascades. **Deleting a project deletes all of its deployments 
 | `github_repo` | `varchar(255)` | `https://github.com/<owner>/<repo>` |
 | `github_branch` | `varchar(255)` | default `main` |
 | `dockerfile_path` | `varchar(255)` | default `Dockerfile` |
+| `container_port` | `integer` | port the app listens on in its container, 1–65535; required by the API (nullable only for pre-Phase-4 rows) |
 | `status` | `varchar(20)` | `ACTIVE` \| `INACTIVE` (CHECK), default `ACTIVE` |
 | `created_at`, `updated_at` | `timestamptz` | |
 
@@ -149,7 +159,11 @@ Every foreign key cascades. **Deleting a project deletes all of its deployments 
 | `commit_sha` | `varchar(40)` | nullable; 7–40 lower-case hex (CHECK) |
 | `branch` | `varchar(255)` | |
 | `status` | `varchar(20)` | `QUEUED` \| `BUILDING` \| `DEPLOYING` \| `HEALTH_CHECK` \| `SUCCESS` \| `FAILED` (CHECK), default `QUEUED` |
-| `docker_image` | `varchar(255)` | nullable; filled in by the build phase later |
+| `docker_image` | `varchar(255)` | image built for this deployment, e.g. `deployx/my-api-0f8fad5b:abc123def456` |
+| `container_id`, `container_name` | `varchar` | the container started for this deployment |
+| `host_port` | `integer` | host port (on 127.0.0.1) the container port is published on |
+| `container_removed_at` | `timestamptz` | when the container was removed (e.g. replaced by a newer deployment) |
+| `error_message` | `varchar(2000)` | short reason for a `FAILED` deployment |
 | `started_at`, `finished_at` | `timestamptz` | set from status changes (see below) |
 | `created_at`, `updated_at` | `timestamptz` | |
 
@@ -190,6 +204,11 @@ npm run migrate:create -- add-something # new empty SQL migration file
 docker compose run --rm migrate         # apply pending migrations
 ```
 
+| Migration | Adds |
+| --------- | ---- |
+| `1790330478769_create-core-schema` | `users`, `projects`, `deployments`, `deployment_logs`, indexes, triggers |
+| `1790587019517_add-container-tracking` | `projects.container_port`; `deployments.container_id`, `container_name`, `host_port`, `container_removed_at`, `error_message` |
+
 `docker compose up` runs the `migrate` service automatically, and the API starts only after it has finished successfully.
 
 ## Deployment Jobs (BullMQ)
@@ -212,7 +231,7 @@ Redis  ── queue "deployments" (keys under QUEUE_PREFIX, default "deployx")
  │
  ▼
 Worker ── up to WORKER_CONCURRENCY jobs at a time (default 2)
- │        QUEUED → BUILDING → DEPLOYING → SUCCESS      (simulated stages)
+ │        QUEUED → BUILDING → DEPLOYING → SUCCESS      (Docker pipeline, see Phase 4)
  ▼
 PostgreSQL ── deployments.status / started_at / finished_at + deployment_logs
 ```
@@ -229,21 +248,7 @@ The payload contains identifiers only, no credentials. The worker reads everythi
 
 ### Job lifecycle
 
-A successful deployment writes these logs:
-
-```text
-10:58:14.784 INFO  Deployment created                                        ← API
-10:58:14.812 INFO  Deployment job started (attempt 1 of 3)                   ← worker
-10:58:14.818 INFO  Deployment is now building                                  status BUILDING, started_at set
-10:58:15.829 INFO  Build simulation completed (no image was built)
-10:58:15.834 INFO  Deployment is now deploying                                 status DEPLOYING
-10:58:16.850 INFO  Deployment simulation completed (no container was started)
-10:58:16.860 INFO  Deployment completed successfully                           status SUCCESS, finished_at set
-```
-
-`HEALTH_CHECK` is not used yet. It arrives with real health checks in Phase 6.
-
-> **Simulation.** [`deploymentProcessor.js`](worker/src/processors/deploymentProcessor.js) only waits `SIMULATION_STEP_MS` per stage. It doesn't run `git`, `docker` or anything on AWS. Phase 4 replaces the simulated stages with the real build and run pipeline.
+`deploymentProcessor.js` ([source](worker/src/processors/deploymentProcessor.js)) is a generic runner. It loads the deployment and its project, skips duplicates, logs `Deployment job started (attempt n of m)` and records failed attempts. It hands the actual work to a **pipeline**: in production, [`dockerDeployment.js`](worker/src/pipeline/dockerDeployment.js), described in [Docker Deployments](#docker-deployments-phase-4) along with a full log trace. Phase 3's simulated stages are gone.
 
 ### Retries
 
@@ -258,15 +263,7 @@ When an attempt fails:
 2. If attempts remain, the deployment goes back to **`QUEUED`** and gets `WARN Retrying in 2s (attempt 2 of 3)`. `started_at` keeps the time of the first attempt. BullMQ re-runs the job after the backoff.
 3. After the last attempt, the deployment becomes **`FAILED`** (with `finished_at`) and gets `ERROR Deployment failed after maximum retry attempts`. The BullMQ job ends in its `failed` state.
 
-Some errors can't be fixed by trying again, so they fail right away without retries. Examples: the deployment was deleted while the job ran, or the job has an unknown name.
-
-**Deterministic test failures (simulation only).** The deployment's branch decides:
-
-| Branch | Behaviour |
-| ------ | --------- |
-| `simulate/fail` | the simulated build fails on every attempt, so the deployment ends `FAILED` after 3 attempts |
-| `simulate/flaky` | fails on attempts 1 and 2 and succeeds on attempt 3, so it ends `SUCCESS` |
-| anything else | never fails |
+Some errors can't be fixed by trying again, so they fail right away without retries: a missing repository, branch, commit or Dockerfile, a deployment deleted while its job ran, or an unknown job name. The [Phase 4 failure table](#failure-handling-and-retries) lists which failures are retried.
 
 ### Failure handling
 
@@ -329,6 +326,223 @@ worker-1  | [worker] job a89d07b9-… completed
 worker-1  | DeployX Worker stopped
 ```
 
+## Docker Deployments (Phase 4)
+
+### Architecture
+
+```text
+GitHub (public repository)
+   │
+   │                         POST /api/projects/:projectId/deployments
+   ▼                                          │
+DeployX API ──────────────────────────────────┘  creates the record, queues the job
+   │
+   ▼
+PostgreSQL  (deployments, deployment_logs)
+   │
+   ▼
+BullMQ / Redis  ("deployments" queue)
+   │
+   ▼
+Deployment Worker ── <WORKSPACE_ROOT>/<deployment-id>/source   (per-deployment workspace)
+   │
+   ├── Git Clone     git clone --single-branch --filter=blob:none ; checkout <commit>
+   │
+   ├── Docker Build  docker build -f <dockerfile_path> -t deployx/<slug>-<id8>:<sha12> <repo root>
+   │
+   └── Docker Run    docker run --network deployx-apps -p 127.0.0.1::<container_port> …
+          │
+          ▼
+     Application  (container on the isolated "deployx-apps" network)
+```
+
+The **API** still only creates the deployment and queues the job. It has no Docker access. The **worker** does all the work. Deployed apps run as ordinary containers on the host's Docker. They are not part of `docker-compose.yml`.
+
+### Deployment lifecycle
+
+```text
+QUEUED ──▶ BUILDING ──────────────────────────────────▶ DEPLOYING ───────────────────────────▶ SUCCESS
+            clone → checkout commit → check Dockerfile     docker run → still running after
+            → docker build → image tagged                   CONTAINER_STARTUP_GRACE_MS →
+                                                            previous container removed
+   any failure in BUILDING or DEPLOYING ──▶ QUEUED (retry, if attempts remain) or FAILED
+```
+
+The worker updates PostgreSQL at every stage. Each status change is written **in the same SQL statement as its log line**, so the API never shows a status without its log line. A successful deployment's logs look like this (real output, trimmed):
+
+```text
+INFO  Deployment created                                          ← API
+INFO  Deployment job started (attempt 1 of 3)                     ← worker
+INFO  Deployment is now building                                    status BUILDING
+INFO  Cloning repository https://github.com/devtejasx/DeployX (branch main)
+INFO  Checking out commit d577dab0332ab12f17d535b8ea17f9c3840fa818
+INFO  Dockerfile found at examples/hello-app/Dockerfile
+INFO  Starting Docker build of deployx/hello-app-be9b5c8c:d577dab0332a
+INFO  #5 [1/3] FROM docker.io/library/node:22-alpine@sha256:…     ← selected build output
+INFO  #6 [2/3] WORKDIR /app
+INFO  #7 [3/3] COPY examples/hello-app/server.js ./server.js
+INFO  #8 naming to docker.io/deployx/hello-app-be9b5c8c:d577dab0332a done
+INFO  Docker image created: deployx/hello-app-be9b5c8c:d577dab0332a
+INFO  Deployment is now deploying                                   status DEPLOYING
+INFO  Starting container deployx-be9b5c8c-…-f0ce4c66-…
+INFO  Container started: deployx-be9b5c8c-…-f0ce4c66-… (46efbbd75580); port 3000 published on 127.0.0.1:10124
+INFO  Cleanup completed: workspace removed
+INFO  Deployment completed successfully                             status SUCCESS
+```
+
+`GET /api/deployments/:deploymentId` then shows what was deployed:
+
+```json
+{
+  "status": "SUCCESS",
+  "commit_sha": "d577dab0332ab12f17d535b8ea17f9c3840fa818",
+  "docker_image": "deployx/hello-app-be9b5c8c:d577dab0332a",
+  "container_id": "46efbbd75580…",
+  "container_name": "deployx-be9b5c8c-9e91-474e-8b66-9faff1dbe500-f0ce4c66-eebc-4fe1-babd-7d4c50f2ee3d",
+  "host_port": 10124,
+  "container_removed_at": null,
+  "error_message": null,
+  "started_at": "2026-09-28T09:27:18.589Z",
+  "finished_at": "2026-09-28T09:27:27.862Z"
+}
+```
+
+`curl http://127.0.0.1:10124/` then returns `Hello from DeployX`. The `HEALTH_CHECK` status is still unused. HTTP health checks come in Phase 6.
+
+### Git clone and commit checkout
+
+[`gitService.js`](worker/src/services/gitService.js) runs, without a shell:
+
+```text
+git clone --single-branch --branch <branch> --filter=blob:none --no-checkout -- <github_repo> <workspace>/source
+git rev-parse --verify <commit_sha>^{commit}    # resolves abbreviated SHAs; must exist on that branch
+git checkout --detach <full sha>
+git rev-parse HEAD                              # verified to equal the resolved SHA
+```
+
+- **Exact commit, not "whatever the branch points at now".** If the deployment has a `commit_sha`, exactly that commit is built. A commit that isn't on the branch fails the deployment (`Commit … not found on branch main`). Without a `commit_sha`, the branch head is built and **its full SHA is written back to `commit_sha`**, so every deployment records exactly what it ran.
+- **Public GitHub repositories only.** The worker re-checks the `https://github.com/<owner>/<repo>` format. Git prompts are disabled, and the machine's git config and credential helpers are ignored (`GIT_CONFIG_NOSYSTEM`, a throwaway `GIT_CONFIG_GLOBAL`, `credential.helper=`). A private or missing repository therefore fails with a clear message instead of hanging or using your stored GitHub token. Private repositories come in Phase 7.
+- Only the `https` transport is allowed (`protocol.allow=never`), and symlinks are checked out as plain files (`core.symlinks=false`).
+
+### Dockerfile validation
+
+The configured `dockerfile_path` must resolve **inside** the checked-out repository, and it must be a **regular file**. Symlinks and paths with `..` are refused. If it's missing, the deployment fails with `Dockerfile not found at <path>` and no build is started.
+
+### Docker build and image naming
+
+```text
+docker build --progress=plain --file <workspace>/source/<dockerfile_path> --tag <image> \
+             --label deployx.managed=true --label deployx.project=<id> --label deployx.deployment=<id> \
+             -- <workspace>/source
+```
+
+- The **build context is the repository root**. A `<Dockerfile>.dockerignore` next to the Dockerfile (BuildKit) can shrink it. The [examples](examples) use one.
+- **Image name:** `deployx/<project-slug>-<first 8 chars of project id>:<first 12 chars of commit SHA>`, for example `deployx/hello-app-be9b5c8c:d577dab0332a`.
+  - The slug is the project name, lower-cased, with anything other than `a-z0-9` replaced by `-` and cut to 40 characters.
+  - The project-ID suffix keeps apart two projects whose names produce the same slug (`My API` and `my-api`).
+  - The tag is always the commit, never `latest`.
+- **Build logs are limited** ([`buildLog.js`](worker/src/lib/buildLog.js)):
+  - Only build steps (`#7 [2/4] RUN …`), errors and the final "naming to" line are stored, each once.
+  - Each line is capped at 1000 characters, and each attempt at 150 lines (`BUILD_LOG_MAX_LINES`). A warning says how many lines were dropped.
+  - Credentials in URLs are masked.
+  - **On failure, the last lines of output are always stored**, so the error is visible even after the cap. Full live output is Phase 5.
+- Builds time out after `DOCKER_BUILD_TIMEOUT_MS` (10 min).
+
+### Container naming, ports and networking
+
+- **Container name:** `deployx-<project-id>-<deployment-id>`. It's unique per deployment, and the container is labelled with both IDs.
+- **Port:** each project has a required **`container_port`**, the port the app listens on *inside* its container. DeployX never guesses it. Set it when creating the project (`"container_port": 3000`), or change it with `PUT /api/projects/:id`. Docker publishes it on **127.0.0.1** at a random free host port, stored as `host_port`.
+- **Network:** apps join **`deployx-apps`**, a separate bridge network that the worker creates on first use:
+  - DeployX's own services (PostgreSQL, Redis, API, worker) are **not** on it, so their names don't resolve and they can't be reached through Docker's internal network.
+  - **Inter-container traffic is disabled** (`enable_icc=false`), so deployed apps can't talk to each other either.
+  - Apps can reach the internet.
+- **Environment:** apps get **no** DeployX environment variables: no `DATABASE_URL`, `REDIS_URL`, passwords, Docker or GitHub credentials. They only get what their own image defines. Per-project environment variables are a later feature.
+
+### One active deployment per project
+
+When a new deployment's container is running, the worker removes the project's **other** DeployX containers, found by the `deployx.project` label. It removes them only after the new container is confirmed running, so a failed deployment never takes the running version down. Replaced deployments stay in the history:
+- their row and logs remain;
+- `container_removed_at` is set;
+- a log line says `Container removed: replaced by deployment <id>`.
+
+This is not a rollback mechanism, which is Phase 6. If two deployments of the same project finish at nearly the same moment, the one that finishes last wins.
+
+### Failure handling and retries
+
+| Failure | Status path | Retried? | `error_message` |
+| ------- | ----------- | -------- | --------------- |
+| Repository or branch missing / private | `BUILDING → FAILED` | no | `Repository … not found or not public` / `Branch "x" not found in …` |
+| Commit not on the branch | `BUILDING → FAILED` | no | `Commit … not found on branch main` |
+| Dockerfile missing | `BUILDING → FAILED` | no | `Dockerfile not found at <path>` |
+| Project has no `container_port` | `FAILED` | no | `Project has no container_port configured; …` |
+| Network error while cloning | `BUILDING → QUEUED → …` | yes (3 attempts) | last error |
+| `docker build` fails | `BUILDING → QUEUED → … → FAILED` | yes (3 attempts) | `Docker build failed: <error line>` |
+| Container exits right away | `DEPLOYING → QUEUED → … → FAILED` | yes (3 attempts) | `Container exited immediately (exit code n)` |
+
+- Retries use the **existing BullMQ policy** from Phase 3: 3 attempts with 2 s and then 4 s backoff. There is no second retry mechanism. All attempts belong to the **same deployment record**; the logs show `Deployment job started (attempt 2 of 3)`.
+- Failures that another attempt can't fix are raised as BullMQ `UnrecoverableError` and fail at once (`Deployment failed and will not be retried`). Build failures are retried, because many are transient (a registry timeout, `npm install` hitting the network).
+- A container that exits is **removed**, and its last 30 output lines are stored as `[container] …` log lines. A deployment is only `SUCCESS` if Docker reports its container as running after the startup grace period.
+
+### Workspace cleanup
+
+- Each attempt starts from an **empty** `<WORKSPACE_ROOT>/<deployment-id>/` directory. The directory name is the deployment UUID and is checked, so it can't escape the workspace root.
+- The workspace is removed at the end of every attempt, successful or not (`Cleanup completed: workspace removed`). If removal fails, a `WARN` log says so. It never changes the deployment's result.
+- If a worker is killed mid-job, the next worker start removes workspaces older than an hour.
+- **Images:** successful images are kept, since a later phase will roll back to them. A failed BuildKit build doesn't tag an image, so nothing half-built is left behind. Images of containers that failed to start are kept, and the container itself is removed. DeployX never prunes images in bulk.
+
+### Security measures and limitations (development setup)
+
+Repository code and Dockerfiles are treated as **untrusted**. What this implementation does:
+
+| Measure | Where |
+| ------- | ----- |
+| No shell anywhere: `git`/`docker` run via `spawn` with argument arrays; values are passed after `--` | [`exec.js`](worker/src/lib/exec.js) |
+| Child processes get an env **allowlist** (PATH, HOME, DOCKER_HOST …). `DATABASE_URL`, `REDIS_URL` and other secrets are never passed to `git`/`docker` | [`exec.js`](worker/src/lib/exec.js) |
+| Repo URL, branch, SHA and Dockerfile path are re-validated in the worker; paths can't leave the workspace; Dockerfile symlinks are refused | [`gitService.js`](worker/src/services/gitService.js), [`workspace.js`](worker/src/services/workspace.js) |
+| Apps are **not privileged**: `--cap-drop ALL` + 8 common capabilities, `no-new-privileges`, 512 MB memory, 1 CPU, 256 processes, no volumes or bind mounts, no Docker socket, no DeployX env vars | [`dockerService.js`](worker/src/services/dockerService.js) |
+| Apps run on their own network with inter-container traffic off; app ports are bound to 127.0.0.1 | [`dockerService.js`](worker/src/services/dockerService.js) |
+| PostgreSQL, Redis, API and dashboard ports are published on 127.0.0.1 only; **Redis requires a password** | [`docker-compose.yml`](docker-compose.yml) |
+
+**Known limitations. Don't run untrusted code with this setup on a machine you care about.** Production isolation is Phase 8.
+
+1. **The worker controls the host's Docker daemon.** In Docker Compose, `/var/run/docker.sock` is mounted into the **worker** (only the worker), and that's root-equivalent on the Docker host. It's needed to run `docker build`/`docker run`.
+   - A filtering socket proxy (`tecnativa/docker-socket-proxy`) was tried. It blocks BuildKit's gRPC session, so builds fail.
+   - Phase 8 options: a rootless Docker/BuildKit daemon, a separate build host, or a sandboxed runtime such as gVisor or Kata.
+2. **Builds run with the daemon's normal privileges.** `RUN` steps can use the network. Resource limits apply to the running app, not to the build, which is bounded only by its timeout.
+3. **Docker Desktop's host IP.** On Docker Desktop, containers can reach the host's published ports through `host.docker.internal` / `192.168.65.254`, even when those ports are bound to 127.0.0.1. On plain Linux Docker, 127.0.0.1-bound ports are not reachable from containers.
+   - So on Docker Desktop, a deployed app can reach PostgreSQL (password-protected), Redis (password-protected) and **the API, which has no authentication yet**.
+   - Change the default passwords in `.env` if others can deploy on your machine. Authentication is Phase 8.
+4. **The API can't stop containers.** Deleting a project removes its database rows, but not its running container, because the API deliberately has no Docker access. Remove leftovers with:
+   ```bash
+   docker rm -f $(docker ps -aq --filter label=deployx.managed=true)
+   ```
+5. Only public GitHub repositories. No build secrets and no per-project environment variables yet.
+
+### Local setup and the test repository
+
+- **Test repository:** this repository itself. [`examples/`](examples) holds the test apps:
+  - `hello-app` answers `GET /` with `Hello from DeployX` on port 3000
+  - `crash-app` exits immediately after starting
+  - `broken-dockerfile` has an invalid instruction
+- To use a repository of your own, it needs a Dockerfile and an app listening on a known port. Set `container_port` to that port.
+
+```bash
+docker compose up -d --build          # full stack, worker included (needs Docker Desktop / Docker Engine)
+
+curl -s -X POST localhost:5000/api/projects -H "Content-Type: application/json" -d '{
+  "name": "hello-app",
+  "github_repo": "https://github.com/devtejasx/DeployX",
+  "dockerfile_path": "examples/hello-app/Dockerfile",
+  "container_port": 3000
+}'
+curl -s -X POST localhost:5000/api/projects/<projectId>/deployments -H "Content-Type: application/json" -d '{}'
+curl -s localhost:5000/api/deployments/<deploymentId>         # status, image, container, host_port
+curl -s localhost:5000/api/deployments/<deploymentId>/logs    # clone, build and run logs
+curl -s http://127.0.0.1:<host_port>/                         # Hello from DeployX
+```
+
+Running the worker outside Docker (`npm run dev:worker`) works the same way, using your local `git` and `docker` CLIs. On Linux, give Compose the socket's group: `DOCKER_SOCKET_GID=$(stat -c %g /var/run/docker.sock)` in `.env`.
+
 ## Project Structure
 
 ```text
@@ -367,7 +581,7 @@ DeployX/
 │   │   │   └── deploymentQueue.js  # BullMQ producer: enqueueDeployment()
 │   │   ├── app.js                  # Express app
 │   │   └── server.js               # entry point: listen + graceful shutdown
-│   ├── test/                       # integration + end-to-end tests (node:test)
+│   ├── test/                       # integration, queue, unit and Docker e2e tests (node:test)
 │   └── Dockerfile
 │
 ├── worker/                         # deployment worker
@@ -375,15 +589,24 @@ DeployX/
 │   │   ├── index.js                # entry point: start, SIGTERM/SIGINT shutdown
 │   │   ├── worker.js               # BullMQ Worker, concurrency, event handlers
 │   │   ├── processors/
-│   │   │   ├── deploymentProcessor.js  # SIMULATED pipeline + retry bookkeeping
-│   │   │   └── simulatedFailures.js    # deterministic failures for testing
+│   │   │   └── deploymentProcessor.js  # job runner: idempotency, attempts, failure bookkeeping
+│   │   ├── pipeline/
+│   │   │   └── dockerDeployment.js     # clone → checkout → build → run → verify → replace
 │   │   ├── services/
-│   │   │   └── deploymentService.js    # status updates + logs in PostgreSQL
+│   │   │   ├── deploymentService.js    # status + logs + container tracking in PostgreSQL
+│   │   │   ├── gitService.js           # safe clone + exact commit checkout
+│   │   │   ├── dockerService.js        # image/container naming, build, restricted run
+│   │   │   └── workspace.js            # per-deployment workspace, path + Dockerfile checks
+│   │   ├── lib/
+│   │   │   ├── exec.js                 # spawn without a shell, env allowlist, timeouts
+│   │   │   └── buildLog.js             # build output filtering and limits
 │   │   ├── config/
 │   │   │   ├── index.js            # environment configuration
 │   │   │   └── redis.js            # ioredis connection factory
 │   │   └── db/postgres.js
-│   └── Dockerfile
+│   └── Dockerfile                  # adds git + Docker CLI (buildx)
+│
+├── examples/                       # test apps for deployments (hello-app, crash-app, broken-dockerfile)
 ├── docker-compose.yml
 ├── .env.example
 └── package.json                    # convenience scripts for the whole repo
@@ -409,18 +632,24 @@ cp .env.example .env
 | `PORT`              | `5000`                                                 | server (also host port)    |
 | `CLIENT_URL`        | `http://localhost:3000`                                | server (CORS origin)       |
 | `DATABASE_URL`      | `postgresql://deployx:deployx@localhost:5432/deployx`  | server, worker, migrations (local) |
-| `REDIS_URL`         | `redis://localhost:6379`                               | server, worker (local)     |
+| `REDIS_URL`         | `redis://:deployx-dev-redis@localhost:6379`             | server, worker (local)     |
 | `QUEUE_PREFIX`      | `deployx`                                              | server + worker (must match) |
 | `DEPLOYMENT_JOB_ATTEMPTS` | `3`                                              | server (job options)       |
 | `DEPLOYMENT_JOB_BACKOFF_MS` | `2000`                                         | server (exponential base)  |
 | `WORKER_CONCURRENCY` | `2`                                                   | worker                     |
 | `WORKER_SHUTDOWN_TIMEOUT_MS` | `25000`                                       | worker                     |
-| `SIMULATION_STEP_MS` | `2000`                                                | worker (simulated stage length) |
+| `DEPLOYX_APP_NETWORK` | `deployx-apps`                                    | worker: network for deployed apps |
+| `DOCKER_BUILD_TIMEOUT_MS` | `600000`                                     | worker |
+| `CONTAINER_STARTUP_GRACE_MS` | `3000`                                    | worker: how long a new container must stay up |
+| `APP_MEMORY_LIMIT` / `APP_CPU_LIMIT` | `512m` / `1`                       | worker: limits per app container |
+| `WORKSPACE_ROOT`    | `<os temp>/deployx-workspaces`                      | worker: where repositories are cloned |
+| `DOCKER_SOCKET_GID` | `0`                                                 | Compose: group owning the Docker socket |
 | `DEV_USER_EMAIL`    | `dev@deployx.local`                                    | temporary current user     |
 | `DEV_USER_NAME`     | `DeployX Developer`                                    | temporary current user     |
 | `POSTGRES_USER`     | `deployx`                                              | postgres container         |
 | `POSTGRES_PASSWORD` | `deployx`                                              | postgres container         |
 | `POSTGRES_DB`       | `deployx`                                              | postgres container         |
+| `REDIS_PASSWORD`    | `deployx-dev-redis`                                    | redis container (`requirepass`); must match `REDIS_URL` |
 | `POSTGRES_PORT`     | `5432`                                                 | host port for PostgreSQL   |
 | `REDIS_PORT`        | `6379`                                                 | host port for Redis        |
 | `TEST_DATABASE_URL` | `DATABASE_URL` + `_test`                               | integration tests only     |
@@ -454,12 +683,14 @@ docker compose up --build
 
 | Service    | Image / build        | Host port | Notes                                              |
 | ---------- | -------------------- | --------- | -------------------------------------------------- |
-| `postgres` | `postgres:17-alpine` | 5432      | `postgres-data` volume, healthcheck                |
-| `redis`    | `redis:7-alpine`     | 6379      | `redis-data` volume, healthcheck                   |
-| `migrate`  | `./server`           | -         | applies migrations, then exits with code 0         |
-| `server`   | `./server`           | 5000      | starts after `migrate` succeeds and the DBs are healthy |
-| `client`   | `./client`           | 3000      | Vite dev server, proxies `/api` to `server`        |
-| `worker`   | `./worker`           | -         | processes deployment jobs; starts after `migrate`; 30 s stop grace period |
+| `postgres` | `postgres:17-alpine` | 127.0.0.1:5432 | `postgres-data` volume, healthcheck |
+| `redis`    | `redis:7-alpine`     | 127.0.0.1:6379 | `redis-data` volume, healthcheck, **password required** |
+| `migrate`  | `./server`           | -              | applies migrations, then exits with code 0 |
+| `server`   | `./server`           | 127.0.0.1:5000 | starts after `migrate` succeeds and the DBs are healthy |
+| `client`   | `./client`           | 127.0.0.1:3000 | Vite dev server, proxies `/api` to `server` |
+| `worker`   | `./worker`           | -              | runs deployments; **the only service with the Docker socket**; 30 s stop grace period |
+
+Deployed apps are **not** Compose services. The worker starts them on the `deployx-apps` network, so `docker compose down` leaves them running. Remove them with `docker rm -f $(docker ps -aq --filter label=deployx.managed=true)`.
 
 ```bash
 docker compose ps -a              # service status (including the finished migrate job)
@@ -559,6 +790,7 @@ Rules that apply to every endpoint:
 | `description` | no | up to 1000 characters; `""` or `null` clears it |
 | `github_branch` | no | valid git branch name, default `main` |
 | `dockerfile_path` | no | relative path inside the repo (no leading `/`, no `..`), default `Dockerfile` |
+| `container_port` | **yes** | integer 1–65535: the port the app listens on inside its container |
 | `status` | no | `ACTIVE` (default) or `INACTIVE` |
 
 ```bash
@@ -569,7 +801,8 @@ curl -X POST http://localhost:5000/api/projects \
     "description": "My backend application",
     "github_repo": "https://github.com/example/my-api",
     "github_branch": "main",
-    "dockerfile_path": "Dockerfile"
+    "dockerfile_path": "Dockerfile",
+    "container_port": 3000
   }'
 ```
 
@@ -584,6 +817,7 @@ curl -X POST http://localhost:5000/api/projects \
     "github_repo": "https://github.com/example/my-api",
     "github_branch": "main",
     "dockerfile_path": "Dockerfile",
+    "container_port": 3000,
     "status": "ACTIVE",
     "created_at": "2026-09-25T10:06:11.680Z",
     "updated_at": "2026-09-25T10:06:11.680Z"
@@ -611,7 +845,7 @@ curl -X PUT http://localhost:5000/api/projects/<id> \
 
 ### Deployments
 
-Creating a deployment queues a background job (see [Deployment Jobs](#deployment-jobs-bullmq)). The API itself never clones, builds or runs anything, and in Phase 3 the worker only simulates those steps.
+Creating a deployment queues a background job (see [Deployment Jobs](#deployment-jobs-bullmq)). The API itself never clones, builds or runs anything. The worker does, as described in [Docker Deployments](#docker-deployments-phase-4).
 
 **Create**: `POST /api/projects/:projectId/deployments` → `201` once the job is queued; the response does not wait for the job to run.
 
@@ -639,6 +873,11 @@ curl -X POST http://localhost:5000/api/projects/<projectId>/deployments \
       "branch": "main",
       "status": "QUEUED",
       "docker_image": null,
+      "container_id": null,
+      "container_name": null,
+      "host_port": null,
+      "container_removed_at": null,
+      "error_message": null,
       "started_at": null,
       "finished_at": null,
       "created_at": "2026-09-25T10:07:19.005Z",
@@ -654,7 +893,7 @@ curl -X POST http://localhost:5000/api/projects/<projectId>/deployments \
 
 **List**: `GET /api/projects/:projectId/deployments` → `200`, the project's deployments newest first (`404` if the project doesn't exist).
 
-**Get**: `GET /api/deployments/:deploymentId` → `200` with the same shape as the create response.
+**Get**: `GET /api/deployments/:deploymentId` → `200` with the same fields as the `deployment` in the create response. Once the worker has run, it shows the real outcome: resolved `commit_sha`, `docker_image`, `container_id`, `container_name`, `host_port`, `error_message` and timestamps (example in [Deployment lifecycle](#deployment-lifecycle)).
 
 **Update status**: `PATCH /api/deployments/:deploymentId/status` → `200` with the updated deployment
 
@@ -711,7 +950,7 @@ The tests start the real Express app on a random port and send HTTP requests to 
 
 - a **separate test database**: `TEST_DATABASE_URL`, or your `DATABASE_URL` with `_test` appended (for example `deployx_test`). It is created if needed, migrated and emptied before each test file.
 - a **separate queue prefix** (`deployx-test`), emptied before each test file.
-- short timings: simulated stages take 300 ms, and the retry backoff is 200 ms, then 400 ms.
+- short timings: the retry backoff is 200 ms, then 400 ms. The queue tests use a fast fake pipeline ([`fakePipeline.js`](server/test/fakePipeline.js)) instead of Docker.
 
 ```bash
 npm run install:all       # the queue tests load the worker's dependencies too
@@ -719,7 +958,7 @@ npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The suite (55 tests, about 17 s) covers:
+The default suite (73 tests, about 20 s, no Docker or network needed) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
@@ -731,35 +970,40 @@ The suite (55 tests, about 17 s) covers:
 - **queue:** the job ID, payload and retry options of every queued job; `503` + `FAILED` when the queue is down
 - **single job:** the API answers before the job runs, then `QUEUED → BUILDING → DEPLOYING → SUCCESS` with timestamps and the exact log sequence
 - **concurrency:** 4 deployments give 2 running and 2 waiting, never more than 2 active, and jobs 3–4 start only after one of the first two finishes
-- **retries:** `simulate/fail` shows attempts 1, 2 and 3, then `FAILED`; `simulate/flaky` succeeds on attempt 3
+- **retries:** a job that always fails shows attempts 1, 2 and 3, then `FAILED`; a flaky one succeeds on attempt 3
 - **isolation:** a failing job doesn't stop other jobs or the worker
 - **duplicates:** adding the same job twice runs it once; a job re-added for a finished deployment, or for a deleted one, is skipped
 - **graceful shutdown:** `close()` lets the running job finish and leaves new jobs for the next worker
+- **worker units:** image/container naming, workspace isolation, Dockerfile checks (including symlinks), no shell interpretation of hostile arguments, secret-free child environments, clone arguments, build log limits
+
+### Docker end-to-end tests
+
+These tests run the **real pipeline**: they clone this repository from GitHub, build the [example apps](examples) with Docker and start containers. They need network access and a Docker daemon, so they're **opt-in**:
+
+```bash
+npm run test:docker       # 7 tests, about 1.5 min
+```
+
+| Test | Checks |
+| ---- | ------ |
+| 1. Successful build | commit `d577dab` → full SHA recorded, image `…:d577dab0332a`, container running, `GET /` = `Hello from DeployX`, log sequence, workspace removed |
+| Security | container not privileged, no mounts, `CapDrop ALL`, `no-new-privileges`, limits set, only on the app network, ports on 127.0.0.1, no `DATABASE_URL`/`REDIS_URL`/passwords in its env, `postgres` not resolvable from the app network |
+| 2 + 6. Invalid Dockerfile + retry | build fails → 3 attempts with 0.2 s / 0.4 s backoff → `FAILED`, parse error stored |
+| 3. Missing Dockerfile | `Dockerfile not found at …`, no build, no retry |
+| 4. Invalid commit | `Commit … not found on branch main`, no retry |
+| 5. Container exits | image builds, container exits → output stored, container removed, `FAILED` after 3 attempts |
+| 7. Multiple deployments | 3 deployments, 2 of them concurrent, all `SUCCESS`; exactly one container left; history kept with `container_removed_at` |
+
+They use their own image prefix (`deployx-test/`) and network (`deployx-apps-test`), and they remove everything they created.
 
 ### Manual verification with Docker
 
+Follow [Local setup and the test repository](#local-setup-and-the-test-repository) to deploy `hello-app`, then try the failing examples: `examples/crash-app/Dockerfile`, `examples/broken-dockerfile/Dockerfile`, a non-existent `dockerfile_path`, or a `commit_sha` that doesn't exist. Useful commands:
+
 ```bash
-docker compose up -d --build
-
-# create a project, then 4 normal deployments and 1 that always fails
-curl -s -X POST localhost:5000/api/projects -H "Content-Type: application/json" \
-  -d '{"name":"demo","github_repo":"https://github.com/example/app"}'
-curl -s -X POST localhost:5000/api/projects/<projectId>/deployments -H "Content-Type: application/json" -d '{}'
-curl -s -X POST localhost:5000/api/projects/<projectId>/deployments -H "Content-Type: application/json" \
-  -d '{"branch":"simulate/fail"}'
-
-docker compose logs -f worker                          # watch jobs start, retry, complete
-curl -s localhost:5000/api/projects/<projectId>/deployments   # statuses
-curl -s localhost:5000/api/deployments/<deploymentId>/logs    # stored logs
-
-# graceful shutdown: create a deployment, then stop the worker while it is BUILDING
-docker compose stop worker                             # waits for the job, then "DeployX Worker stopped"
-```
-
-Polling 5 deployments like this (oldest first; Q = `QUEUED`, B = `BUILDING`, D = `DEPLOYING`, S = `SUCCESS`, F = `FAILED`) shows the concurrency limit and the retries of the failing deployment (the fifth):
-
-```text
-BBQQQ  DDQQQ  SSBBQ  SSDDQ  SSSSB  SSSSQ  SSSSB  SSSSQ  SSSSB  SSSSF
+docker compose logs -f worker                                   # jobs starting, retrying, completing
+docker ps --filter label=deployx.managed=true                   # running app containers
+docker compose stop worker                                      # graceful: waits for the running job
 ```
 
 To try the API by hand, use the `curl` examples above against `http://localhost:5000`. Through the dashboard's proxy, `http://localhost:3000/api/...` works too.
@@ -773,6 +1017,12 @@ netsh interface ipv4 show excludedportrange protocol=tcp
 ```
 
 If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTGRES_PORT` and the port in `DATABASE_URL`, for example `15432`, then run `docker compose up -d postgres`.
+
+**Worker says `docker is not usable` / `permission denied … docker.sock`.** In Docker Compose, set `DOCKER_SOCKET_GID` to the group that owns the socket (`stat -c %g /var/run/docker.sock` on Linux; `0` on Docker Desktop). Outside Docker, make sure `docker version` works in the shell that starts `npm run dev:worker`.
+
+**`NOAUTH Authentication required` from Redis.** Since Phase 4 Redis needs a password. Make `REDIS_URL` in `.env` include `REDIS_PASSWORD`: `redis://:<password>@localhost:6379`.
+
+**Deployment fails with `Project has no container_port configured`.** Projects created before Phase 4 have no port. Set it with `PUT /api/projects/:id` and `{"container_port": 3000}`.
 
 ## Project Status
 
@@ -798,7 +1048,7 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 
 - [x] BullMQ `deployments` queue on the existing Redis (one API connection)
 - [x] Deployment creation queues a job (job ID = deployment ID) and returns immediately
-- [x] Worker with concurrency 2 and a clearly marked simulated pipeline
+- [x] Worker with concurrency 2 and a clearly marked simulated pipeline (replaced by the Docker pipeline in Phase 4)
 - [x] Status and logs written to PostgreSQL at every stage
 - [x] 3 attempts with exponential backoff, final `FAILED` with a log
 - [x] One failed job doesn't affect other jobs or the worker
@@ -806,6 +1056,20 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 - [x] Graceful shutdown on `SIGTERM`/`SIGINT`
 - [x] End-to-end tests (API → BullMQ → Redis → worker → PostgreSQL)
 - [x] No Docker builds, git clones, AWS or webhooks (later phases)
+
+**Phase 4: Docker-based deployment**
+
+- [x] Public GitHub repositories cloned into per-deployment workspaces
+- [x] Exact commit checked out (and recorded when none was requested)
+- [x] Dockerfile validated before building
+- [x] Image built and tagged with the commit SHA
+- [x] Container started on an isolated network with a declared `container_port`, verified running, tracked in PostgreSQL
+- [x] Previous container replaced; deployment history kept
+- [x] Build, checkout and startup failures end `FAILED` with a reason; BullMQ retries for transient failures
+- [x] Workspaces always cleaned up; build logs limited
+- [x] Unprivileged, secret-free, resource-limited app containers; Redis password; services on 127.0.0.1
+- [x] Unit tests and opt-in Docker end-to-end tests
+- [x] No health checks, rollback, real-time logs, webhooks, OAuth or AWS (later phases)
 
 ## Future Phases
 
@@ -815,8 +1079,8 @@ DeployX is developed incrementally across **8 phases**:
 | ----- | --------------------------------------------------------------------- |
 | 1     | Project foundation ✅                                                 |
 | 2     | Data model and REST API ✅                                            |
-| **3** | **Job queue: BullMQ on Redis, worker job processing, retries, concurrency (this phase)** ✅ |
-| 4     | Build & run: git clone, Docker build, container deployment            |
+| 3     | Job queue: BullMQ on Redis, worker job processing, retries, concurrency ✅ |
+| **4** | **Build & run: git clone, Docker build, container deployment (this phase)** ✅ |
 | 5     | Deployment history, state machine, real-time logs (WebSockets/SSE)    |
 | 6     | Health checks for deployed apps, automatic rollback, stable versions  |
 | 7     | GitHub OAuth & webhooks, AWS / EC2 cloud deployment                   |
