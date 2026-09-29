@@ -29,6 +29,12 @@ const config = {
     // Exponential backoff base: retries wait base, 2 x base, 4 x base, ...
     backoffMs: positiveInt(process.env.DEPLOYMENT_JOB_BACKOFF_MS, 2000),
   },
+  // Live log streams (SSE): how often each stream re-checks the database in
+  // case a Redis event was missed, and how often it sends a keep-alive.
+  logStream: {
+    pollMs: positiveInt(process.env.LOG_STREAM_POLL_MS, 2000),
+    heartbeatMs: positiveInt(process.env.LOG_STREAM_HEARTBEAT_MS, 15000),
+  },
   // Temporary stand-in for authentication (see middleware/devUser.js).
   devUser: {
     email: (process.env.DEV_USER_EMAIL || 'dev@deployx.local').toLowerCase(),

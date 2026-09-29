@@ -2,6 +2,8 @@ import app from './app.js';
 import config from './config/index.js';
 import { closePostgres } from './db/postgres.js';
 import { connectRedis, closeRedis } from './db/redis.js';
+import { closeAllLogStreams } from './controllers/logStream.controller.js';
+import { closeSubscriber } from './events/deploymentSubscriber.js';
 import { closeDeploymentQueue } from './queues/deploymentQueue.js';
 
 connectRedis();
@@ -13,6 +15,9 @@ const server = app.listen(config.port, () => {
 async function shutdown(signal) {
   console.log(`[api] ${signal} received, shutting down`);
   server.close();
+  // End live log streams (browsers reconnect elsewhere), then their subscriber.
+  closeAllLogStreams();
+  await closeSubscriber().catch(() => {});
   // The queue uses the shared Redis connection, so close it first.
   await closeDeploymentQueue().catch(() => {});
   await Promise.allSettled([closePostgres(), closeRedis()]);

@@ -38,6 +38,8 @@ const { default: pool, closePostgres } = await import('../src/db/postgres.js');
 const { connectRedis, closeRedis } = await import('../src/db/redis.js');
 const { runMigrations } = await import('../src/db/migrate.js');
 const { getDeploymentQueue, closeDeploymentQueue } = await import('../src/queues/deploymentQueue.js');
+const { closeSubscriber } = await import('../src/events/deploymentSubscriber.js');
+const { closeAllLogStreams } = await import('../src/controllers/logStream.controller.js');
 
 export { pool, getDeploymentQueue };
 
@@ -91,12 +93,15 @@ export async function setupTestServer() {
   }
 
   async function close() {
+    closeAllLogStreams();
     await new Promise((resolve) => server.close(resolve));
+    await closeSubscriber();
     await closeDeploymentQueue();
     await Promise.allSettled([closePostgres(), closeRedis()]);
   }
 
   return {
+    baseUrl,
     get: (urlPath) => request('GET', urlPath),
     post: (urlPath, body, options) => request('POST', urlPath, body, options),
     put: (urlPath, body) => request('PUT', urlPath, body),

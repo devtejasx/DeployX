@@ -5,6 +5,9 @@ import { getDeployment } from './deployment.service.js';
 
 const LOG_COLUMNS = 'id, deployment_id, level, message, created_at';
 
+// Most lines read per query by live streams.
+export const LOG_BATCH_SIZE = 500;
+
 // Inserts only if the deployment exists and belongs to the user, in one
 // statement, then publishes the line to live log streams.
 export async function addLog(userId, deploymentId, { level, message }) {
@@ -21,6 +24,20 @@ export async function addLog(userId, deploymentId, { level, message }) {
   }
   await publishLog(deploymentId, rows[0]);
   return rows[0];
+}
+
+// Lines written after log `afterId` (a bigint as a decimal string), oldest
+// first, at most LOG_BATCH_SIZE. Used by live streams, which check ownership
+// once when they open.
+export async function listLogsAfter(deploymentId, afterId) {
+  const { rows } = await query(
+    `SELECT ${LOG_COLUMNS} FROM deployment_logs
+     WHERE deployment_id = $1 AND id > $2::bigint
+     ORDER BY id
+     LIMIT ${LOG_BATCH_SIZE}`,
+    [deploymentId, afterId],
+  );
+  return rows;
 }
 
 // Chronological order. The identity id breaks ties between log lines written
