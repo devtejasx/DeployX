@@ -12,7 +12,7 @@ const PG_ERRORS = {
 
 function toClientError(err) {
   if (err instanceof ApiError) {
-    return { statusCode: err.statusCode, message: err.message, details: err.details };
+    return { statusCode: err.statusCode, message: err.message, details: err.details, extra: err.extra };
   }
 
   // Raised by express.json() for unparsable or oversized bodies.
@@ -33,7 +33,7 @@ function toClientError(err) {
 // Global error handler. Express recognises it by its four-argument signature,
 // so `next` must stay in the parameter list even though it is unused.
 export function errorHandler(err, req, res, next) {
-  const { statusCode, message, details } = toClientError(err);
+  const { statusCode, message, details, extra } = toClientError(err);
 
   // Internal details (SQL, stack traces, connection strings) are only logged,
   // never sent to the client.
@@ -43,7 +43,7 @@ export function errorHandler(err, req, res, next) {
     console.error(`[api] ${req.method} ${req.originalUrl} failed:`, err);
   }
 
-  const error = { message };
+  const error = { message, ...extra };
   if (details) error.details = details;
 
   res.status(statusCode).json({ success: false, error });

@@ -1,6 +1,7 @@
 import { query } from '../db/postgres.js';
 import { enqueueDeployment } from '../queues/deploymentQueue.js';
 import { ApiError } from '../utils/ApiError.js';
+import { transitionDeploymentStatus } from './deploymentStateMachine.js';
 import { getProject } from './project.service.js';
 
 const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.commit_sha, d.branch, d.status, d.docker_image,
@@ -48,10 +49,7 @@ export async function createDeployment(userId, projectId, data) {
     // Without a job nothing would ever pick the deployment up, so record the
     // failure instead of leaving it QUEUED forever.
     console.error(`[api] Could not queue deployment ${deployment.id}:`, err.message || err);
-    await query(
-      `UPDATE deployments SET status = 'FAILED', finished_at = now() WHERE id = $1`,
-      [deployment.id],
-    );
+    await transitionDeploymentStatus(deployment.id, 'FAILED', { errorMessage: 'Deployment queue is unavailable' });
     await appendLog(deployment.id, 'ERROR', 'Could not add the deployment job to the queue (Redis unavailable)');
     throw new ApiError(503, 'Deployment queue is unavailable; the deployment was marked as FAILED');
   }
@@ -85,34 +83,12 @@ export async function getDeployment(userId, deploymentId) {
   return rows[0];
 }
 
-// Records a status change and keeps the timestamps consistent with it:
-// - started_at is set the first time the deployment leaves QUEUED
-// - finished_at is set on SUCCESS/FAILED and cleared otherwise
-// Which transitions are allowed is not enforced yet (a later phase). The
-// worker drives the status while it processes a job; this is a manual
-// override and is not coordinated with a job that is currently running.
+// Manual status change through the state machine: only transitions listed
+// in deployment_status_transitions are accepted (409 otherwise), and the
+// timestamps follow the database rules. The worker drives the status while
+// it processes a job; this override is not coordinated with a running job.
 export async function updateDeploymentStatus(userId, deploymentId, status) {
-  const { rows } = await query(
-    `WITH d AS (
-       UPDATE deployments AS dep
-       SET status = $3::varchar,
-           started_at = CASE
-             WHEN $3::varchar = 'QUEUED' THEN NULL
-             ELSE COALESCE(dep.started_at, now())
-           END,
-           finished_at = CASE
-             WHEN $3::varchar IN ('SUCCESS', 'FAILED') THEN now()
-             ELSE NULL
-           END
-       FROM projects AS owner
-       WHERE dep.id = $1 AND owner.id = dep.project_id AND owner.user_id = $2
-       RETURNING dep.*
-     )
-     SELECT ${DEPLOYMENT_DETAIL_COLUMNS} FROM d JOIN projects p ON p.id = d.project_id`,
-    [deploymentId, userId, status],
-  );
-  if (rows.length === 0) {
-    throw ApiError.notFound('Deployment not found');
-  }
-  return rows[0];
+  await getDeployment(userId, deploymentId); // 404 unless it exists and is the user's
+  await transitionDeploymentStatus(deploymentId, status);
+  return getDeployment(userId, deploymentId);
 }

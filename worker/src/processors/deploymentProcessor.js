@@ -6,7 +6,7 @@ import {
   addLog,
   getDeploymentWithProject,
   markFailed,
-  setStatus,
+  transitionDeploymentStatus,
 } from '../services/deploymentService.js';
 
 // Delay BullMQ will wait before the next attempt (for the log message only).
@@ -49,9 +49,10 @@ export function createDeploymentProcessor({ pipeline = runDockerDeployment } = {
       deployment,
       project: deployment.project,
       log: (level, message) => addLog(deploymentId, level, message),
-      // Moves the deployment to a new status together with its log line.
+      // Moves the deployment to a new status (through the state machine)
+      // together with its log line.
       async setStage(status, message) {
-        const updated = await setStatus(deploymentId, status, message);
+        const updated = await transitionDeploymentStatus(deploymentId, status, { message });
         if (!updated) {
           // Deleted mid-flight (its project was removed): retrying cannot help.
           throw new UnrecoverableError('Deployment was deleted while it was being processed');
@@ -86,7 +87,10 @@ async function recordFailedAttempt(job, err, attempt, maxAttempts) {
   if (willRetry) {
     // Back to QUEUED while BullMQ waits to retry; started_at is kept.
     const delaySeconds = nextRetryDelayMs(job, attempt) / 1000;
-    await setStatus(deploymentId, 'QUEUED', `Retrying in ${delaySeconds}s (attempt ${attempt + 1} of ${maxAttempts})`, 'WARN');
+    await transitionDeploymentStatus(deploymentId, 'QUEUED', {
+      message: `Retrying in ${delaySeconds}s (attempt ${attempt + 1} of ${maxAttempts})`,
+      level: 'WARN',
+    });
     return;
   }
 

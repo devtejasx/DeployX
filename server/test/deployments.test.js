@@ -191,7 +191,8 @@ describe('PATCH /api/deployments/:deploymentId/status', () => {
     const deployment = await createDeployment();
     const { body } = await api.patch(`/api/deployments/${deployment.id}/status`, { status: 'FAILED' });
     assert.equal(body.data.status, 'FAILED');
-    assert.ok(body.data.started_at);
+    // It never started work, so there is no start time (state machine rule).
+    assert.equal(body.data.started_at, null);
     assert.ok(body.data.finished_at);
   });
 
@@ -214,6 +215,57 @@ describe('PATCH /api/deployments/:deploymentId/status', () => {
 
   test('returns 404 for a deployment that does not exist', async () => {
     const { status } = await api.patch(`/api/deployments/${MISSING_ID}/status`, { status: 'BUILDING' });
+    assert.equal(status, 404);
+  });
+});
+
+describe('deployment state machine through the API', () => {
+  test('invalid transitions are rejected with 409 and the from/to states', async () => {
+    const deployment = await createDeployment();
+    const patch = (status) => api.patch(`/api/deployments/${deployment.id}/status`, { status });
+
+    const skip = await patch('SUCCESS');
+    assert.equal(skip.status, 409);
+    assert.deepEqual(skip.body, {
+      success: false,
+      error: { message: 'Invalid deployment state transition', from: 'QUEUED', to: 'SUCCESS' },
+    });
+
+    for (const status of ['BUILDING', 'DEPLOYING', 'SUCCESS']) {
+      assert.equal((await patch(status)).status, 200);
+    }
+    for (const [to, from] of [
+      ['BUILDING', 'SUCCESS'],
+      ['QUEUED', 'SUCCESS'],
+      ['FAILED', 'SUCCESS'],
+    ]) {
+      const { status, body } = await patch(to);
+      assert.equal(status, 409, `${from} -> ${to}`);
+      assert.deepEqual(body.error, { message: 'Invalid deployment state transition', from, to });
+    }
+
+    const unchanged = await api.get(`/api/deployments/${deployment.id}`);
+    assert.equal(unchanged.body.data.status, 'SUCCESS');
+  });
+
+  test('FAILED is final too', async () => {
+    const deployment = await createDeployment();
+    await api.patch(`/api/deployments/${deployment.id}/status`, { status: 'FAILED' });
+    const { status, body } = await api.patch(`/api/deployments/${deployment.id}/status`, { status: 'DEPLOYING' });
+    assert.equal(status, 409);
+    assert.deepEqual(body.error, { message: 'Invalid deployment state transition', from: 'FAILED', to: 'DEPLOYING' });
+  });
+
+  test('setting the current status again changes nothing', async () => {
+    const deployment = await createDeployment();
+    const { status, body } = await api.patch(`/api/deployments/${deployment.id}/status`, { status: 'QUEUED' });
+    assert.equal(status, 200);
+    assert.equal(body.data.status, 'QUEUED');
+    assert.equal(body.data.updated_at, deployment.updated_at);
+  });
+
+  test('an unknown deployment is still a 404, not a state machine error', async () => {
+    const { status } = await api.patch(`/api/deployments/${MISSING_ID}/status`, { status: 'SUCCESS' });
     assert.equal(status, 404);
   });
 });

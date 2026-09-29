@@ -237,6 +237,27 @@ describe('retries and failures', () => {
     const next = (await deploy()).deployment;
     await waitForStatus(next.id, ['SUCCESS']);
   });
+
+  test('the worker obeys the state machine: a deployment failed by hand mid-run is not resumed', async () => {
+    const { deployment } = await deploy();
+    await waitForStatus(deployment.id, ['BUILDING']);
+    // Manual override while the job is in its (fake) build step.
+    assert.equal((await api.patch(`/api/deployments/${deployment.id}/status`, { status: 'FAILED' })).status, 200);
+
+    const job = await waitFor(async () => {
+      const current = await getDeploymentQueue().getJob(deployment.id);
+      return (await current.getState()) === 'failed' ? current : null;
+    });
+    // FAILED -> DEPLOYING is rejected, and the job ends without retries.
+    assert.equal(job.failedReason, 'Invalid deployment state transition: FAILED -> DEPLOYING');
+    assert.equal(job.attemptsMade, 1);
+    assert.equal(await getStatus(deployment.id), 'FAILED');
+    assert.ok(
+      (await logMessages(deployment.id)).includes(
+        'ERROR Attempt 1 of 3 failed: Invalid deployment state transition: FAILED -> DEPLOYING',
+      ),
+    );
+  });
 });
 
 describe('duplicates and removed deployments', () => {
