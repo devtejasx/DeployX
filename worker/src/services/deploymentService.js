@@ -1,5 +1,6 @@
 import { UnrecoverableError } from 'bullmq';
 import { query } from '../db/postgres.js';
+import { publishLog, publishStatus } from '../events/deploymentEvents.js';
 
 export const TERMINAL_STATUSES = ['SUCCESS', 'FAILED'];
 
@@ -21,6 +22,7 @@ const DEPLOYMENT_COLUMNS = `id, project_id, commit_sha, branch, status, docker_i
 // Log messages are capped to fit deployment_logs (and to stay readable).
 const MAX_LOG_LENGTH = 4000;
 const MAX_ERROR_LENGTH = 2000;
+const LOG_RETURNING = 'RETURNING id, level, message, created_at';
 
 function clip(text, max) {
   return text.length > max ? `${text.slice(0, max - 14)}… [truncated]` : text;
@@ -46,7 +48,8 @@ export async function getDeploymentWithProject(deploymentId) {
 // database state machine (transition_deployment_status), which rejects
 // transitions that are not allowed and keeps the timestamps right. In the
 // same statement `message` is appended to the logs, so nobody can observe the
-// new status without its log line.
+// new status without its log line. Both are then published as real-time
+// events (log first, then status).
 // Returns the updated deployment, or null if it no longer exists.
 export async function transitionDeploymentStatus(deploymentId, status, { message = null, level = 'INFO' } = {}) {
   try {
@@ -56,11 +59,16 @@ export async function transitionDeploymentStatus(deploymentId, status, { message
        ), logged AS (
          INSERT INTO deployment_logs (deployment_id, level, message)
          SELECT id, $3, $4 FROM updated WHERE $4::text IS NOT NULL
+         ${LOG_RETURNING}
        )
-       SELECT * FROM updated`,
+       SELECT updated.*, (SELECT row_to_json(logged) FROM logged) AS log FROM updated`,
       [deploymentId, status, level, message === null ? null : clip(message, MAX_LOG_LENGTH)],
     );
-    return rows[0] ?? null;
+    if (rows.length === 0) return null;
+    const { log, ...deployment } = rows[0];
+    await publishLog(deploymentId, log);
+    await publishStatus(deploymentId, deployment.status);
+    return deployment;
   } catch (err) {
     if (err.code === INVALID_TRANSITION) throw invalidTransition(err);
     throw err;
@@ -81,11 +89,15 @@ export async function markFailed(deploymentId, errorMessage, message) {
        ), logged AS (
          INSERT INTO deployment_logs (deployment_id, level, message)
          SELECT id, 'ERROR', $3 FROM updated
+         ${LOG_RETURNING}
        )
-       SELECT id FROM updated`,
+       SELECT (SELECT row_to_json(logged) FROM logged) AS log FROM updated`,
       [deploymentId, clip(errorMessage, MAX_ERROR_LENGTH), clip(message, MAX_LOG_LENGTH)],
     );
-    return rows.length > 0;
+    if (rows.length === 0) return false;
+    await publishLog(deploymentId, rows[0].log);
+    await publishStatus(deploymentId, 'FAILED');
+    return true;
   } catch (err) {
     // It reached a final state concurrently: nothing to mark.
     if (err.code === INVALID_TRANSITION) return false;
@@ -93,14 +105,17 @@ export async function markFailed(deploymentId, errorMessage, message) {
   }
 }
 
-// Appends a log line through the same deployment_logs table the API serves.
-// A deployment that has been deleted is silently skipped.
+// Appends a log line through the same deployment_logs table the API serves,
+// then publishes it as a real-time event. A deployment that has been deleted
+// is silently skipped.
 export async function addLog(deploymentId, level, message) {
-  await query(
+  const { rows } = await query(
     `INSERT INTO deployment_logs (deployment_id, level, message)
-     SELECT id, $2, $3 FROM deployments WHERE id = $1`,
+     SELECT id, $2, $3 FROM deployments WHERE id = $1
+     ${LOG_RETURNING}`,
     [deploymentId, level, clip(message, MAX_LOG_LENGTH)],
   );
+  await publishLog(deploymentId, rows[0]);
 }
 
 // Stores the exact commit that was checked out (fills it in when the
@@ -125,14 +140,16 @@ export async function recordContainer(deploymentId, { containerId, containerName
 // The deployment's container was removed (e.g. replaced by a newer
 // deployment). The deployment row and its logs are kept as history.
 export async function recordContainerRemoved(deploymentId, message) {
-  await query(
+  const { rows } = await query(
     `WITH updated AS (
        UPDATE deployments SET container_removed_at = now()
        WHERE id = $1 AND container_removed_at IS NULL
        RETURNING id
      )
      INSERT INTO deployment_logs (deployment_id, level, message)
-     SELECT id, 'INFO', $2 FROM updated`,
+     SELECT id, 'INFO', $2 FROM updated
+     ${LOG_RETURNING}`,
     [deploymentId, clip(message, MAX_LOG_LENGTH)],
   );
+  await publishLog(deploymentId, rows[0]);
 }

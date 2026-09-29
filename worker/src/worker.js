@@ -1,6 +1,7 @@
 import { Worker } from 'bullmq';
 import config from './config/index.js';
 import { createRedisConnection } from './config/redis.js';
+import { clearEventPublisher, setEventPublisher } from './events/deploymentEvents.js';
 import { createDeploymentProcessor } from './processors/deploymentProcessor.js';
 import { markFailed } from './services/deploymentService.js';
 
@@ -11,6 +12,8 @@ export function createDeploymentWorker({
   processor = createDeploymentProcessor(),
 } = {}) {
   const connection = createRedisConnection();
+  // Real-time log/status events are published on this same connection.
+  setEventPublisher(connection);
 
   const worker = new Worker(config.queue.name, processor, {
     connection,
@@ -51,6 +54,7 @@ export function createDeploymentWorker({
   // closes the Redis connection.
   async function close(force = false) {
     await worker.close(force);
+    clearEventPublisher(connection);
     await connection.quit().catch(() => connection.disconnect());
   }
 

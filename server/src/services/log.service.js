@@ -1,10 +1,12 @@
 import { query } from '../db/postgres.js';
+import { publishLog } from '../events/deploymentEvents.js';
 import { ApiError } from '../utils/ApiError.js';
 import { getDeployment } from './deployment.service.js';
 
 const LOG_COLUMNS = 'id, deployment_id, level, message, created_at';
 
-// Inserts only if the deployment exists and belongs to the user, in one statement.
+// Inserts only if the deployment exists and belongs to the user, in one
+// statement, then publishes the line to live log streams.
 export async function addLog(userId, deploymentId, { level, message }) {
   const { rows } = await query(
     `INSERT INTO deployment_logs (deployment_id, level, message)
@@ -17,6 +19,7 @@ export async function addLog(userId, deploymentId, { level, message }) {
   if (rows.length === 0) {
     throw ApiError.notFound('Deployment not found');
   }
+  await publishLog(deploymentId, rows[0]);
   return rows[0];
 }
 

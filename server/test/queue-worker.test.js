@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, mock, test } from 'node:test';
 import { FAIL_BRANCH, FLAKY_BRANCH, createFakePipeline } from './fakePipeline.js';
-import { getDeploymentQueue, pool, projectPayload, setupTestServer } from './helpers.js';
+import { getDeploymentQueue, pool, projectPayload, recordDeploymentEvents, setupTestServer } from './helpers.js';
 
 const STEP_MS = 300;
 const CONCURRENCY = 2;
@@ -135,6 +135,35 @@ describe('single deployment job', () => {
     const job = await getDeploymentQueue().getJob(deployment.id);
     assert.equal(await job.getState(), 'completed');
     assert.deepEqual(job.returnvalue, { status: 'SUCCESS' });
+  });
+
+  test('every persisted log line and status change is published in real time', async () => {
+    const recorder = await recordDeploymentEvents();
+    try {
+      const { deployment } = await deploy();
+      await waitForStatus(deployment.id, ['SUCCESS']);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      const events = recorder.forDeployment(deployment.id);
+      const { rows } = await pool.query(
+        'SELECT id::text, message FROM deployment_logs WHERE deployment_id = $1 ORDER BY id',
+        [deployment.id],
+      );
+      // Same lines, same order, same ids as in PostgreSQL.
+      assert.deepEqual(
+        events.filter((e) => e.type === 'log').map((e) => [e.log.id, e.log.message]),
+        rows.map((row) => [row.id, row.message]),
+      );
+      assert.deepEqual(
+        events.filter((e) => e.type === 'status').map((e) => e.status),
+        ['BUILDING', 'DEPLOYING', 'SUCCESS'],
+      );
+      // Each status arrives right after the log line written with it.
+      const successIndex = events.findIndex((e) => e.type === 'status' && e.status === 'SUCCESS');
+      assert.equal(events[successIndex - 1].log.message, 'Deployment completed successfully');
+    } finally {
+      await recorder.close();
+    }
   });
 });
 

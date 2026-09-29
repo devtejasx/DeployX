@@ -1,4 +1,5 @@
 import { query } from '../db/postgres.js';
+import { publishLog, publishStatus } from '../events/deploymentEvents.js';
 import { enqueueDeployment } from '../queues/deploymentQueue.js';
 import { ApiError } from '../utils/ApiError.js';
 import { transitionDeploymentStatus } from './deploymentStateMachine.js';
@@ -12,13 +13,15 @@ const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.commit_sha, d.branch, d.status
 const DEPLOYMENT_DETAIL_COLUMNS = `${DEPLOYMENT_COLUMNS},
   json_build_object('id', p.id, 'name', p.name, 'github_repo', p.github_repo) AS project`;
 
-// Log lines written by the platform itself (not submitted through the API).
+// Log lines written by the platform itself (not submitted through the API),
+// persisted first and then published as real-time events.
 async function appendLog(deploymentId, level, message) {
-  await query('INSERT INTO deployment_logs (deployment_id, level, message) VALUES ($1, $2, $3)', [
-    deploymentId,
-    level,
-    message,
-  ]);
+  const { rows } = await query(
+    `INSERT INTO deployment_logs (deployment_id, level, message) VALUES ($1, $2, $3)
+     RETURNING id, level, message, created_at`,
+    [deploymentId, level, message],
+  );
+  await publishLog(deploymentId, rows[0]);
 }
 
 // Creates the QUEUED record and hands it to the job queue. The API returns as
@@ -51,6 +54,7 @@ export async function createDeployment(userId, projectId, data) {
     console.error(`[api] Could not queue deployment ${deployment.id}:`, err.message || err);
     await transitionDeploymentStatus(deployment.id, 'FAILED', { errorMessage: 'Deployment queue is unavailable' });
     await appendLog(deployment.id, 'ERROR', 'Could not add the deployment job to the queue (Redis unavailable)');
+    await publishStatus(deployment.id, 'FAILED');
     throw new ApiError(503, 'Deployment queue is unavailable; the deployment was marked as FAILED');
   }
 
@@ -88,7 +92,8 @@ export async function getDeployment(userId, deploymentId) {
 // timestamps follow the database rules. The worker drives the status while
 // it processes a job; this override is not coordinated with a running job.
 export async function updateDeploymentStatus(userId, deploymentId, status) {
-  await getDeployment(userId, deploymentId); // 404 unless it exists and is the user's
+  const before = await getDeployment(userId, deploymentId); // 404 unless it exists and is the user's
   await transitionDeploymentStatus(deploymentId, status);
+  if (before.status !== status) await publishStatus(deploymentId, status);
   return getDeployment(userId, deploymentId);
 }

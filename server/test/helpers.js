@@ -108,6 +108,23 @@ export async function setupTestServer() {
 
 export const MISSING_ID = '00000000-0000-4000-8000-000000000000';
 
+// Records every deployment event published on the test queue prefix:
+// [{ channel, event }]. Uses its own Redis connection (subscriber mode).
+export async function recordDeploymentEvents() {
+  const { default: IORedis } = await import('ioredis');
+  const subscriber = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379');
+  const events = [];
+  subscriber.on('pmessage', (pattern, channel, message) => {
+    events.push({ channel, event: JSON.parse(message) });
+  });
+  await subscriber.psubscribe(`${process.env.QUEUE_PREFIX}:deployment:*:events`);
+  return {
+    events,
+    forDeployment: (deploymentId) => events.filter((e) => e.event.deploymentId === deploymentId).map((e) => e.event),
+    close: () => subscriber.quit(),
+  };
+}
+
 let projectCounter = 0;
 
 export function projectPayload(overrides = {}) {
