@@ -2,7 +2,7 @@
 
 A self-service deployment platform: connect a GitHub repository, build it into a Docker image, deploy it, watch it run and roll back automatically when a release goes bad.
 
-> **Status: Phase 4 of 8. Docker-based deployment.** DeployX is being built one phase at a time. Creating a deployment queues a job; the worker clones the public GitHub repository at the requested commit, builds a Docker image and starts it as a container on an isolated network, tracking everything in PostgreSQL. Health checks and rollback (Phase 6), real-time logs (Phase 5), GitHub/AWS integration (Phase 7) and production-grade isolation (Phase 8) come later. See [Security measures and limitations](#security-measures-and-limitations-development-setup) before deploying code you don't trust.
+> **Status: Phase 5 of 8. State machine, deployment history and real-time logs.** DeployX is being built one phase at a time. Creating a deployment queues a job; the worker clones the public GitHub repository at the requested commit, builds a Docker image and starts it as a container on an isolated network. Every status change goes through a database-enforced state machine, and the dashboard shows each application's deployment history with **live logs over Server-Sent Events**. Health checks and rollback (Phase 6), GitHub/AWS integration (Phase 7) and production-grade isolation (Phase 8) come later. See [Security measures and limitations](#security-measures-and-limitations-development-setup) before deploying code you don't trust.
 
 ## Overview
 
@@ -41,6 +41,13 @@ A self-service deployment platform: connect a GitHub repository, build it into a
 - Build and startup failures end as `FAILED` with the reason; transient failures use the Phase 3 retries
 - Test apps in [`examples/`](examples) and opt-in **Docker end-to-end tests**
 
+**Phase 5 (state machine, history, real-time logs)**
+
+- A **deployment state machine** enforced by PostgreSQL: allowed transitions live in one table, a trigger rejects the rest, and the API and worker both change status only through `transitionDeploymentStatus()`
+- **Real-time events**: every log line and status change is published to Redis Pub/Sub on a per-deployment channel
+- **`GET /api/deployments/:id/logs/stream`** (Server-Sent Events): stored logs first, then live lines and status, resume via `Last-Event-ID`, closes when the deployment finishes
+- **Dashboard**: applications → deployment history (newest first) → deployment details with **live logs**, lifecycle steps and errors
+
 ## Architecture
 
 ```text
@@ -75,7 +82,7 @@ A self-service deployment platform: connect a GitHub repository, build it into a
              └──────────────┘
 ```
 
-The browser only talks to the client. The Vite dev server forwards `/api/*` requests to the API, so the frontend never contains a hard-coded backend URL.
+The browser only talks to the client. The Vite dev server forwards `/api/*` requests to the API, so the frontend never contains a hard-coded backend URL. Running deployments are followed over **Server-Sent Events** (`/api/deployments/:id/logs/stream`); the API learns about new log lines and status changes from **Redis Pub/Sub** events that the worker publishes (see [Real-Time Deployment Logs](#real-time-deployment-logs-phase-5)).
 
 Each API request passes through these layers:
 
@@ -208,6 +215,7 @@ docker compose run --rm migrate         # apply pending migrations
 | --------- | ---- |
 | `1790330478769_create-core-schema` | `users`, `projects`, `deployments`, `deployment_logs`, indexes, triggers |
 | `1790587019517_add-container-tracking` | `projects.container_port`; `deployments.container_id`, `container_name`, `host_port`, `container_removed_at`, `error_message` |
+| `1790671094193_deployment-state-machine` | `deployment_status_transitions` (the transition map), the enforcing trigger, `transition_deployment_status()` |
 
 `docker compose up` runs the `migrate` service automatically, and the API starts only after it has finished successfully.
 
@@ -543,6 +551,113 @@ curl -s http://127.0.0.1:<host_port>/                         # Hello from Deplo
 
 Running the worker outside Docker (`npm run dev:worker`) works the same way, using your local `git` and `docker` CLIs. On Linux, give Compose the socket's group: `DOCKER_SOCKET_GID=$(stat -c %g /var/run/docker.sock)` in `.env`.
 
+## Deployment State Machine (Phase 5)
+
+A deployment can only move between statuses along these edges:
+
+```text
+             ┌────────────── retry (BullMQ backoff) ─────────────┐
+             ▼                                                    │
+         ┌────────┐      ┌──────────┐      ┌───────────┐      ┌─────────┐
+  new ──▶│ QUEUED │─────▶│ BUILDING │─────▶│ DEPLOYING │─────▶│ SUCCESS │  final
+         └───┬────┘      └────┬─────┘      └─────┬─────┘      └─────────┘
+             │                │                  │
+             └────────────────┴──────────────────┴──────────▶  FAILED     final
+```
+
+| From | Allowed to | Why |
+| ---- | ---------- | --- |
+| `QUEUED` | `BUILDING`, `FAILED` | the worker starts the job / it could not be queued or failed before building |
+| `BUILDING` | `DEPLOYING`, `FAILED`, `QUEUED` | image built / failed for good / attempt failed, BullMQ will retry |
+| `DEPLOYING` | `SUCCESS`, `FAILED`, `QUEUED` | container running / failed for good / attempt failed, BullMQ will retry |
+| `SUCCESS`, `FAILED` | nothing | final |
+| (`HEALTH_CHECK`) | reserved for Phase 6 (`DEPLOYING → HEALTH_CHECK → SUCCESS/FAILED/QUEUED`) | not entered yet |
+
+`BUILDING/DEPLOYING → QUEUED` is kept on purpose. Since Phase 3, a failed attempt waits in `QUEUED` until BullMQ retries it; every attempt stays on the same deployment row. Everything else is rejected, for example `SUCCESS → BUILDING`, `FAILED → DEPLOYING` and `SUCCESS → QUEUED`.
+
+**Where it's enforced.** The API and the worker are separate packages. The only place both can share one definition is the **database**. Migration [`1790671094193_deployment-state-machine`](server/src/db/migrations/1790671094193_deployment-state-machine.sql) adds three things:
+
+- **`deployment_status_transitions`**: the map above, as rows with descriptions. Phase 6 extends it by inserting rows in a new migration.
+- a **trigger** on `deployments` that rejects any status change not in the table, with SQLSTATE `DX001` and detail `{"from","to"}`. It applies to every writer: the API, the worker, or plain SQL.
+- **`transition_deployment_status(id, status, error_message)`**, the one function that changes status:
+  1. It locks the row and reads the current status.
+  2. It returns nothing for an unknown deployment.
+  3. It's a **no-op** if the status is already the target, so repeating a step is harmless.
+  4. Otherwise it applies the change and keeps the timestamps right: `started_at` when work first begins (kept across retries), `finished_at` on `SUCCESS`/`FAILED`, and `error_message` on `FAILED`.
+
+In code, both sides call a `transitionDeploymentStatus(deploymentId, newStatus)` wrapper. No code writes `deployments.status` directly.
+
+- **API:** [`deploymentStateMachine.js`](server/src/services/deploymentStateMachine.js). `PATCH /api/deployments/:id/status` returns **409** for an invalid transition:
+  ```json
+  { "success": false, "error": { "message": "Invalid deployment state transition", "from": "SUCCESS", "to": "BUILDING" } }
+  ```
+- **Worker:** `transitionDeploymentStatus()` in [`deploymentService.js`](worker/src/services/deploymentService.js). It still writes the status and its log line in one statement. An invalid transition ends the job as an `UnrecoverableError`, without retries; for example, when someone sets a running deployment to `FAILED` by hand.
+
+## Real-Time Deployment Logs (Phase 5)
+
+```text
+Worker / API
+   │  1. INSERT deployment_logs / transition_deployment_status()   (PostgreSQL: source of truth)
+   │  2. PUBLISH <QUEUE_PREFIX>:deployment:<id>:events               (Redis Pub/Sub: "something changed")
+   ▼
+Redis ──▶ API subscriber (one connection, one channel per watched deployment)
+               │ 3. re-read PostgreSQL: lines after the last one sent, current status
+               ▼
+          GET /api/deployments/:id/logs/stream   (Server-Sent Events)
+               │
+               ▼
+          React: EventSource → log viewer + status
+```
+
+**Events.** Every persisted log line and status change is published on the deployment's **own** channel, `<QUEUE_PREFIX>:deployment:<deploymentId>:events`. So events of deployment A can never reach a stream of deployment B. The payloads are `{type:"log", log:{id, level, message, created_at}}` and `{type:"status", status}`.
+- The worker publishes on its existing Redis connection; the API on its single shared one.
+- Publishing is **best effort**: the row is already committed. A Redis outage is logged, never turned into a failed request or job.
+
+**The stream.** `GET /api/deployments/:deploymentId/logs/stream` responds with `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`:
+
+```text
+retry: 3000
+
+id: 1041
+event: log
+data: {"id":"1041","deployment_id":"…","level":"INFO","message":"Cloning repository …","created_at":"…"}
+
+event: status
+data: { …the deployment, exactly as GET /api/deployments/:id… }
+
+: keep-alive
+
+event: end
+data: {"deploymentId":"…","status":"SUCCESS"}
+```
+
+1. The deployment is checked first, so an unknown or foreign ID gets the normal JSON `404`/`400`, not a stream.
+2. **Stored lines are sent first** (all of them, or those after `Last-Event-ID`), then the current status.
+3. Each Redis event, plus a database check every `LOG_STREAM_POLL_MS` (2 s) as a safety net, makes the stream **re-read PostgreSQL** for lines after the last one it sent. Events aren't forwarded blindly. So lines always arrive **in database order, without gaps or duplicates**, even when an event is lost or Redis is down (then updates arrive within the poll interval instead of instantly).
+4. Status changes are sent as `status` events. The stream sends `end` and **closes** once the deployment is `SUCCESS` or `FAILED`. Keep-alive comments go out every 15 s.
+5. When the client disconnects, the timers and the Redis listener are released. The API holds **one** subscriber connection for all streams, and each deployment channel is subscribed once, however many browsers watch it. When the last stream leaves, the channel is unsubscribed.
+6. If the database fails mid-stream, the API sends `stream-error` and closes, and the browser reconnects. On shutdown the API ends open streams so browsers reconnect elsewhere.
+
+**Reconnects.** Every log event carries its database id as the SSE `id`.
+- The browser's `EventSource` reconnects by itself, sending `Last-Event-ID`, and receives only the lines it missed.
+- If the browser gives up (for example, the dev proxy answered `502` while the API restarted), the dashboard reopens the stream itself with `?lastEventId=<id>`, after checking that the deployment still exists.
+- The UI also ignores any line id it has already shown. Verified by restarting the API in the middle of a deployment: the page ended with all 56 lines, 0 duplicates.
+
+**Worker crashes.** If the worker dies mid-job, the stream stays open (keep-alives) and shows the last known status. When BullMQ hands the stalled job to a worker again, new lines and statuses flow as usual.
+
+## Dashboard (Phase 5)
+
+`http://localhost:3000` now has three parts under the system status card:
+
+- **Applications:** your projects; pick one.
+- **Deployment history:** that project's deployments, **newest first**. Each row shows its number (`#1` = oldest), short ID, commit, a status badge, created/started/finished time, duration, and the error for failed ones. **Deploy** queues a new deployment of the branch head. The list refreshes every 3 s while something is running, and immediately when the selected deployment changes status.
+- **Deployment details:**
+  - the lifecycle steps `QUEUED → BUILDING → DEPLOYING → SUCCESS/FAILED`, status, full commit SHA, branch, timestamps, a running duration that ticks, image, container and local URL, and the error box for `FAILED`;
+  - **live logs** that follow new lines (scroll up to pause) and show whether the stream is Live, Reconnecting or closed;
+  - "Deployment completed successfully." or "Deployment failed." at the end.
+
+The selection is in the URL (`#/projects/<id>/deployments/<id>`), so reloads and links keep it. All state comes from the API. The UI keeps no second copy of deployment status.
+
 ## Project Structure
 
 ```text
@@ -550,9 +665,11 @@ DeployX/
 ├── client/                         # React dashboard (Vite)
 │   ├── public/
 │   ├── src/
-│   │   ├── api/systemApi.js        # GET /api/system/status
-│   │   ├── components/StatusRow.jsx
-│   │   ├── hooks/useSystemStatus.js
+│   │   ├── api/                    # http.js (envelope), systemApi.js, deploymentsApi.js
+│   │   ├── components/             # SystemStatus, ProjectList, DeploymentHistory, DeploymentDetails,
+│   │   │                           # LogViewer, StatusSteps, StatusBadge, StatusRow
+│   │   ├── hooks/                  # useDeploymentStream (SSE), usePolling, useHashRoute, useSystemStatus
+│   │   ├── utils/format.js         # dates, durations, short ids
 │   │   ├── App.jsx
 │   │   ├── index.css
 │   │   └── main.jsx
@@ -644,6 +761,8 @@ cp .env.example .env
 | `APP_MEMORY_LIMIT` / `APP_CPU_LIMIT` | `512m` / `1`                       | worker: limits per app container |
 | `WORKSPACE_ROOT`    | `<os temp>/deployx-workspaces`                      | worker: where repositories are cloned |
 | `DOCKER_SOCKET_GID` | `0`                                                 | Compose: group owning the Docker socket |
+| `LOG_STREAM_POLL_MS` | `2000`                                              | server: live streams re-check the database this often (safety net for missed events) |
+| `LOG_STREAM_HEARTBEAT_MS` | `15000`                                        | server: keep-alive comment interval on live streams |
 | `DEV_USER_EMAIL`    | `dev@deployx.local`                                    | temporary current user     |
 | `DEV_USER_NAME`     | `DeployX Developer`                                    | temporary current user     |
 | `POSTGRES_USER`     | `deployx`                                              | postgres container         |
@@ -734,7 +853,7 @@ Validation failures add `details`, with one readable message per problem:
 | 201 | resource created |
 | 400 | validation failed, malformed ID, or malformed JSON |
 | 404 | resource or route not found |
-| 409 | conflict: duplicate project name, or deploying an inactive project |
+| 409 | conflict: duplicate project name, deploying an inactive project, or an invalid deployment state transition (response includes `from` and `to`) |
 | 500 | unexpected error; the response says `Internal server error`, and details go only to the server log |
 | 503 | `/api/system/status`: PostgreSQL or Redis unreachable; creating a deployment: job queue unavailable |
 
@@ -761,6 +880,7 @@ Rules that apply to every endpoint:
 | PATCH | `/api/deployments/:deploymentId/status` | update deployment status |
 | POST | `/api/deployments/:deploymentId/logs` | add a log line |
 | GET | `/api/deployments/:deploymentId/logs` | list log lines (chronological) |
+| GET | `/api/deployments/:deploymentId/logs/stream` | live logs and status as Server-Sent Events ([details](#real-time-deployment-logs-phase-5)) |
 
 ### Health and status
 
@@ -905,10 +1025,10 @@ curl -X PATCH http://localhost:5000/api/deployments/<deploymentId>/status \
 
 Only `QUEUED`, `BUILDING`, `DEPLOYING`, `HEALTH_CHECK`, `SUCCESS` and `FAILED` are accepted. Anything else returns `400`. The timestamps follow the status:
 
-- `started_at` is set the first time a deployment leaves `QUEUED`. Setting it back to `QUEUED` clears it.
+- `started_at` is set when work first begins (`BUILDING`), and kept if the deployment goes back to `QUEUED` for a retry. A deployment that fails straight from `QUEUED` has no `started_at`.
 - `finished_at` is set on `SUCCESS` or `FAILED` and cleared for any other status.
 
-Which transitions are allowed (for example, `SUCCESS` → `BUILDING`) is not enforced yet. The deployment state machine is part of a later phase.
+Only transitions allowed by the [state machine](#deployment-state-machine-phase-5) are accepted. Anything else returns **409** with `from` and `to`. Setting the current status again is a no-op (`200`).
 
 Since Phase 3 the **worker** sets these statuses as it processes the job, so this endpoint is a manual override. It isn't coordinated with a job that is currently running, and the worker's next stage overwrites it. Setting `SUCCESS` or `FAILED` before the job starts makes the worker skip it.
 
@@ -942,7 +1062,7 @@ curl -X POST http://localhost:5000/api/deployments/<deploymentId>/logs \
 
 Log IDs are 64-bit integers and are returned as strings, so no precision is lost in JavaScript.
 
-**List**: `GET /api/deployments/:deploymentId/logs` → `200`, all log lines in the order they were written. Real-time streaming is not part of this phase.
+**List**: `GET /api/deployments/:deploymentId/logs` → `200`, all log lines in the order they were written. For live output, use `GET /api/deployments/:deploymentId/logs/stream` (Server-Sent Events, see [Real-Time Deployment Logs](#real-time-deployment-logs-phase-5)).
 
 ## Testing
 
@@ -958,7 +1078,7 @@ npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The default suite (73 tests, about 20 s, no Docker or network needed) covers:
+The default suite (114 tests, about 25 s, no Docker or network needed) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
@@ -974,6 +1094,9 @@ The default suite (73 tests, about 20 s, no Docker or network needed) covers:
 - **isolation:** a failing job doesn't stop other jobs or the worker
 - **duplicates:** adding the same job twice runs it once; a job re-added for a finished deployment, or for a deleted one, is skipped
 - **graceful shutdown:** `close()` lets the running job finish and leaves new jobs for the next worker
+- **state machine:** every allowed transition passes (`QUEUED → BUILDING`, `BUILDING → DEPLOYING`, `DEPLOYING → SUCCESS`, `BUILDING/DEPLOYING → FAILED`, retry edges); `SUCCESS → BUILDING`, `FAILED → DEPLOYING`, `SUCCESS → QUEUED` and others fail with `DX001`; raw UPDATEs are blocked too; timestamps and no-ops; API 409s with `from`/`to`; the worker stops when a deployment is failed by hand
+- **events:** every persisted log line and status change is published on the deployment's own channel, with the database ids and in order; a Redis outage doesn't fail requests
+- **live stream (SSE):** headers; stored logs first, then status; new lines and statuses live; closes on `SUCCESS` and on `FAILED`; finished deployments get backlog + end at once; unpublished lines still arrive via the periodic check; `Last-Event-ID` resume without duplicates; no leakage between deployments; one shared subscription per deployment, released on disconnect; keep-alives
 - **worker units:** image/container naming, workspace isolation, Dockerfile checks (including symlinks), no shell interpretation of hostile arguments, secret-free child environments, clone arguments, build log limits
 
 ### Docker end-to-end tests
@@ -1071,6 +1194,16 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 - [x] Unit tests and opt-in Docker end-to-end tests
 - [x] No health checks, rollback, real-time logs, webhooks, OAuth or AWS (later phases)
 
+**Phase 5: state machine, deployment history, real-time logs**
+
+- [x] Transition map in one table, enforced by a PostgreSQL trigger for every writer
+- [x] `transitionDeploymentStatus()` used by the API and the worker; no direct status writes; invalid transitions → 409 / unrecoverable job error
+- [x] Log lines and status changes published to per-deployment Redis channels
+- [x] SSE endpoint: backlog, live updates, `Last-Event-ID` resume, closes on final status, subscriptions cleaned up on disconnect, database fallback when Redis is down
+- [x] Dashboard: applications, deployment history (newest first), details with live logs, lifecycle steps and errors
+- [x] Tests for the state machine, events and stream; Phase 1–4 tests and Docker e2e tests still pass
+- [x] No health checks, rollback, webhooks, OAuth or AWS (later phases)
+
 ## Future Phases
 
 DeployX is developed incrementally across **8 phases**:
@@ -1080,8 +1213,8 @@ DeployX is developed incrementally across **8 phases**:
 | 1     | Project foundation ✅                                                 |
 | 2     | Data model and REST API ✅                                            |
 | 3     | Job queue: BullMQ on Redis, worker job processing, retries, concurrency ✅ |
-| **4** | **Build & run: git clone, Docker build, container deployment (this phase)** ✅ |
-| 5     | Deployment history, state machine, real-time logs (WebSockets/SSE)    |
+| 4     | Build & run: git clone, Docker build, container deployment ✅         |
+| **5** | **Deployment history, state machine, real-time logs (SSE) (this phase)** ✅ |
 | 6     | Health checks for deployed apps, automatic rollback, stable versions  |
 | 7     | GitHub OAuth & webhooks, AWS / EC2 cloud deployment                   |
 | 8     | Production auth, security hardening, monitoring, CI/CD                |
