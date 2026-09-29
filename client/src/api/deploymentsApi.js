@@ -15,10 +15,6 @@ export function getDeployment(deploymentId, options) {
   return apiRequest(`/deployments/${deploymentId}`, options);
 }
 
-export function listDeploymentLogs(deploymentId, options) {
-  return apiRequest(`/deployments/${deploymentId}/logs`, options);
-}
-
 // Queues a new deployment of the project's configured branch head.
 export function createDeployment(projectId, body = {}) {
   return apiRequest(`/projects/${projectId}/deployments`, { method: 'POST', body });

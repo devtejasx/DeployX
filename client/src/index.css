@@ -400,3 +400,92 @@ button:disabled {
 .log-view .muted {
   color: #64748b;
 }
+
+.logs__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 20px 0 8px;
+}
+
+.logs__header h3 {
+  margin: 0;
+}
+
+.connection {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.connection__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.connection--live {
+  color: var(--ok);
+}
+
+.connection--live .connection__dot {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.connection--reconnecting {
+  color: var(--warn);
+}
+
+.connection--failed {
+  color: var(--bad);
+}
+
+.steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  list-style: none;
+  margin: 16px 0 0;
+  padding: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.steps__step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+
+.steps__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+}
+
+.steps__step--done {
+  color: var(--ok);
+}
+
+.steps__step--done .steps__dot,
+.steps__step--failed .steps__dot {
+  background: currentColor;
+}
+
+.steps__step--current {
+  color: var(--accent);
+}
+
+.steps__step--current .steps__dot {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.steps__step--failed {
+  color: var(--bad);
+}

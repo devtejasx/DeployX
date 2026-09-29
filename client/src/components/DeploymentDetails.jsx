@@ -1,5 +1,19 @@
+import { useEffect, useState } from 'react';
+import LogViewer from './LogViewer.jsx';
 import StatusBadge from './StatusBadge.jsx';
-import { formatDateTime, formatDuration, formatTime } from '../utils/format.js';
+import StatusSteps from './StatusSteps.jsx';
+import { formatDateTime, formatDuration, isTerminal } from '../utils/format.js';
+
+// Re-renders every second while `active`, so running durations tick.
+function useNow(active) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!active) return undefined;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [active]);
+  return now;
+}
 
 function Field({ label, children }) {
   return (
@@ -10,8 +24,12 @@ function Field({ label, children }) {
   );
 }
 
-// One deployment: its facts, error and logs.
-export default function DeploymentDetails({ deployment, number, logs, error, onClose }) {
+// One deployment: its facts, error and live logs. `stream` comes from
+// useDeploymentStream; its deployment is what the server last sent.
+export default function DeploymentDetails({ stream, number, onClose }) {
+  const { deployment, logs, connection, ended, error } = stream;
+  const now = useNow(deployment && !isTerminal(deployment.status));
+
   if (error) {
     return (
       <section className="card details">
@@ -36,6 +54,8 @@ export default function DeploymentDetails({ deployment, number, logs, error, onC
         </button>
       </div>
 
+      <StatusSteps status={deployment.status} />
+
       <dl className="details__grid">
         <Field label="Status">
           <StatusBadge status={deployment.status} />
@@ -49,7 +69,7 @@ export default function DeploymentDetails({ deployment, number, logs, error, onC
         <Field label="Created">{formatDateTime(deployment.created_at)}</Field>
         <Field label="Started">{formatDateTime(deployment.started_at)}</Field>
         <Field label="Finished">{formatDateTime(deployment.finished_at)}</Field>
-        <Field label="Duration">{formatDuration(deployment.started_at, deployment.finished_at)}</Field>
+        <Field label="Duration">{formatDuration(deployment.started_at, deployment.finished_at, now)}</Field>
         <Field label="Image">
           <span className="mono">{deployment.docker_image ?? '—'}</span>
         </Field>
@@ -79,18 +99,7 @@ export default function DeploymentDetails({ deployment, number, logs, error, onC
         </div>
       )}
 
-      <h3>Logs</h3>
-      <ol className="log-view" aria-label="Deployment logs">
-        {logs.map((line) => (
-          <li key={line.id} className={`log-line log-line--${line.level.toLowerCase()}`}>
-            <time className="log-line__time" dateTime={line.created_at}>
-              {formatTime(line.created_at)}
-            </time>
-            <span className="log-line__message">{line.message}</span>
-          </li>
-        ))}
-        {logs.length === 0 && <li className="muted">No log lines yet.</li>}
-      </ol>
+      <LogViewer logs={logs} connection={connection} status={deployment.status} ended={ended} />
     </section>
   );
 }

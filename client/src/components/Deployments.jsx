@@ -1,10 +1,6 @@
-import {
-  createDeployment,
-  getDeployment,
-  listDeploymentLogs,
-  listProjectDeployments,
-  listProjects,
-} from '../api/deploymentsApi.js';
+import { useEffect } from 'react';
+import { createDeployment, listProjectDeployments, listProjects } from '../api/deploymentsApi.js';
+import { useDeploymentStream } from '../hooks/useDeploymentStream.js';
 import { useHashRoute } from '../hooks/useHashRoute.js';
 import { usePolling } from '../hooks/usePolling.js';
 import { isTerminal } from '../utils/format.js';
@@ -27,16 +23,16 @@ export default function Deployments() {
     shouldPoll: hasRunningDeployment,
   });
 
-  const selected = usePolling(
-    () => (deploymentId ? getDeployment(deploymentId) : Promise.resolve(null)),
-    [deploymentId],
-    { shouldPoll: (deployment) => deployment && !isTerminal(deployment.status) },
-  );
-  const logs = usePolling(
-    () => (deploymentId ? listDeploymentLogs(deploymentId) : Promise.resolve([])),
-    [deploymentId],
-    { shouldPoll: () => selected.data && !isTerminal(selected.data.status) },
-  );
+  // The selected deployment and its logs, live over Server-Sent Events.
+  const stream = useDeploymentStream(deploymentId);
+
+  // When the selected deployment changes status, refresh the history row now
+  // rather than at the next poll (the API stays the source of truth).
+  const streamedStatus = stream.deployment?.status;
+  const { reload: reloadHistory } = history;
+  useEffect(() => {
+    if (streamedStatus) reloadHistory();
+  }, [streamedStatus, reloadHistory]);
 
   const index = history.data?.findIndex((deployment) => deployment.id === deploymentId) ?? -1;
   const number = index >= 0 ? history.data.length - index : '';
@@ -76,13 +72,7 @@ export default function Deployments() {
         )}
 
         {project && deploymentId && (
-          <DeploymentDetails
-            deployment={selected.data}
-            number={number}
-            logs={logs.data ?? []}
-            error={selected.error}
-            onClose={() => navigate(projectId)}
-          />
+          <DeploymentDetails stream={stream} number={number} onClose={() => navigate(projectId)} />
         )}
       </div>
     </div>
