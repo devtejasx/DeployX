@@ -11,7 +11,7 @@ before(async () => {
 after(() => api.close());
 
 describe('schema', () => {
-  test('migrations create the four core tables', async () => {
+  test('migrations create the core tables and the state machine table', async () => {
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
        WHERE table_schema = 'public' AND table_name <> 'pgmigrations'
@@ -19,7 +19,7 @@ describe('schema', () => {
     );
     assert.deepEqual(
       rows.map((row) => row.table_name),
-      ['deployment_logs', 'deployments', 'projects', 'users'],
+      ['deployment_logs', 'deployment_status_transitions', 'deployments', 'projects', 'users'],
     );
   });
 
