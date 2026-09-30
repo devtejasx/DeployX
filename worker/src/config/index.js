@@ -50,6 +50,31 @@ const config = {
     timeoutMs: positiveInt(process.env.GIT_TIMEOUT_MS, 2 * 60 * 1000),
   },
 
+  // GitHub App used to clone private repositories (optional). The worker signs
+  // a short-lived JWT with the App's private key and exchanges it for an
+  // installation token that can only read the one repository being deployed,
+  // and expires within an hour. Without an App, only public repositories can
+  // be cloned. The private key may be given with literal "\n" line breaks.
+  github: {
+    appId: process.env.GITHUB_APP_ID || '',
+    privateKey: (process.env.GITHUB_APP_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+  },
+
+  // AWS deployments (projects with deployment target AWS_ECS): images are
+  // pushed to one ECR repository and deployed to the project's ECS service in
+  // one cluster. Credentials are never configured here: the AWS SDK finds them
+  // in its usual places (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE,
+  // or the IAM role of the machine or task the worker runs on).
+  aws: {
+    region: process.env.AWS_REGION || '',
+    ecrRepository: process.env.AWS_ECR_REPOSITORY || '',
+    ecsCluster: process.env.AWS_ECS_CLUSTER || '',
+    // How long an ECS rollout may take before it counts as failed, and how
+    // often its progress is checked.
+    deployTimeoutMs: positiveInt(process.env.AWS_ECS_DEPLOY_TIMEOUT_MS, 10 * 60 * 1000),
+    pollIntervalMs: positiveInt(process.env.AWS_ECS_POLL_INTERVAL_MS, 10 * 1000),
+  },
+
   docker: {
     // Image repository prefix: <prefix>/<project-slug>-<project-id>:<commit>
     imagePrefix: process.env.DOCKER_IMAGE_PREFIX || 'deployx',
@@ -83,6 +108,12 @@ const config = {
     retries: positiveInt(process.env.HEALTH_CHECK_RETRIES, 5),
     // Time the application gets to start before the first attempt.
     startupGraceMs: nonNegativeInt(process.env.HEALTH_CHECK_STARTUP_GRACE_MS, 5000),
+    // AWS_ECS projects are checked on their service URL, whose host must
+    // resolve to a public address. Set to true when the service is only
+    // reachable privately (an internal load balancer, the worker running in
+    // the same VPC). Link-local addresses such as the instance metadata
+    // service (169.254.169.254) stay refused either way.
+    allowPrivateUrls: process.env.HEALTH_CHECK_ALLOW_PRIVATE_URLS === 'true',
   },
 };
 

@@ -1,176 +1,65 @@
 import { UnrecoverableError } from 'bullmq';
-import config from '../config/index.js';
-import { createBuildLogCollector } from '../lib/buildLog.js';
-import {
-  buildImage,
-  containerLogs,
-  containerName,
-  deploymentImageTag,
-  deploymentLabels,
-  ensureAppNetwork,
-  imageId,
-  imageName,
-  inspectContainer,
-  publishedHostPort,
-  removeContainer,
-  runContainer,
-} from '../services/dockerService.js';
-import { recordCommit, recordContainer, recordImage } from '../services/deploymentService.js';
-import { GitSourceError, cloneAndCheckout } from '../services/gitService.js';
-import { DockerfileNotFoundError, createWorkspace, removeWorkspace, validateDockerfile } from '../services/workspace.js';
+import { withProjectLock } from '../db/postgres.js';
+import { createTargets } from '../targets/index.js';
+import { createSourceBuild } from './build.js';
 import { createRelease } from './release.js';
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const withoutLock = (projectId, fn) => fn();
 
-// Errors that another attempt cannot fix are raised as UnrecoverableError,
-// so BullMQ fails the job at once instead of retrying it. Anything else
-// (network trouble, a failed build, a crashing container) is retried
-// according to the queue's retry policy.
-function unrecoverable(message) {
-  return new UnrecoverableError(message);
-}
-
-const release = createRelease();
-
-// The real deployment pipeline:
-//   BUILDING:     workspace -> git clone -> checkout commit -> Dockerfile check -> docker build
-//   DEPLOYING:    docker run -> verify running
-//   HEALTH_CHECK: HTTP health check with retries (pipeline/release.js)
+// The deployment pipeline. There is exactly one, whatever created the
+// deployment (the API or a GitHub push) and wherever it runs:
+//
+//   BUILDING:     git clone -> checkout commit -> Dockerfile check -> docker build   (build.js)
+//                 -> publish (AWS_ECS: push to ECR)
+//   DEPLOYING:    start the new version (LOCAL: docker run; AWS_ECS: ECS rollout)
+//   HEALTH_CHECK: HTTP health check with retries                               (release.js)
 //   SUCCESS, or ROLLING_BACK -> FAILED / ROLLBACK_FAILED when the application is unhealthy
-// The workspace is removed at the end whatever happens.
-export async function runDockerDeployment(ctx) {
-  const { deployment, project } = ctx;
+//
+// Where the new version runs is the deployment's target (deployments.
+// deployment_target, see targets/). The workspace is removed once the new
+// version runs, and at the end whatever happens.
+//
+// `build` and `targets` are replaced in tests.
+export function createDeploymentPipeline({ build = createSourceBuild(), targets = createTargets() } = {}) {
+  const releases = new Map();
 
-  if (!project.container_port) {
-    throw unrecoverable('Project has no container_port configured; set it with PUT /api/projects/:id');
-  }
-
-  const workspace = await createWorkspace(deployment.id);
-  let workspaceRemoved = false;
-
-  async function cleanUpWorkspace() {
-    if (workspaceRemoved) return;
-    workspaceRemoved = true;
-    try {
-      await removeWorkspace(workspace);
-      await ctx.log('INFO', 'Cleanup completed: workspace removed');
-    } catch (err) {
-      // Never hide the deployment result behind a cleanup problem.
-      await ctx.log('WARN', `Workspace cleanup failed: ${err.message}`);
+  // One release stage per target. A target that runs its deployments one at a
+  // time (AWS_ECS) already holds the project lock around deploy + release.
+  function releaseFor(target) {
+    if (!releases.has(target)) {
+      releases.set(target, createRelease({ target, lock: target.serializeDeploys ? withoutLock : withProjectLock }));
     }
+    return releases.get(target);
   }
 
-  try {
+  return async function runDeployment(ctx) {
+    const { deployment, project } = ctx;
+    const target = targets[deployment.deployment_target];
+    if (!target) throw new UnrecoverableError(`Unknown deployment target "${deployment.deployment_target}"`);
+    target.validate(project);
+
     await ctx.setStage('BUILDING', 'Deployment is now building');
-
-    // --- Source ------------------------------------------------------------
-    let commitSha;
+    const built = await build(ctx);
     try {
-      commitSha = await cloneAndCheckout({
-        repoUrl: project.github_repo,
-        branch: deployment.branch,
-        commitSha: deployment.commit_sha,
-        workspaceDir: workspace.dir,
-        sourceDir: workspace.sourceDir,
-        onStep: (message) => ctx.log('INFO', message),
+      const artifact = await target.publish(ctx, built);
+
+      const lock = target.serializeDeploys ? withProjectLock : withoutLock;
+      return await lock(project.id, async () => {
+        await ctx.setStage('DEPLOYING', 'Deployment is now deploying');
+        const deployed = await target.deploy(ctx, artifact);
+
+        // The sources are no longer needed; the new version runs from its image.
+        await built.cleanUp();
+
+        // A running version is not a successful deployment yet: the health
+        // check decides, and an unhealthy deployment is rolled back.
+        return await releaseFor(target)(ctx, deployed);
       });
-    } catch (err) {
-      if (err instanceof GitSourceError) throw unrecoverable(err.message);
-      throw err;
+    } finally {
+      await built.cleanUp();
     }
-    await recordCommit(deployment.id, commitSha);
-
-    let dockerfile;
-    try {
-      dockerfile = await validateDockerfile(workspace.sourceDir, project.dockerfile_path);
-    } catch (err) {
-      if (err instanceof DockerfileNotFoundError || /Invalid path/.test(err.message)) throw unrecoverable(err.message);
-      throw err;
-    }
-    await ctx.log('INFO', `Dockerfile found at ${project.dockerfile_path}`);
-
-    // --- Build -------------------------------------------------------------
-    const image = imageName(project, commitSha);
-    const labels = deploymentLabels({ projectId: project.id, deploymentId: deployment.id });
-    await ctx.log('INFO', `Starting Docker build of ${image}`);
-
-    const buildLog = createBuildLogCollector({ maxLines: config.docker.buildLogMaxLines });
-    const storedLines = new Set();
-    // Build output arrives faster than it can be stored; keep the order by
-    // chaining the inserts and wait for them after the build.
-    let pendingLogs = Promise.resolve();
-    const build = await buildImage({
-      contextDir: workspace.sourceDir,
-      dockerfile,
-      image,
-      extraTags: [deploymentImageTag(project, deployment.id)],
-      labels,
-      onLine: (line) => {
-        const stored = buildLog.accept(line);
-        if (stored) {
-          storedLines.add(stored);
-          pendingLogs = pendingLogs.then(() => ctx.log('INFO', stored));
-        }
-      },
-    });
-    await pendingLogs;
-    if (buildLog.dropped > 0) {
-      await ctx.log('WARN', `${buildLog.dropped} further build output lines were not stored (limit reached)`);
-    }
-    if (build.code !== 0) {
-      // Make sure the lines explaining the failure are stored.
-      for (const line of buildLog.tail()) {
-        if (!storedLines.has(line)) await ctx.log('ERROR', line);
-      }
-      const reason = buildLog.tail().findLast((line) => /error/i.test(line)) ?? `exit code ${build.code}`;
-      throw new Error(`Docker build failed: ${reason}`);
-    }
-    // The ID is kept next to the tag: a rollback restarts exactly this image.
-    await recordImage(deployment.id, image, await imageId(image));
-    await ctx.log('INFO', `Docker image created: ${image}`);
-
-    // --- Run ---------------------------------------------------------------
-    await ctx.setStage('DEPLOYING', 'Deployment is now deploying');
-    await ensureAppNetwork();
-
-    const name = containerName(project.id, deployment.id);
-    // A container of an earlier attempt of this same deployment.
-    if (await inspectContainer(name)) {
-      await removeContainer(name);
-      await ctx.log('INFO', `Removed container ${name} left by an earlier attempt`);
-    }
-
-    await ctx.log('INFO', `Starting container ${name}`);
-    const containerId = await runContainer({ image, name, containerPort: project.container_port, labels });
-
-    // Not the health check yet: only make sure it did not exit at once.
-    await sleep(config.docker.startupGraceMs);
-    const state = await inspectContainer(containerId);
-    if (!state?.State?.Running) {
-      const exitCode = state?.State?.ExitCode;
-      const output = await containerLogs(containerId).catch(() => []);
-      for (const line of output) await ctx.log('ERROR', `[container] ${line.slice(0, 1000)}`);
-      await removeContainer(containerId).catch(() => {});
-      await ctx.log('INFO', `Removed failed container ${name}`);
-      throw new Error(`Container exited immediately (exit code ${exitCode ?? 'unknown'})`);
-    }
-
-    const hostPort = publishedHostPort(state, project.container_port);
-    await recordContainer(deployment.id, { containerId, containerName: name, hostPort });
-    await ctx.log(
-      'INFO',
-      `Container started: ${name} (${containerId.slice(0, 12)}); port ${project.container_port} published on ` +
-        `127.0.0.1:${hostPort}`,
-    );
-
-    // The sources are no longer needed; the container runs from its image.
-    await cleanUpWorkspace();
-
-    // A running container is not a successful deployment yet: the health
-    // check decides, and an unhealthy deployment is rolled back. The previous
-    // container keeps running until then.
-    return await release(ctx, { containerId, name, hostPort, image });
-  } finally {
-    await cleanUpWorkspace();
-  }
+  };
 }
+
+// The pipeline the worker runs.
+export const runDockerDeployment = createDeploymentPipeline();

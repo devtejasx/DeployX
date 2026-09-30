@@ -108,6 +108,36 @@ describe('live updates', () => {
     await waitFor(() => stream.ended);
   });
 
+  test('the last log line, committed together with the final status, is streamed before the end', async (t) => {
+    const deployment = await createDeployment();
+    for (const status of ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK']) await setStatus(deployment.id, status);
+
+    // The worker finishes right after the stream read the logs and before it
+    // reads the deployment: status and last line in one statement, as the
+    // worker writes them.
+    const realQuery = pool.query.bind(pool);
+    let finished = false;
+    t.mock.method(pool, 'query', async (text, params) => {
+      const result = await realQuery(text, params);
+      if (!finished && typeof text === 'string' && text.includes('id > $2::bigint') && params?.[0] === deployment.id) {
+        finished = true;
+        await realQuery(
+          `WITH updated AS (SELECT id FROM transition_deployment_status($1, 'FAILED', 'Health check failed'))
+           INSERT INTO deployment_logs (deployment_id, level, message)
+           SELECT id, 'ERROR', 'Deployment failed: the last line' FROM updated`,
+          [deployment.id],
+        );
+      }
+      return result;
+    });
+
+    const stream = await openStream(deployment.id);
+    const end = await stream.waitFor((e) => e.event === 'end');
+    assert.equal(end.data.status, 'FAILED');
+    assert.equal(stream.logs().at(-1), 'Deployment failed: the last line');
+    assert.deepEqual(stream.events.slice(-3).map((e) => e.event), ['log', 'status', 'end']);
+  });
+
   test('the stream stays open through a rollback and closes after ROLLBACK_FAILED', async () => {
     const deployment = await createDeployment();
     const stream = await openStream(deployment.id);

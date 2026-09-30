@@ -1,130 +1,54 @@
-import config from '../config/index.js';
+import { createLocalDockerTarget } from '../targets/localDockerTarget.js';
 import * as dockerService from './dockerService.js';
-import { containerName, deploymentLabels, firstPublishedHostPort, publishedHostPort } from './dockerService.js';
-import {
-  addLog,
-  findStableDeployment,
-  markFailed,
-  recordContainer,
-  recordContainerRemoved,
-  recordRollback,
-} from './deploymentService.js';
+import { addLog, findStableDeployment, markFailed, recordRollback } from './deploymentService.js';
 import { waitForHealthy } from './healthCheckService.js';
 
 export const NO_STABLE_DEPLOYMENT = 'No previous stable deployment available for rollback.';
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 // Automatic rollback of a deployment that failed its health check:
-//   find the project's last stable deployment -> remove the unhealthy
-//   container -> make sure the stable version runs (its container is normally
-//   still running; otherwise it is started again from its image) -> health
-//   check it -> record the outcome -> the failed deployment becomes FAILED, or
+//   find the project's last stable deployment -> take the unhealthy version
+//   down -> make sure the stable version runs (LOCAL: its container normally
+//   still runs, otherwise it is started again from its image; AWS_ECS: its
+//   image digest is deployed to the service again) -> health check it ->
+//   record the outcome -> the failed deployment becomes FAILED, or
 //   ROLLBACK_FAILED when the stable version could not be brought back.
+//
+// This is the only rollback there is: the deployment target (targets/)
+// supplies the infrastructure steps, the flow and its rules are the same.
 //
 // Safety rules:
 // - only the project's own stable deployment is ever used (looked up by
-//   project ID), and nothing is restored without its image and port
+//   project ID), on the target the failed deployment ran on, and nothing is
+//   restored without its image
 // - a rollback only counts as completed once the restored version passed its
 //   health check; anything else is reported as a failed rollback
 // - the stable deployment's record and the history are never rewritten: only
-//   the container it currently runs in is tracked
-// - the only containers removed are the failed deployment's own one and a
-//   stopped leftover of the stable deployment
+//   where it currently runs (its container or task definition) is tracked
+// - nothing is rebuilt: the stable version runs from the image it was built as
 //
-// `docker` is the Docker service (replaced by a fake in tests).
-export function createRollbackService({ docker = dockerService } = {}) {
-  async function removeUnhealthyContainer(ctx, container) {
-    await ctx.log('INFO', `Stopping unhealthy container ${container.name}`);
-    try {
-      await docker.removeContainer(container.containerId);
-      await recordContainerRemoved(ctx.deployment.id, 'Container removed: the deployment failed its health check');
-    } catch (err) {
-      // Not fatal: the stable version can run next to it.
-      await ctx.log('WARN', `Could not remove the unhealthy container: ${err.message}`);
-    }
-  }
-
-  // The stable deployment's container, if it is still running. That is the
-  // normal case: a container is only retired after a newer deployment passed
-  // its health check.
-  async function runningStableContainer(stable) {
-    if (!stable.container_id) return null;
-    const inspection = await docker.inspectContainer(stable.container_id);
-    if (!inspection?.State?.Running) return null;
-
-    const hostPort = firstPublishedHostPort(inspection);
-    if (!hostPort) throw new Error('the stable container has no published port');
-    return { containerId: stable.container_id, name: stable.container_name, hostPort, started: false };
-  }
-
-  // Starts the stable version again from the image it was deployed with.
-  async function startStableContainer(ctx, stable) {
-    const { project } = ctx;
-    // The image ID when it was recorded: unlike the tag, a later build of the
-    // same commit cannot have moved it to another image.
-    const image = stable.docker_image_id ?? stable.docker_image;
-    if (!image) throw new Error('the stable deployment has no Docker image recorded');
-    if (!project.container_port) throw new Error('the project has no container_port configured');
-    if (!(await docker.imageExists(image))) {
-      throw new Error(`image ${stable.docker_image} of the stable deployment is no longer available`);
-    }
-
-    const name = containerName(project.id, stable.id);
-    // A stopped container of this same deployment would block the name.
-    if (await docker.inspectContainer(name)) {
-      await docker.removeContainer(name);
-      await ctx.log('INFO', `Removed stopped container ${name}`);
-    }
-
-    const imageId = stable.docker_image_id ? ` (ID ${stable.docker_image_id.slice('sha256:'.length, 19)})` : '';
-    await ctx.log('INFO', `Starting stable version from image ${stable.docker_image}${imageId}`);
-    await docker.ensureAppNetwork();
-    const containerId = await docker.runContainer({
-      image,
-      name,
-      containerPort: project.container_port,
-      labels: deploymentLabels({ projectId: project.id, deploymentId: stable.id }),
-    });
-
-    await sleep(config.docker.startupGraceMs);
-    const state = await docker.inspectContainer(containerId);
-    if (!state?.State?.Running) {
-      await docker.removeContainer(containerId).catch(() => {});
-      throw new Error(`the stable container exited immediately (exit code ${state?.State?.ExitCode ?? 'unknown'})`);
-    }
-    return { containerId, name, hostPort: publishedHostPort(state, project.container_port), started: true };
-  }
-
+// `target` is the deployment target (by default LOCAL on `docker`, the Docker
+// service, which tests replace by a fake).
+export function createRollbackService({ docker = dockerService, target = createLocalDockerTarget({ docker }) } = {}) {
   // Makes the stable deployment the live, verified version again. Throws with
   // the reason if that is not possible.
   async function restoreStable(ctx, stable) {
-    const container = (await runningStableContainer(stable)) ?? (await startStableContainer(ctx, stable));
-    if (!container.started) await ctx.log('INFO', `Stable container ${container.name} is still running`);
+    const restored = await target.restoreStable(ctx, stable);
 
     await ctx.log('INFO', 'Running health check on the stable version');
     const result = await waitForHealthy({
-      port: container.hostPort,
+      ...target.healthCheck(restored).options,
       path: ctx.project.health_check_path,
-      // A container that was already serving needs no time to start.
-      startupGracePeriod: container.started ? undefined : 0,
+      // A version that was already serving needs no time to start.
+      startupGracePeriod: restored.started ? undefined : 0,
       onLog: ctx.log,
     });
     if (!result.healthy) {
-      // A container that was already running is left alone; one started just
-      // now for the rollback is removed again.
-      if (container.started) await docker.removeContainer(container.containerId).catch(() => {});
+      await target.abandonRestored(restored);
       throw new Error(`the stable deployment is unhealthy too (${result.error})`);
     }
     await ctx.log('INFO', 'Stable version is healthy');
 
-    if (container.started) {
-      await recordContainer(stable.id, {
-        containerId: container.containerId,
-        containerName: container.name,
-        hostPort: container.hostPort,
-      });
-    }
+    await target.recordRestored(ctx, stable, restored);
     await addLog(stable.id, 'INFO', `Restored as the live version: deployment ${ctx.deployment.id} failed its health check`);
   }
 
@@ -140,20 +64,27 @@ export function createRollbackService({ docker = dockerService } = {}) {
   }
 
   // Handles `ctx.deployment` having failed its health check (`reason`), with
-  // its running `container` { containerId, name }. The caller holds the
+  // `deployed` the version the target started for it. The caller holds the
   // project lock. The deployment always ends in a final status (FAILED, or
   // ROLLBACK_FAILED when the rollback itself failed); returns
   // { status: 'COMPLETED' | 'FAILED' | 'NOT_AVAILABLE', stableDeploymentId, errorMessage }.
-  return async function rollbackDeployment(ctx, { container, reason }) {
-    const stable = await findStableDeployment(ctx.project.id);
+  return async function rollbackDeployment(ctx, { deployed, reason }) {
+    const found = await findStableDeployment(ctx.project.id);
+    // A stable version that ran on another target (the project was switched
+    // between LOCAL and AWS_ECS) cannot be restored here.
+    const stable = found?.deployment_target === ctx.deployment.deployment_target ? found : null;
 
     if (!stable) {
       // E.g. the project's first deployment: there is nothing to restore.
-      await ctx.log('WARN', NO_STABLE_DEPLOYMENT);
-      await removeUnhealthyContainer(ctx, container);
+      const note = found
+        ? `No previous stable deployment on ${ctx.deployment.deployment_target} available for rollback ` +
+          `(the last stable deployment ran on ${found.deployment_target}).`
+        : NO_STABLE_DEPLOYMENT;
+      await ctx.log('WARN', note);
+      await target.discardUnhealthy(ctx, deployed, { restoring: false });
       return finish(ctx, {
         status: 'NOT_AVAILABLE',
-        errorMessage: `${reason}. ${NO_STABLE_DEPLOYMENT}`,
+        errorMessage: `${reason}. ${note}`,
         message: 'Deployment failed: the application is unhealthy and there is nothing to roll back to',
       });
     }
@@ -161,7 +92,7 @@ export function createRollbackService({ docker = dockerService } = {}) {
     await ctx.setStage('ROLLING_BACK', 'Starting automatic rollback');
     const commit = stable.commit_sha ? ` (commit ${stable.commit_sha.slice(0, 7)})` : '';
     await ctx.log('INFO', `Previous stable deployment: ${stable.id}${commit}`);
-    await removeUnhealthyContainer(ctx, container);
+    await target.discardUnhealthy(ctx, deployed, { restoring: true });
 
     try {
       await restoreStable(ctx, stable);

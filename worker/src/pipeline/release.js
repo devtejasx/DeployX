@@ -2,59 +2,48 @@ import config from '../config/index.js';
 import { withProjectLock } from '../db/postgres.js';
 import { RecordedFailureError } from '../lib/errors.js';
 import * as dockerService from '../services/dockerService.js';
-import { recordContainerRemoved, recordHealthCheck, unfinishedDeploymentIds } from '../services/deploymentService.js';
+import { recordHealthCheck } from '../services/deploymentService.js';
 import { maxHealthCheckAttempts, waitForHealthy } from '../services/healthCheckService.js';
 import { createRollbackService } from '../services/rollbackService.js';
+import { createLocalDockerTarget } from '../targets/localDockerTarget.js';
 
-// Lines of the unhealthy container's output copied into the deployment logs.
+// Lines of the unhealthy version's output copied into the deployment logs.
 const CONTAINER_LOG_LINES = 20;
 
-// The last stage of a deployment, once its container is running:
+// The last stage of a deployment, once its new version runs, for every
+// deployment target:
 //
-//   HEALTH_CHECK ── healthy ──> SUCCESS   (then the previous container is retired)
+//   HEALTH_CHECK ── healthy ──> SUCCESS   (then the previous version is retired)
 //        │
 //        └── unhealthy ──> ROLLING_BACK ──> FAILED            (last stable version restored)
 //                     │                └──> ROLLBACK_FAILED   (it could not be restored)
 //                     └──> FAILED                             (no stable version to restore)
 //
-// A deployment is never SUCCESS because its container started: only a passed
-// health check leads there. The previous stable container keeps running
-// until then, so an unhealthy deployment never takes the project down.
+// A deployment is never SUCCESS because its version started: only a passed
+// health check leads there. The previous stable version keeps running until
+// then (LOCAL), or is restored by the rollback (AWS_ECS).
 //
-// `docker` is the Docker service (replaced by a fake in tests).
-export function createRelease({ docker = dockerService } = {}) {
-  const rollbackDeployment = createRollbackService({ docker });
+// `target` is the deployment target (by default LOCAL on `docker`, the Docker
+// service, which tests replace by a fake). `lock` serializes promotion and
+// rollback per project; a target that already serializes whole deployments
+// (AWS_ECS) passes one that does not lock again.
+export function createRelease({
+  docker = dockerService,
+  target = createLocalDockerTarget({ docker }),
+  lock = withProjectLock,
+} = {}) {
+  const rollbackDeployment = createRollbackService({ target });
 
-  // One live deployment per project: this one is healthy and recorded as
-  // SUCCESS, so the project's other containers are removed. Containers of
-  // deployments that are still being processed belong to their own jobs.
-  async function retirePreviousContainers(ctx, container) {
+  // `deployed`: what target.deploy() returned for the deployment (LOCAL:
+  // { containerId, name, hostPort, image }). Returns the job result on
+  // SUCCESS; throws RecordedFailureError after an unhealthy deployment was
+  // handled.
+  return async function release(ctx, deployed) {
     const { deployment, project } = ctx;
-    try {
-      const others = (await docker.listProjectContainers(project.id)).filter(({ id }) => id !== container.containerId);
-      const unfinished = await unfinishedDeploymentIds(others.map((other) => other.deploymentId));
-      for (const previous of others) {
-        if (unfinished.has(previous.deploymentId)) continue;
-        await docker.removeContainer(previous.id);
-        if (previous.deploymentId) {
-          await recordContainerRemoved(previous.deploymentId, `Container removed: replaced by deployment ${deployment.id}`);
-        }
-      }
-    } catch (err) {
-      // The deployment itself succeeded. A container left behind is removed
-      // by the project's next successful deployment.
-      console.error(`[worker] could not remove previous containers of project ${project.id}: ${err.message}`);
-    }
-  }
-
-  // `container`: { containerId, name, hostPort, image } of the deployment's
-  // running container. Returns the job result on SUCCESS; throws
-  // RecordedFailureError after an unhealthy deployment was handled.
-  return async function release(ctx, container) {
-    const { deployment, project } = ctx;
-    const { host, timeoutMs, intervalMs } = config.healthCheck;
+    const { timeoutMs, intervalMs } = config.healthCheck;
     const maxAttempts = maxHealthCheckAttempts();
     const path = project.health_check_path;
+    const health = target.healthCheck(deployed);
 
     // The details are stored before the line (or status) that announces them,
     // so whoever reads the deployment because of that event sees them.
@@ -74,11 +63,11 @@ export function createRelease({ docker = dockerService } = {}) {
     );
     await ctx.setStage(
       'HEALTH_CHECK',
-      `Running health checks: GET http://${host}:${container.hostPort}${path} ` +
+      `Running health checks: GET ${health.url}${path} ` +
         `(up to ${maxAttempts} attempts, ${timeoutMs / 1000}s timeout, ${intervalMs / 1000}s apart)`,
     );
     const result = await waitForHealthy({
-      port: container.hostPort,
+      ...health.options,
       path,
       onLog: ctx.log,
       onAttempt: ({ attempt, result: attemptResult }) =>
@@ -93,26 +82,23 @@ export function createRelease({ docker = dockerService } = {}) {
 
     if (result.healthy) {
       // Promotion and rollback of one project never run at the same time.
-      return withProjectLock(project.id, async () => {
+      return lock(project.id, async () => {
         await ctx.setStage('SUCCESS', 'Deployment completed successfully');
-        await retirePreviousContainers(ctx, container);
-        return {
-          status: 'SUCCESS',
-          image: container.image,
-          containerId: container.containerId,
-          hostPort: container.hostPort,
-        };
+        await target.retirePrevious(ctx, deployed);
+        return { status: 'SUCCESS', ...deployed };
       });
     }
 
     const reason = `Health check failed after ${result.attempts} attempt${result.attempts === 1 ? '' : 's'}: ${result.error}`;
     await recordHealthCheck(deployment.id, { status: 'FAILED', completed_at: new Date().toISOString() });
     await ctx.log('ERROR', reason);
-    const output = await docker.containerLogs(container.containerId, CONTAINER_LOG_LINES).catch(() => []);
+    const output = await Promise.resolve()
+      .then(() => target.logs(deployed, CONTAINER_LOG_LINES))
+      .catch(() => []);
     for (const line of output) await ctx.log('INFO', `[container] ${line.slice(0, 1000)}`);
     await ctx.log('ERROR', 'Deployment marked unhealthy');
 
-    const outcome = await withProjectLock(project.id, () => rollbackDeployment(ctx, { container, reason }));
+    const outcome = await lock(project.id, () => rollbackDeployment(ctx, { deployed, reason }));
     // Rebuilding the same commit cannot make it healthy: no retry.
     throw new RecordedFailureError(outcome.errorMessage);
   };

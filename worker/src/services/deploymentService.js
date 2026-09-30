@@ -16,8 +16,9 @@ function invalidTransition(err) {
   return new UnrecoverableError(`Invalid deployment state transition: ${from} -> ${to}`);
 }
 
-const DEPLOYMENT_COLUMNS = `id, project_id, commit_sha, branch, status, docker_image, docker_image_id,
-  container_id, container_name, host_port, container_removed_at, error_message,
+const DEPLOYMENT_COLUMNS = `id, project_id, commit_sha, branch, status, trigger, deployment_target,
+  docker_image, docker_image_id, image_digest,
+  container_id, container_name, host_port, container_removed_at, aws_task_definition_arn, error_message,
   health_check, rollback_status, rollback_deployment_id,
   started_at, finished_at, created_at, updated_at`;
 
@@ -40,7 +41,8 @@ export async function getDeploymentWithProject(deploymentId) {
             json_build_object(
               'id', p.id, 'name', p.name, 'github_repo', p.github_repo,
               'dockerfile_path', p.dockerfile_path, 'container_port', p.container_port,
-              'health_check_path', p.health_check_path
+              'health_check_path', p.health_check_path,
+              'aws_ecs_service', p.aws_ecs_service, 'aws_service_url', p.aws_service_url
             ) AS project
      FROM deployments d JOIN projects p ON p.id = d.project_id
      WHERE d.id = $1`,
@@ -138,6 +140,22 @@ export async function recordImage(deploymentId, image, imageId = null) {
     image,
     imageId,
   ]);
+}
+
+// The image as pushed to a registry (AWS_ECS): docker_image becomes its
+// registry reference (<repository-uri>:<tag>), image_digest the immutable
+// digest ECS runs and a rollback restores.
+export async function recordRegistryImage(deploymentId, reference, digest) {
+  await query('UPDATE deployments SET docker_image = $2, image_digest = $3 WHERE id = $1', [
+    deploymentId,
+    reference,
+    digest,
+  ]);
+}
+
+// The ECS task definition revision the deployment runs as (AWS_ECS).
+export async function recordTaskDefinition(deploymentId, taskDefinitionArn) {
+  await query('UPDATE deployments SET aws_task_definition_arn = $2 WHERE id = $1', [deploymentId, taskDefinitionArn]);
 }
 
 export async function recordContainer(deploymentId, { containerId, containerName, hostPort }) {

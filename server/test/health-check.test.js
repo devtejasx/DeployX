@@ -144,6 +144,8 @@ describe('checkContainerHealth', () => {
       intervalMs: 250,
       retries: 4,
       startupGraceMs: 0,
+      // Service URLs (AWS_ECS) must resolve to public addresses by default.
+      allowPrivateUrls: false,
     });
 
     // ...and are what a health check uses when the caller passes none.

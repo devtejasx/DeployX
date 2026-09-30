@@ -62,6 +62,19 @@ for (const [command, args] of [
   }
 }
 
+// Optional integrations (names only, never keys).
+const { aws, github } = config;
+console.log(
+  aws.region && aws.ecrRepository && aws.ecsCluster
+    ? `[worker] AWS deployments: ECR repository ${aws.ecrRepository}, ECS cluster ${aws.ecsCluster} (${aws.region})`
+    : '[worker] AWS deployments not configured (AWS_REGION, AWS_ECR_REPOSITORY, AWS_ECS_CLUSTER)',
+);
+console.log(
+  github.appId && github.privateKey
+    ? `[worker] private repositories: GitHub App ${github.appId}`
+    : '[worker] private repositories: no GitHub App configured, public repositories only',
+);
+
 const swept = await sweepStaleWorkspaces().catch(() => 0);
 if (swept > 0) console.log(`[worker] removed ${swept} stale deployment workspace(s)`);
 console.log(`[worker] deployment workspaces in ${config.workspace.root}`);

@@ -29,7 +29,8 @@ async function dockerOrThrow(args, what, options) {
 // Project name -> valid Docker repository component: lower-case letters,
 // digits and single dashes, at most 40 characters. The short project ID keeps
 // two projects whose names sanitize the same ("My API", "my-api") apart.
-export function imageRepository(projectName, projectId) {
+//   "My API", 0f8fad5b-... -> my-api-0f8fad5b
+export function projectImageName(projectName, projectId) {
   const slug =
     projectName
       .toLowerCase()
@@ -37,7 +38,11 @@ export function imageRepository(projectName, projectId) {
       .replace(/^-+|-+$/g, '')
       .slice(0, 40)
       .replace(/-+$/, '') || 'project';
-  return `${config.docker.imagePrefix}/${slug}-${projectId.slice(0, 8)}`;
+  return `${slug}-${projectId.slice(0, 8)}`;
+}
+
+export function imageRepository(projectName, projectId) {
+  return `${config.docker.imagePrefix}/${projectImageName(projectName, projectId)}`;
 }
 
 // deployx/<project-slug>-<project-id-prefix>:<first 12 characters of the commit SHA>
@@ -161,6 +166,29 @@ export async function imageId(image) {
 export async function imageExists(image) {
   const result = await docker(['image', 'inspect', '--format', '{{.Id}}', '--', image]);
   return result.code === 0;
+}
+
+// Gives the local image `source` another name, e.g. its registry reference.
+export async function tagImage(source, target) {
+  await dockerOrThrow(['image', 'tag', '--', source, target], `Tagging ${source} as ${target}`);
+}
+
+// docker push <reference>. Output lines go to `onLine`.
+export async function pushImage(reference, { onLine } = {}) {
+  await dockerOrThrow(['image', 'push', '--', reference], `Pushing ${reference}`, {
+    onLine,
+    timeoutMs: config.docker.buildTimeoutMs,
+  });
+}
+
+// docker login for a registry. The password goes through stdin, so it is
+// never part of a command line; Docker keeps it in its credential store.
+export async function registryLogin({ registry, username, password }) {
+  await dockerOrThrow(
+    ['login', '--username', username, '--password-stdin', '--', registry],
+    `Logging in to ${registry}`,
+    { input: password },
+  );
 }
 
 export async function containerLogs(nameOrId, tail = 30) {

@@ -81,9 +81,8 @@ export async function streamLogs(req, res) {
     res.end();
   }
 
-  // Sends every stored line newer than the last one sent, then the deployment
-  // if anything about it changed; ends the stream on a final status.
-  async function sync() {
+  // Sends every stored line newer than the last one sent.
+  async function sendNewLogs() {
     for (;;) {
       const logs = await logService.listLogsAfter(deploymentId, lastLogId.toString());
       for (const log of logs) {
@@ -92,14 +91,26 @@ export async function streamLogs(req, res) {
       }
       if (logs.length < logService.LOG_BATCH_SIZE) break;
     }
+  }
+
+  // Sends every stored line newer than the last one sent, then the deployment
+  // if anything about it changed; ends the stream on a final status.
+  async function sync() {
+    await sendNewLogs();
 
     const deployment = await deploymentService.getDeployment(userId, deploymentId);
+    const final = TERMINAL_STATUSES.includes(deployment.status);
+    // The worker commits a final status together with the deployment's last
+    // log line. If that commit landed between the two reads above, the line
+    // was not there yet: read the logs once more before the stream ends.
+    if (final) await sendNewLogs();
+
     const snapshot = JSON.stringify(deployment);
     if (snapshot !== lastDeploymentSent) {
       send('status', deployment);
       lastDeploymentSent = snapshot;
     }
-    if (TERMINAL_STATUSES.includes(deployment.status)) {
+    if (final) {
       send('end', { deploymentId, status: deployment.status });
       close();
     }

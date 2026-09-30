@@ -123,6 +123,20 @@ services:
       HEALTH_CHECK_INTERVAL_MS: ${HEALTH_CHECK_INTERVAL_MS:-2000}
       HEALTH_CHECK_RETRIES: ${HEALTH_CHECK_RETRIES:-5}
       HEALTH_CHECK_STARTUP_GRACE_MS: ${HEALTH_CHECK_STARTUP_GRACE_MS:-5000}
+      HEALTH_CHECK_ALLOW_PRIVATE_URLS: ${HEALTH_CHECK_ALLOW_PRIVATE_URLS:-false}
+      # Private repositories (optional GitHub App); only the worker gets the key.
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      # AWS deployments (optional). Credentials are passed through from the
+      # environment Compose runs in, never written here.
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ECR_REPOSITORY: ${AWS_ECR_REPOSITORY:-}
+      AWS_ECS_CLUSTER: ${AWS_ECS_CLUSTER:-}
+      AWS_ECS_DEPLOY_TIMEOUT_MS: ${AWS_ECS_DEPLOY_TIMEOUT_MS:-600000}
+      AWS_ECS_POLL_INTERVAL_MS: ${AWS_ECS_POLL_INTERVAL_MS:-10000}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # DEVELOPMENT ONLY: the worker drives the host's Docker daemon to build

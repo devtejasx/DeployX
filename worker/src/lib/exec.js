@@ -54,7 +54,15 @@ export class CommandError extends Error {
 // `tailSize` lines are kept for error reporting. Resolves with the exit code
 // (non-zero is not an error here) and throws CommandError if the program
 // cannot be started or exceeds `timeoutMs`.
-export function runCommand(command, args, { cwd, env = childEnv(), timeoutMs = 60000, onLine, tailSize = 50 } = {}) {
+//
+// `input` is written to the program's stdin: the way to hand it a secret
+// (e.g. `docker login --password-stdin`) without putting it in its arguments,
+// where other processes on the machine could read it.
+export function runCommand(
+  command,
+  args,
+  { cwd, env = childEnv(), timeoutMs = 60000, onLine, tailSize = 50, input } = {},
+) {
   return new Promise((resolve, reject) => {
     const tail = [];
     const stdoutChunks = [];
@@ -65,8 +73,13 @@ export function runCommand(command, args, { cwd, env = childEnv(), timeoutMs = 6
       env,
       shell: false,
       windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
+    if (input !== undefined) {
+      // A program that exits without reading its input must not crash us.
+      child.stdin.on('error', () => {});
+      child.stdin.end(input);
+    }
 
     function lineReader(stream, name) {
       let pending = '';
