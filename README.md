@@ -54,7 +54,8 @@ A self-service deployment platform: connect a GitHub repository, build it into a
 - `HEALTH_CHECK` is now part of every deployment; **`SUCCESS` is only reachable from it**, enforced by the database
 - **Stable deployments** tracked per project without a flag: the last stable deployment is the newest successful one
 - **Automatic rollback** of an unhealthy deployment: the previous version keeps running during the check, is verified (or restarted from its image) and health-checked before anything is called recovered
-- Rollback outcome on the deployment (`COMPLETED`, `FAILED`, `NOT_AVAILABLE`), streamed live and shown in the dashboard
+- Rollback outcome on the deployment (`COMPLETED`, `FAILED`, `NOT_AVAILABLE`), streamed live and shown in the dashboard; a rollback that fails ends the deployment as **`ROLLBACK_FAILED`**
+- **Health-check details** (attempts, last status code, response time, error) recorded on the deployment and pushed to the dashboard after every attempt
 - See [Phase 6 — Health Checks & Automatic Rollback](#phase-6--health-checks--automatic-rollback)
 
 ## Architecture
@@ -177,13 +178,14 @@ Every foreign key cascades. **Deleting a project deletes all of its deployments 
 | `project_id` | `uuid` | FK → `projects.id` |
 | `commit_sha` | `varchar(40)` | nullable; 7–40 lower-case hex (CHECK) |
 | `branch` | `varchar(255)` | |
-| `status` | `varchar(20)` | `QUEUED` \| `BUILDING` \| `DEPLOYING` \| `HEALTH_CHECK` \| `ROLLING_BACK` \| `SUCCESS` \| `FAILED` (CHECK), default `QUEUED` |
+| `status` | `varchar(20)` | `QUEUED` \| `BUILDING` \| `DEPLOYING` \| `HEALTH_CHECK` \| `ROLLING_BACK` \| `SUCCESS` \| `FAILED` \| `ROLLBACK_FAILED` (CHECK), default `QUEUED` |
 | `docker_image` | `varchar(255)` | image built for this deployment, e.g. `deployx/my-api-0f8fad5b:abc123def456` |
 | `docker_image_id` | `varchar(80)` | immutable ID (`sha256:…`) of that image; what a rollback starts again. Internal, not returned by the API |
 | `container_id`, `container_name` | `varchar` | the container started for this deployment |
 | `host_port` | `integer` | host port (on 127.0.0.1) the container port is published on |
 | `container_removed_at` | `timestamptz` | when the container was removed (e.g. replaced by a newer deployment) |
 | `error_message` | `varchar(2000)` | short reason for a `FAILED` deployment |
+| `health_check` | `jsonb` | what the worker recorded while checking the application: `status` (`RUNNING` \| `PASSED` \| `FAILED`), `attempts`, `max_attempts`, `status_code`, `response_time`, `error`, `started_at`, `completed_at`; `NULL` until the deployment reaches its health check |
 | `rollback_status` | `varchar(20)` | outcome of the automatic rollback: `COMPLETED` \| `FAILED` \| `NOT_AVAILABLE` (CHECK); `NULL` unless the deployment failed its health check |
 | `rollback_deployment_id` | `uuid` | FK → `deployments.id` (`ON DELETE SET NULL`): the stable deployment the rollback restored, or tried to |
 | `started_at`, `finished_at` | `timestamptz` | set from status changes (see below) |
@@ -236,6 +238,7 @@ docker compose run --rm migrate         # apply pending migrations
 | `1790671094193_deployment-state-machine` | `deployment_status_transitions` (the transition map), the enforcing trigger, `transition_deployment_status()` |
 | `1790767006154_rollback-and-stable-deployments` | `ROLLING_BACK` status and its transitions; `deployments.rollback_status`, `rollback_deployment_id`; `projects.health_check_path`; `stable_deployment_id()` and its index |
 | `1790767291227_health-check-required-and-image-id` | removes `DEPLOYING → SUCCESS` (success requires the health check); `deployments.docker_image_id` |
+| `1790775116221_rollback-failed-status-and-health-check-details` | `ROLLBACK_FAILED` status and `ROLLING_BACK → ROLLBACK_FAILED`; `transition_deployment_status()` treats it as final; `deployments.health_check` |
 
 `docker compose up` runs the `migrate` service automatically, and the API starts only after it has finished successfully.
 
@@ -394,7 +397,7 @@ QUEUED ──▶ BUILDING ──────────────────
             → docker build → image tagged                   after CONTAINER_STARTUP_        with retries                  removed
                                                             GRACE_MS
    any failure in BUILDING or DEPLOYING ──▶ QUEUED (retry, if attempts remain) or FAILED
-   unhealthy in HEALTH_CHECK ──▶ ROLLING_BACK ──▶ FAILED   (see Phase 6)
+   unhealthy in HEALTH_CHECK ──▶ ROLLING_BACK ──▶ FAILED or ROLLBACK_FAILED   (see Phase 6)
 ```
 
 The worker updates PostgreSQL at every stage. Each status change is written **in the same SQL statement as its log line**, so the API never shows a status without its log line. A successful deployment's logs look like this (real output, trimmed):
@@ -511,7 +514,7 @@ If two deployments of the same project finish at nearly the same moment, the one
 | Network error while cloning | `BUILDING → QUEUED → …` | yes (3 attempts) | last error |
 | `docker build` fails | `BUILDING → QUEUED → … → FAILED` | yes (3 attempts) | `Docker build failed: <error line>` |
 | Container exits right away | `DEPLOYING → QUEUED → … → FAILED` | yes (3 attempts) | `Container exited immediately (exit code n)` |
-| Container runs but is unhealthy | `HEALTH_CHECK → ROLLING_BACK → FAILED`, or `HEALTH_CHECK → FAILED` without a stable deployment | no (the health check has its own retries) | `Health check failed after n attempts: … Rolled back to deployment <id>.` ([all cases](#failure-scenarios)) |
+| Container runs but is unhealthy | `HEALTH_CHECK → ROLLING_BACK → FAILED` (or `→ ROLLBACK_FAILED` if the rollback fails), or `HEALTH_CHECK → FAILED` without a stable deployment | no (the health check has its own retries) | `Health check failed after n attempts: … Rolled back to deployment <id>.` ([all cases](#failure-scenarios)) |
 
 - Retries use the **existing BullMQ policy** from Phase 3: 3 attempts with 2 s and then 4 s backoff. There is no second retry mechanism. All attempts belong to the **same deployment record**; the logs show `Deployment job started (attempt 2 of 3)`.
 - Failures that another attempt can't fix are raised as BullMQ `UnrecoverableError` and fail at once (`Deployment failed and will not be retried`). Build failures are retried, because many are transient (a registry timeout, `npm install` hitting the network).
@@ -580,7 +583,7 @@ Running the worker outside Docker (`npm run dev:worker`) works the same way, usi
 
 ## Deployment State Machine (Phase 5)
 
-> **Phase 6 extended this machine** with `HEALTH_CHECK` and `ROLLING_BACK` and removed `DEPLOYING → SUCCESS`. The current map is in [Phase 6 → State machine](#state-machine). This section describes how the machine is built and enforced, which has not changed.
+> **Phase 6 extended this machine** with `HEALTH_CHECK`, `ROLLING_BACK` and the final status `ROLLBACK_FAILED`, and removed `DEPLOYING → SUCCESS`. The current map is in [Phase 6 → State machine](#state-machine). This section describes how the machine is built and enforced, which has not changed.
 
 As introduced in Phase 5, a deployment could only move between statuses along these edges:
 
@@ -606,7 +609,7 @@ As introduced in Phase 5, a deployment could only move between statuses along th
 
 **Where it's enforced.** The API and the worker are separate packages. The only place both can share one definition is the **database**. Migration [`1790671094193_deployment-state-machine`](server/src/db/migrations/1790671094193_deployment-state-machine.sql) adds three things:
 
-- **`deployment_status_transitions`**: the map above, as rows with descriptions. Phase 6 extended it with two migrations that insert and delete rows; no code changed to enforce the new edges.
+- **`deployment_status_transitions`**: the map above, as rows with descriptions. Phase 6 extended it with migrations that insert and delete rows; no code changed to enforce the new edges.
 - a **trigger** on `deployments` that rejects any status change not in the table, with SQLSTATE `DX001` and detail `{"from","to"}`. It applies to every writer: the API, the worker, or plain SQL.
 - **`transition_deployment_status(id, status, error_message)`**, the one function that changes status:
   1. It locks the row and reads the current status.
@@ -663,7 +666,7 @@ data: {"deploymentId":"…","status":"SUCCESS"}
 1. The deployment is checked first, so an unknown or foreign ID gets the normal JSON `404`/`400`, not a stream.
 2. **Stored lines are sent first** (all of them, or those after `Last-Event-ID`), then the current status.
 3. Each Redis event, plus a database check every `LOG_STREAM_POLL_MS` (2 s) as a safety net, makes the stream **re-read PostgreSQL** for lines after the last one it sent. Events aren't forwarded blindly. So lines always arrive **in database order, without gaps or duplicates**, even when an event is lost or Redis is down (then updates arrive within the poll interval instead of instantly).
-4. Status changes are sent as `status` events. The stream sends `end` and **closes** once the deployment is `SUCCESS` or `FAILED`. `HEALTH_CHECK` and `ROLLING_BACK` are not final, so health-check attempts and the whole rollback are streamed before the stream ends. Keep-alive comments go out every 15 s.
+4. A `status` event carries the whole deployment and is sent **whenever the record changed**: its status, but also its health-check progress, image or container. The stream sends `end` and **closes** once the deployment is final: `SUCCESS`, `FAILED` or `ROLLBACK_FAILED`. `HEALTH_CHECK` and `ROLLING_BACK` are not final, so health-check attempts and the whole rollback are streamed before the stream ends. Keep-alive comments go out every 15 s.
 5. When the client disconnects, the timers and the Redis listener are released. The API holds **one** subscriber connection for all streams, and each deployment channel is subscribed once, however many browsers watch it. When the last stream leaves, the channel is unsubscribed.
 6. If the database fails mid-stream, the API sends `stream-error` and closes, and the browser reconnects. On shutdown the API ends open streams so browsers reconnect elsewhere.
 
@@ -672,22 +675,34 @@ data: {"deploymentId":"…","status":"SUCCESS"}
 - If the browser gives up (for example, the dev proxy answered `502` while the API restarted), the dashboard reopens the stream itself with `?lastEventId=<id>`, after checking that the deployment still exists.
 - The UI also ignores any line id it has already shown. Verified by restarting the API in the middle of a deployment: the page ended with all 56 lines, 0 duplicates.
 
-**Worker crashes.** If the worker dies mid-job, the stream stays open (keep-alives) and shows the last known status. When BullMQ hands the stalled job to a worker again, new lines and statuses flow as usual.
+**Worker crashes.** If the worker dies mid-job, the stream stays open (keep-alives) and shows the last known status. When BullMQ hands the stalled job to a worker again, new lines and statuses flow as usual. Since Phase 6 that job finds the deployment still in `BUILDING`, `DEPLOYING` or `HEALTH_CHECK`, logs `Previous attempt was interrupted during <status>; starting again`, puts it back to `QUEUED` and runs the attempt from the beginning.
 
 ## Phase 6 — Health Checks & Automatic Rollback
 
 A deployment is no longer successful because its container started. After `docker run`, the worker checks the application over HTTP. Only a healthy answer leads to `SUCCESS`; an unhealthy deployment is rolled back to the project's last stable deployment.
 
 ```text
-Deployment                        Health Check Failure
-   ↓                                 ↓
-Docker Run                        Find Last Stable Version
-   ↓                                 ↓
-Health Check                      Rollback (make sure it runs)
-   ↓                                 ↓
-SUCCESS                           Health Check
-                                     ↓
-                                  Recovered  (the failed deployment is FAILED, rollback COMPLETED)
+Deployment
+    ↓
+Docker  (build, run)
+    ↓
+Health Check
+    ↓
+Healthy?
+  ┌───┴────┐
+ YES       NO
+  ↓         ↓
+SUCCESS   ROLLBACK
+(stable)    ↓
+        Last Stable Version  ── none ──▶ FAILED  (nothing to roll back to)
+            ↓
+        Health Check
+         ┌───┴────┐
+        YES       NO
+         ↓         ↓
+     RECOVERED   ROLLBACK_FAILED
+     (the new deployment is FAILED,
+      the stable version is live)
 ```
 
 ### State machine
@@ -700,10 +715,10 @@ SUCCESS                           Health Check
          └───┬────┘     └────┬─────┘     └─────┬─────┘     └───┬──────┬───┘     └─────────┘
              │               │                 │               │      │ unhealthy, a stable deployment exists
              │               │                 │               │      ▼
-             │               │                 │               │  ┌──────────────┐
-             │               │                 │               │  │ ROLLING_BACK │
+             │               │                 │               │  ┌──────────────┐  stable version not restored
+             │               │                 │               │  │ ROLLING_BACK │────────────────────────────▶  ROLLBACK_FAILED  final
              │               │                 │               │  └──────┬───────┘
-             │               │                 │               │         │ rollback ended (restored or not)
+             │               │                 │               │         │ stable version restored and healthy
              └───────────────┴─────────────────┴───────────────┴─────────┴──────▶  FAILED     final
                                                      unhealthy, nothing to roll back to
 ```
@@ -714,13 +729,14 @@ SUCCESS                           Health Check
 | `BUILDING` | `DEPLOYING`, `FAILED`, `QUEUED` | unchanged |
 | `DEPLOYING` | `HEALTH_CHECK`, `FAILED`, `QUEUED` | container running / failed for good / attempt failed, BullMQ will retry. **`DEPLOYING → SUCCESS` no longer exists** |
 | `HEALTH_CHECK` | `SUCCESS`, `ROLLING_BACK`, `FAILED`, `QUEUED` | healthy / unhealthy with a stable deployment / unhealthy without one / an unexpected error, BullMQ will retry |
-| `ROLLING_BACK` | `FAILED` | the rollback ended; the deployment itself failed either way |
-| `SUCCESS`, `FAILED` | nothing | final |
+| `ROLLING_BACK` | `FAILED`, `ROLLBACK_FAILED` | the stable version is live again; the deployment itself failed / the stable version could not be brought back |
+| `SUCCESS`, `FAILED`, `ROLLBACK_FAILED` | nothing | final |
 
-Two decisions are worth knowing:
+Three decisions are worth knowing:
 
 - **`SUCCESS` is only reachable from `HEALTH_CHECK`.** Migration [`1790767291227`](server/src/db/migrations/1790767291227_health-check-required-and-image-id.sql) deletes the `DEPLOYING → SUCCESS` row, so "never successful before the health check" is a database rule for the worker, the API and plain SQL alike.
 - **`FAILED` stays final, so the rollback happens before it: `HEALTH_CHECK → ROLLING_BACK → FAILED`**, not `FAILED → ROLLING_BACK`. The live log stream ends on a final status. If a deployment became `FAILED` first, the dashboard would stop following it before the rollback started. `SUCCESS → ROLLING_BACK`, `BUILDING → ROLLING_BACK`, `FAILED → ROLLING_BACK` and `ROLLING_BACK → SUCCESS` are all rejected. A rolled-back deployment never becomes `SUCCESS`; the outcome of its rollback is stored next to it (see [Rollback](#rollback)).
+- **Two ways to fail after a health check.** `FAILED` means this deployment failed and the project is in a known state: the stable version is live, or there never was one. `ROLLBACK_FAILED` means the rollback itself failed: the stable version could not be restored or is unhealthy too, so **no healthy version is live** and someone has to look. It is a final status of its own rather than a flag on `FAILED`, so it stands out in the history and the API.
 
 ### Health-check configuration
 
@@ -743,6 +759,15 @@ curl -X PUT localhost:5000/api/projects/<projectId> -H "Content-Type: applicatio
 ```
 
 Nothing is hard-coded in the pipeline: the path comes from the project, the rest from the worker's configuration ([`config/index.js`](worker/src/config/index.js)).
+
+### Health-check target
+
+The check goes to **`<HEALTH_CHECK_HOST>:<host_port>`**, the port Docker published for the container, not to `<container name>:<container port>`. That follows from how Phase 4 runs apps:
+
+- Apps run on the `deployx-apps` network with inter-container traffic disabled, and the worker is deliberately not on that network. A container name is therefore neither resolvable nor reachable from the worker.
+- Every app's `container_port` is published on `127.0.0.1:<random port>` of the Docker host and recorded as `host_port`. That is the one address through which anything outside the container reaches it, so it is also what a health check should exercise.
+- A worker running on the host (`npm run dev:worker`) uses `127.0.0.1`. A worker inside Docker Compose is a container itself, where `127.0.0.1` is the worker; it reaches the host's published ports as `host.docker.internal`, which Compose sets as `HEALTH_CHECK_HOST`.
+- When a rollback re-checks a stable container, the port is read from Docker (`docker container inspect`), not from the database: a container that was restarted by hand gets a new host port.
 
 ### Health checks and retries
 
@@ -773,6 +798,23 @@ INFO  Deployment completed successfully                                         
 
 A health-check failure is **not retried by BullMQ**. Rebuilding the same commit can't make it healthy, so the job runs once and the deployment is rolled back. Build and startup failures keep their Phase 3 retries.
 
+**Health-check details.** Besides the log lines, the worker keeps a summary on the deployment (`deployments.health_check`), updated after every attempt and returned by the API:
+
+```json
+{
+  "status": "FAILED",
+  "attempts": 5,
+  "max_attempts": 5,
+  "status_code": 503,
+  "response_time": 3,
+  "error": "Health check returned HTTP 503",
+  "started_at": "2026-09-30T13:41:46.512Z",
+  "completed_at": "2026-09-30T13:41:59.637Z"
+}
+```
+
+`status` is `RUNNING`, `PASSED` or `FAILED`; `status_code`, `response_time` and `error` describe the last attempt (`status_code` is `null` when there was no HTTP answer, e.g. a timeout). It is one JSON column rather than eight columns, and it is `null` for a deployment that never reached its health check. The log stream sends the deployment whenever this changes, so the dashboard shows "Attempt 3 / 5" while the status is still `HEALTH_CHECK`. A deployment's own record is only about its own check: re-checking a stable deployment during a rollback does not touch that deployment's `health_check`.
+
 ### Stable deployments
 
 > A deployment is **stable** when it is `SUCCESS`. The **last stable deployment** of a project is its most recently finished `SUCCESS` deployment.
@@ -799,29 +841,30 @@ ROLLING_BACK
    ↓
 Remove the unhealthy container
    ↓
-Stable container still running? ── no ──▶ image still there? ── no ──▶ rollback FAILED
+Stable container still running? ── no ──▶ image still there? ── no ──▶ rollback FAILED ──▶ ROLLBACK_FAILED
    │ yes                                    │ yes
    │                                        ▼
    │                                   start the stable image again
    ▼                                        ▼
-Health check the stable version ── unhealthy ──▶ rollback FAILED
+Health check the stable version ── unhealthy ──▶ rollback FAILED ──▶ ROLLBACK_FAILED
    ↓ healthy
 rollback COMPLETED ──▶ the failed deployment becomes FAILED
 ```
 
 The outcome is stored on the **failed** deployment:
 
-| `rollback_status` | Meaning | `rollback_deployment_id` |
-| ----------------- | ------- | ------------------------ |
-| `COMPLETED` | the stable deployment is live and passed its health check | the restored deployment |
-| `FAILED` | it could not be restored, or it is unhealthy too | the deployment that was tried |
-| `NOT_AVAILABLE` | the project had no stable deployment | `null` |
-| `null` | no rollback applied (every deployment that did not fail its health check) | `null` |
+| `rollback_status` | Final `status` | Meaning | `rollback_deployment_id` |
+| ----------------- | -------------- | ------- | ------------------------ |
+| `COMPLETED` | `FAILED` | the stable deployment is live and passed its health check | the restored deployment |
+| `FAILED` | `ROLLBACK_FAILED` | it could not be restored, or it is unhealthy too | the deployment that was tried |
+| `NOT_AVAILABLE` | `FAILED` | the project had no stable deployment | `null` |
+| `null` | any | no rollback applied (every deployment that did not fail its health check) | `null` |
 
 ```json
 {
   "status": "FAILED",
   "error_message": "Health check failed after 5 attempts: Health check returned HTTP 503. Rolled back to deployment 6e1c550e-995d-48c4-8feb-4ba8be22f8e6.",
+  "health_check": { "status": "FAILED", "attempts": 5, "max_attempts": 5, "status_code": 503, "error": "Health check returned HTTP 503", "…": "…" },
   "rollback_status": "COMPLETED",
   "rollback_deployment_id": "6e1c550e-995d-48c4-8feb-4ba8be22f8e6",
   "is_stable": false
@@ -871,12 +914,18 @@ Two details make this exact:
 | Unhealthy, stable deployment still running | `HEALTH_CHECK → ROLLING_BACK → FAILED`, rollback `COMPLETED`; the stable container never stopped |
 | Unhealthy, stable container gone, image present | the stable version is started from its image and health-checked; rollback `COMPLETED` |
 | **First deployment** of a project is unhealthy | no rollback is attempted: `HEALTH_CHECK → FAILED`, rollback `NOT_AVAILABLE`, error ends with `No previous stable deployment available for rollback.` |
-| The stable version is unhealthy too | rollback `FAILED`: `Rollback failed: the stable deployment is unhealthy too (…)`. Nothing claims a recovery |
-| Stable container gone and its image removed | rollback `FAILED`: `image … of the stable deployment is no longer available`. Nothing is started |
-| The restarted stable container exits at once | rollback `FAILED`: `the stable container exited immediately (exit code n)` |
-| Health endpoint times out / connection refused / wrong port | unhealthy like any other failure; same paths as above |
+| The stable version is unhealthy too | `ROLLING_BACK → ROLLBACK_FAILED`, rollback `FAILED`: `Rollback failed: the stable deployment is unhealthy too (…)`. Nothing claims a recovery |
+| Stable container gone and its image removed | `ROLLBACK_FAILED`: `image … of the stable deployment is no longer available`. Nothing is started |
+| The restarted stable container exits at once | `ROLLBACK_FAILED`: `the stable container exited immediately (exit code n)` |
+| Health endpoint returns 404 / 500, times out, or the connection is refused | unhealthy like any other failure; same paths as above |
+| Application starts slowly | the startup grace period and the retries cover it: early failed attempts are logged as warnings, the first healthy answer makes it `SUCCESS` |
+| `docker build` fails | unchanged from Phase 4: `BUILDING → QUEUED → … → FAILED` with retries; no container, no health check, the stable version keeps running |
 | Container exits before the health check | unchanged from Phase 4: `DEPLOYING → QUEUED → … → FAILED` with retries. The previous stable container was never touched, so there is nothing to roll back |
-| Worker dies during a rollback | when BullMQ hands the job out again the deployment is set to `FAILED` with rollback `FAILED` (`the rollback did not complete`). A rollback is never run twice |
+| Worker dies during a rollback | when BullMQ hands the job out again the deployment is set to `ROLLBACK_FAILED` (`the rollback did not complete`). A rollback is never run twice |
+| Worker dies, or PostgreSQL is unreachable, during `BUILDING`, `DEPLOYING` or `HEALTH_CHECK` | nothing can be recorded, so the deployment is **not** marked `SUCCESS` even if the application answered. The job is run again, finds the interrupted status, goes back to `QUEUED` and starts over; the container of the interrupted attempt is replaced |
+| Redis can't deliver events | statuses and logs are written to PostgreSQL first, so the outcome is unchanged. The log stream re-reads PostgreSQL every `LOG_STREAM_POLL_MS`, so the dashboard still gets every line, a little later. (Without Redis at all no job runs: BullMQ needs it, as since Phase 3) |
+| Browser disconnects during a rollback | the rollback does not depend on anyone watching. The stream's Redis subscription is released; reopening the page resumes after the last line received (`Last-Event-ID`) |
+| Several projects deploy at once | independent: see [Concurrent deployments](#concurrent-deployments) |
 
 In every unhealthy case the unhealthy container is removed and its last 20 output lines are stored as `[container] …` log lines.
 
@@ -897,7 +946,7 @@ In every unhealthy case the unhealthy container is removed and its last 20 outpu
 
 ### No health API
 
-`GET /api/deployments/:id` already returns the outcome (`status`, `error_message`, `rollback_status`, `rollback_deployment_id`, `is_stable`), and every attempt with its status code and response time is in the logs. A separate `/health` endpoint would duplicate that, so none was added.
+`GET /api/deployments/:id` already returns the outcome (`status`, `error_message`, `health_check`, `rollback_status`, `rollback_deployment_id`, `is_stable`), and every attempt with its status code and response time is in the logs. A separate `/health` endpoint would duplicate that, so none was added.
 
 ### How to test locally
 
@@ -923,7 +972,22 @@ curl -s localhost:5000/api/projects/<projectId>/deployments
 curl -s http://127.0.0.1:<host_port of the first deployment>/        # Hello from DeployX
 ```
 
-Open `http://localhost:3000` while step 2 runs to watch the attempts and the rollback live. To see the other scenarios: deploy `unhealthy-app` as a project's **first** deployment (no stable version), or remove the stable container (`docker rm -f <container_name>`) before step 2 (restore from the image).
+Open `http://localhost:3000` while step 2 runs to watch the attempts and the rollback live. What to look for:
+
+1. First deployment: the steps reach `HEALTH_CHECK`, the health-check box counts attempts, then `SUCCESS` with a **Stable** tag.
+2. Second deployment: five failed attempts (`503 Service Unavailable`), then `ROLLING_BACK` (↻), then `FAILED` with **Automatic rollback ✓ Completed** and a link to the restored deployment.
+3. The log viewer shows every health-check and rollback line as it happens and ends with "The previous stable version was restored."
+4. The history keeps both rows; the first is still **Stable** and still answers on its port.
+
+Other scenarios:
+
+- **No stable version:** deploy `unhealthy-app` as a project's first deployment → `FAILED`, rollback "Not available".
+- **Restore from the image:** `docker rm -f <container_name of the stable deployment>` before step 2 → the rollback starts it again.
+- **`ROLLBACK_FAILED`:** remove the stable container **and** its image before step 2 → the rollback has nothing to start:
+  ```bash
+  docker rm -f <container_name of the stable deployment>
+  docker rmi -f $(docker image inspect --format '{{.Id}}' <repository>:deployment-<stable deployment id>)
+  ```
 
 ## Dashboard (Phase 5)
 
@@ -939,12 +1003,14 @@ Open `http://localhost:3000` while step 2 runs to watch the attempts and the rol
 **Phase 6 additions:**
 
 - A running deployment shows what it is doing and the latest log line under the steps, for example **Running health checks…** / `Health check attempt 2/5 failed: Health check returned HTTP 503`.
+- A **Health check** box shows the recorded details and follows them live: Running / Passed / Failed, `Attempt 3 / 5`, the last response (`200 OK · 38 ms`, or "No HTTP response") and the last error.
 - `ROLLING_BACK` has its own badge (↻) and step: **Health check failed. Restoring the previous stable version…**
 - A deployment that failed its health check shows the health check as the failed step and an **Automatic rollback** box: `✓ Completed` with a link to the **restored deployment**, `✗ Failed` with the rollback target, or `Not available` with "No previous stable deployment available for rollback."
-- The project's last stable deployment carries a **Stable** tag in the history and in its details; failed rows show "Rolled back to #N", "Rollback failed" or "No stable version to roll back to".
+- `ROLLBACK_FAILED` has its own badge and final step, and the log viewer ends with "…the automatic rollback failed: no healthy version is live."
+- The project's last stable deployment carries a **Stable** tag in the history and in its details; failed rows show "Automatic rollback completed · restored #N", "Automatic rollback failed" or "No stable version to roll back to".
 - The history header shows the project's health-check path.
 
-None of this is computed in the browser: the steps, the rollback box and the tag are read from `status`, `rollback_status`, `rollback_deployment_id` and `is_stable` as the API sends them.
+None of this is computed in the browser: the steps, the boxes and the tag are read from `status`, `health_check`, `rollback_status`, `rollback_deployment_id` and `is_stable` as the API sends them.
 
 The selection is in the URL (`#/projects/<id>/deployments/<id>`), so reloads and links keep it. All state comes from the API. The UI keeps no second copy of deployment status.
 
@@ -957,7 +1023,8 @@ DeployX/
 │   ├── src/
 │   │   ├── api/                    # http.js (envelope), systemApi.js, deploymentsApi.js
 │   │   ├── components/             # SystemStatus, ProjectList, DeploymentHistory, DeploymentDetails,
-│   │   │                           # RollbackSummary, LogViewer, StatusSteps, StatusBadge, StatusRow
+│   │   │                           # HealthCheckSummary, RollbackSummary, LogViewer, StatusSteps,
+│   │   │                           # StatusBadge, StatusRow
 │   │   ├── hooks/                  # useDeploymentStream (SSE), usePolling, useHashRoute, useSystemStatus
 │   │   ├── utils/format.js         # dates, durations, short ids
 │   │   ├── App.jsx
@@ -996,7 +1063,7 @@ DeployX/
 │   │   ├── index.js                # entry point: start, SIGTERM/SIGINT shutdown
 │   │   ├── worker.js               # BullMQ Worker, concurrency, event handlers
 │   │   ├── processors/
-│   │   │   └── deploymentProcessor.js  # job runner: idempotency, attempts, failure bookkeeping
+│   │   │   └── deploymentProcessor.js  # job runner: idempotency, attempts, failure bookkeeping, resuming interrupted attempts
 │   │   ├── pipeline/
 │   │   │   ├── dockerDeployment.js     # clone → checkout → build → run → verify running
 │   │   │   └── release.js              # health check → SUCCESS and retire the previous container, or rollback
@@ -1299,6 +1366,7 @@ curl -X POST http://localhost:5000/api/projects/<projectId>/deployments \
       "host_port": null,
       "container_removed_at": null,
       "error_message": null,
+      "health_check": null,
       "rollback_status": null,
       "rollback_deployment_id": null,
       "is_stable": false,
@@ -1317,7 +1385,7 @@ curl -X POST http://localhost:5000/api/projects/<projectId>/deployments \
 
 **List**: `GET /api/projects/:projectId/deployments` → `200`, the project's deployments newest first (`404` if the project doesn't exist). At most one of them has `is_stable: true`: the project's last stable deployment.
 
-**Get**: `GET /api/deployments/:deploymentId` → `200` with the same fields as the `deployment` in the create response. Once the worker has run, it shows the real outcome: resolved `commit_sha`, `docker_image`, `container_id`, `container_name`, `host_port`, `error_message` and timestamps (example in [Deployment lifecycle](#deployment-lifecycle)). For a deployment that failed its health check, `rollback_status` and `rollback_deployment_id` report what the automatic rollback did (see [Rollback](#rollback)); `is_stable` tells whether this is the project's last stable deployment.
+**Get**: `GET /api/deployments/:deploymentId` → `200` with the same fields as the `deployment` in the create response. Once the worker has run, it shows the real outcome: resolved `commit_sha`, `docker_image`, `container_id`, `container_name`, `host_port`, `error_message` and timestamps (example in [Deployment lifecycle](#deployment-lifecycle)). `health_check` holds the recorded health-check details (see [Health checks and retries](#health-checks-and-retries)). For a deployment that failed its health check, `rollback_status` and `rollback_deployment_id` report what the automatic rollback did (see [Rollback](#rollback)); `is_stable` tells whether this is the project's last stable deployment.
 
 **Update status**: `PATCH /api/deployments/:deploymentId/status` → `200` with the updated deployment
 
@@ -1327,10 +1395,10 @@ curl -X PATCH http://localhost:5000/api/deployments/<deploymentId>/status \
   -d '{ "status": "BUILDING" }'
 ```
 
-Only `QUEUED`, `BUILDING`, `DEPLOYING`, `HEALTH_CHECK`, `ROLLING_BACK`, `SUCCESS` and `FAILED` are accepted. Anything else returns `400`. The timestamps follow the status:
+Only `QUEUED`, `BUILDING`, `DEPLOYING`, `HEALTH_CHECK`, `ROLLING_BACK`, `SUCCESS`, `FAILED` and `ROLLBACK_FAILED` are accepted. Anything else returns `400`. The timestamps follow the status:
 
 - `started_at` is set when work first begins (`BUILDING`), and kept if the deployment goes back to `QUEUED` for a retry. A deployment that fails straight from `QUEUED` has no `started_at`.
-- `finished_at` is set on `SUCCESS` or `FAILED` and cleared for any other status.
+- `finished_at` is set on `SUCCESS`, `FAILED` or `ROLLBACK_FAILED` and cleared for any other status.
 
 Only transitions allowed by the [state machine](#state-machine) are accepted. Anything else returns **409** with `from` and `to`; for example `DEPLOYING → SUCCESS`, which has to go through `HEALTH_CHECK`. Setting the current status again is a no-op (`200`).
 
@@ -1383,7 +1451,7 @@ npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The default suite (181 tests, about 40 s, no Docker or network needed) covers:
+The default suite (200 tests, about 45 s, no Docker or network needed) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
@@ -1399,20 +1467,22 @@ The default suite (181 tests, about 40 s, no Docker or network needed) covers:
 - **isolation:** a failing job doesn't stop other jobs or the worker
 - **duplicates:** adding the same job twice runs it once; a job re-added for a finished deployment, or for a deleted one, is skipped
 - **graceful shutdown:** `close()` lets the running job finish and leaves new jobs for the next worker
-- **state machine:** every allowed transition passes (`QUEUED → BUILDING`, `BUILDING → DEPLOYING`, `DEPLOYING → HEALTH_CHECK`, `HEALTH_CHECK → SUCCESS / FAILED / ROLLING_BACK`, `ROLLING_BACK → FAILED`, retry edges); `DEPLOYING → SUCCESS`, `SUCCESS → HEALTH_CHECK`, `SUCCESS → ROLLING_BACK`, `BUILDING → ROLLING_BACK`, `FAILED → ROLLING_BACK`, `ROLLING_BACK → SUCCESS`, `SUCCESS → BUILDING` and others fail with `DX001`; raw UPDATEs are blocked too; timestamps and no-ops; API 409s with `from`/`to`; the worker stops when a deployment is failed by hand
+- **state machine:** every allowed transition passes (`QUEUED → BUILDING`, `BUILDING → DEPLOYING`, `DEPLOYING → HEALTH_CHECK`, `HEALTH_CHECK → SUCCESS / FAILED / ROLLING_BACK`, `ROLLING_BACK → FAILED / ROLLBACK_FAILED`, retry edges); `DEPLOYING → SUCCESS`, `SUCCESS → HEALTH_CHECK`, `SUCCESS → ROLLING_BACK`, `BUILDING → ROLLING_BACK`, `FAILED → ROLLING_BACK`, `FAILED → SUCCESS`, `ROLLING_BACK → SUCCESS`, `HEALTH_CHECK → ROLLBACK_FAILED`, `ROLLBACK_FAILED → anything`, `SUCCESS → BUILDING` and others fail with `DX001`; raw UPDATEs are blocked too; timestamps and no-ops; API 409s with `from`/`to`; the worker stops when a deployment is failed by hand
 - **events:** every persisted log line and status change is published on the deployment's own channel, with the database ids and in order; a Redis outage doesn't fail requests
-- **live stream (SSE):** headers; stored logs first, then status; new lines and statuses live; closes on `SUCCESS` and on `FAILED`; finished deployments get backlog + end at once; unpublished lines still arrive via the periodic check; `Last-Event-ID` resume without duplicates; no leakage between deployments; one shared subscription per deployment, released on disconnect; keep-alives
+- **live stream (SSE):** headers; stored logs first, then status; new lines and statuses live; a change of the record without a status change (health-check progress) is pushed, once; closes on `SUCCESS`, on `FAILED` and, after staying open through the rollback, on `ROLLBACK_FAILED`; finished deployments get backlog + end at once; unpublished lines still arrive via the periodic check; `Last-Event-ID` resume without duplicates; no leakage between deployments; one shared subscription per deployment, released on disconnect; keep-alives
 - **worker units:** image/container naming, workspace isolation, Dockerfile checks (including symlinks), no shell interpretation of hostile arguments, secret-free child environments, clone arguments, build log limits
-- **health checks** ([`health-check.test.js`](server/test/health-check.test.js)): 200, 201 and 204 healthy; 500, 503 and 404 unhealthy; redirects unhealthy and never followed; timeout; connection refused; a non-HTTP server; configurable path; a retry that succeeds; all retries failing; the interval; the startup grace period; bounded attempts; rejected hosts, ports and paths (no request is sent)
+- **health checks** ([`health-check.test.js`](server/test/health-check.test.js)): 200, 201 and 204 healthy; 400, 404, 500 and 503 unhealthy; redirects unhealthy and never followed; timeout; connection refused; a non-HTTP server; configurable path; a retry that succeeds; all retries failing; the interval; the startup grace period; bounded attempts; rejected hosts, ports and paths (no request is sent)
 - **stable deployments** ([`stable-deployments.test.js`](server/test/stable-deployments.test.js)): none without a success; the newest success replaces the previous one, whose record stays untouched; failed and rolled-back deployments never become stable; tracked per project; `is_stable` and the rollback fields in the API
 - **health check and rollback, end to end** ([`rollback.test.js`](server/test/rollback.test.js), API → BullMQ → worker → PostgreSQL → Redis → SSE):
   - `SUCCESS` is never reported before the health check passes (two failed attempts, then healthy), and the project's own path is requested
-  - version A stable, version B unhealthy → B `FAILED`, rollback `COMPLETED`, A still serving, the exact log sequence, the same lines and `ROLLING_BACK` on the SSE stream, history and A's record unchanged, no BullMQ retry
+  - version A stable, version B unhealthy → B `FAILED`, rollback `COMPLETED`, A still serving, the exact log sequence, the same lines, `ROLLING_BACK` and the health-check progress on the SSE stream, history and A's record unchanged, no BullMQ retry
+  - the recorded health-check details for a pass, a slow start, a failure and a timeout
   - the stable version restarted from its image (by image ID) when its container is gone
   - first deployment unhealthy → `NOT_AVAILABLE`, never `ROLLING_BACK`, no crash
-  - rollback failures: the stable version unhealthy too, its image missing, its container exiting at once; nothing claims a recovery
+  - rollback failures end as `ROLLBACK_FAILED`: the stable version unhealthy too, its image missing, its container exiting at once; nothing claims a recovery
   - timeouts and refused connections; the worker keeps running afterwards
   - a rollback interrupted by a worker restart
+  - **degraded infrastructure:** a browser disconnecting in the middle of a rollback (subscription released, nothing missed after reconnecting); Redis events failing (same database state, the stream falls back to PostgreSQL); PostgreSQL unreachable during the health check (never `SUCCESS` by accident, the attempt is run again, no leaked container)
   - **concurrency:** three projects at once, each rolled back only to its own stable deployment (or to none); in one project a healthy and an unhealthy deployment at the same time, in both orders; two healthy ones leave exactly one container
 
 ### Docker end-to-end tests
@@ -1435,7 +1505,7 @@ npm run test:docker       # 11 tests, about 2.5 min
 | 8. Unhealthy first deployment | `unhealthy-app` runs but `GET /health` = 503 → `FAILED`, rollback `NOT_AVAILABLE`, one attempt, container removed |
 | 9. Rollback | `hello-app` stable, then `unhealthy-app` → `FAILED`, rollback `COMPLETED`; the stable container never stopped and still answers; log sequence |
 | 10. Restore from the image | stable container removed by hand → the rollback starts it again from its image **ID** (the commit tag meanwhile points at the unhealthy build) and health-checks it |
-| 11. Rollback failure | stable container and image removed → rollback `FAILED` with the reason; history intact |
+| 11. Rollback failure | stable container and image removed → `ROLLBACK_FAILED` with the reason; history intact |
 
 They use their own image prefix (`deployx-test/`) and network (`deployx-apps-test`), and they remove everything they created. They clone the `main` branch; set `DEPLOYX_TEST_BRANCH` to test example apps from another branch.
 
@@ -1533,10 +1603,12 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 **Phase 6: health checks and automatic rollback**
 
 - [x] Health checks: configurable endpoint, timeout, retries, interval and startup grace period; failures never crash the worker
-- [x] State machine: `HEALTH_CHECK` in use, `ROLLING_BACK` added, `SUCCESS` only reachable through the health check, invalid transitions rejected
+- [x] State machine: `HEALTH_CHECK` in use, `ROLLING_BACK` and the final `ROLLBACK_FAILED` added, `SUCCESS` only reachable through the health check, invalid transitions rejected
 - [x] Stable version: a healthy successful deployment becomes stable; tracked per project; derived, so history is never rewritten
 - [x] Automatic rollback: unhealthy deployment detected, last stable deployment found, restored (still running or restarted from its image) and health-checked
-- [x] Outcomes reported: rollback completed, rollback failed, no stable version
+- [x] Outcomes reported: rollback completed, rollback failed (`ROLLBACK_FAILED`), no stable version
+- [x] Health-check details (attempts, status code, response time, error) recorded per deployment and streamed live
+- [x] Fails safely when Redis events, PostgreSQL or the worker are interrupted: no false `SUCCESS`, interrupted attempts are run again
 - [x] Health-check and rollback logs streamed through the existing Redis Pub/Sub + SSE pipeline; no second event system
 - [x] Dashboard: health-check progress, rolling back, rollback outcome, restored deployment, stable tag
 - [x] Unit, integration and rollback end-to-end tests; Phase 1–5 tests and the Docker e2e tests pass
