@@ -12,7 +12,7 @@ const CONNECTION_LABELS = {
 // Closing line for a failed deployment, by its rollback outcome.
 const FAILURE_NOTES = {
   COMPLETED: 'Deployment failed its health check. The previous stable version was restored.',
-  FAILED: 'Deployment failed its health check, and the automatic rollback failed.',
+  FAILED: 'Deployment failed its health check, and the automatic rollback failed: no healthy version is live.',
   NOT_AVAILABLE: 'Deployment failed its health check. There was no stable version to roll back to.',
 };
 
@@ -55,7 +55,7 @@ export default function LogViewer({ logs, connection, status, rollbackStatus, en
       </ol>
 
       {ended && status === 'SUCCESS' && <p className="notice notice--ok">Deployment completed successfully.</p>}
-      {ended && status === 'FAILED' && (
+      {ended && (status === 'FAILED' || status === 'ROLLBACK_FAILED') && (
         <p className="notice notice--error">{FAILURE_NOTES[rollbackStatus] ?? 'Deployment failed.'}</p>
       )}
     </div>

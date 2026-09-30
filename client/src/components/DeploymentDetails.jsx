@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import HealthCheckSummary from './HealthCheckSummary.jsx';
 import LogViewer from './LogViewer.jsx';
 import RollbackSummary from './RollbackSummary.jsx';
 import StatusBadge from './StatusBadge.jsx';
@@ -66,7 +67,10 @@ export default function DeploymentDetails({ stream, number, numberOf, onSelect, 
         </button>
       </div>
 
-      <StatusSteps status={deployment.status} rollbackStatus={deployment.rollback_status} />
+      <StatusSteps
+        status={deployment.status}
+        healthCheckFailed={deployment.health_check?.status === 'FAILED' || Boolean(deployment.rollback_status)}
+      />
 
       {ACTIVITY[deployment.status] && (
         <p className={`activity activity--${deployment.status.toLowerCase()}`} role="status">
@@ -116,9 +120,10 @@ export default function DeploymentDetails({ stream, number, numberOf, onSelect, 
         </Field>
       </dl>
 
+      <HealthCheckSummary check={deployment.health_check} />
       <RollbackSummary deployment={deployment} numberOf={numberOf} onSelect={onSelect} />
 
-      {deployment.status === 'FAILED' && (
+      {(deployment.status === 'FAILED' || deployment.status === 'ROLLBACK_FAILED') && (
         <div className="notice notice--error" role="alert">
           <strong>Error</strong>
           <div>{deployment.error_message ?? 'The deployment failed (see the logs).'}</div>

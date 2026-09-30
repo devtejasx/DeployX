@@ -1,21 +1,23 @@
 // The deployment lifecycle as steps:
 //   QUEUED -> BUILDING -> DEPLOYING -> HEALTH_CHECK -> SUCCESS
 // Steps before the current one are done. Everything shown here is derived
-// from what the API reports (status and rollback_status), nothing is assumed:
-// - a deployment that is ROLLING_BACK, or FAILED with a rollback outcome,
-//   failed its health check, so that step is marked as the failed one
+// from what the API reports (status, health_check and rollback_status),
+// nothing is assumed:
+// - a deployment that is ROLLING_BACK or ROLLBACK_FAILED, or FAILED with a
+//   failed health check, failed at the health check: that step is marked as
+//   the failed one, followed by where the deployment is now
 // - any other FAILED deployment shows FAILED as its final step; which stage
 //   failed is told by the error and the logs.
 const STEPS = ['QUEUED', 'BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'SUCCESS'];
 
-function stepsFor(status, rollbackStatus) {
-  if (status === 'ROLLING_BACK' || (status === 'FAILED' && rollbackStatus)) {
+function stepsFor(status, healthCheckFailed) {
+  if (status === 'ROLLING_BACK' || status === 'ROLLBACK_FAILED' || (status === 'FAILED' && healthCheckFailed)) {
     return [
       { label: 'QUEUED', state: 'done' },
       { label: 'BUILDING', state: 'done' },
       { label: 'DEPLOYING', state: 'done' },
       { label: 'HEALTH_CHECK', state: 'failed' },
-      status === 'ROLLING_BACK' ? { label: 'ROLLING_BACK', state: 'current' } : { label: 'FAILED', state: 'failed' },
+      { label: status, state: status === 'ROLLING_BACK' ? 'current' : 'failed' },
     ];
   }
 
@@ -32,10 +34,10 @@ function stepsFor(status, rollbackStatus) {
   });
 }
 
-export default function StatusSteps({ status, rollbackStatus }) {
+export default function StatusSteps({ status, healthCheckFailed }) {
   return (
     <ol className="steps" aria-label="Deployment progress">
-      {stepsFor(status, rollbackStatus).map(({ label, state }) => (
+      {stepsFor(status, healthCheckFailed).map(({ label, state }) => (
         <li
           key={label}
           className={`steps__step steps__step--${state}`}

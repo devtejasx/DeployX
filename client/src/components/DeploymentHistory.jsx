@@ -6,9 +6,9 @@ import { formatDateTime, formatDuration, shortId, shortSha } from '../utils/form
 function rollbackNote(deployment, numberOf) {
   switch (deployment.rollback_status) {
     case 'COMPLETED':
-      return `Rolled back to #${numberOf(deployment.rollback_deployment_id)}`;
+      return `Automatic rollback completed · restored #${numberOf(deployment.rollback_deployment_id)}`;
     case 'FAILED':
-      return 'Rollback failed';
+      return 'Automatic rollback failed';
     case 'NOT_AVAILABLE':
       return 'No stable version to roll back to';
     default:

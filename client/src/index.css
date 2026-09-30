@@ -331,6 +331,7 @@ button:disabled {
 .badge--deploying { --badge: var(--info); }
 .badge--health_check { --badge: var(--info); }
 .badge--rolling_back { --badge: var(--warn); }
+.badge--rollback_failed { --badge: var(--bad); }
 .badge--success { --badge: var(--ok); }
 .badge--failed { --badge: var(--bad); }
 
@@ -411,13 +412,15 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
-.rollback {
+.rollback,
+.health {
   margin: 16px 0 0;
   padding: 12px 14px;
   border-radius: 8px;
   border: 1px solid var(--border);
 }
 
+.health__grid,
 .rollback__grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -425,8 +428,36 @@ button:disabled {
   margin: 0;
 }
 
+.health__state,
 .rollback__outcome {
   font-weight: 600;
+}
+
+.health__error {
+  margin: 8px 0 0;
+  font-size: 0.8125rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.health--running .health__state {
+  color: var(--info);
+}
+
+.health--running .health__state span {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.health--ok .health__state {
+  color: var(--ok);
+}
+
+.health--error .health__state {
+  color: var(--bad);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .health--running .health__state span { animation: none; }
 }
 
 .rollback__note {

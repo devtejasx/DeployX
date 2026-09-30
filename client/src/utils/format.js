@@ -1,4 +1,6 @@
-export const TERMINAL_STATUSES = ['SUCCESS', 'FAILED'];
+// Final statuses. ROLLBACK_FAILED: the deployment was unhealthy and the last
+// stable version could not be restored either.
+export const TERMINAL_STATUSES = ['SUCCESS', 'FAILED', 'ROLLBACK_FAILED'];
 
 export function isTerminal(status) {
   return TERMINAL_STATUSES.includes(status);

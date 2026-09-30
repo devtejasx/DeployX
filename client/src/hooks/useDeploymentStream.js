@@ -13,10 +13,11 @@ function compareLogIds(a, b) {
 // Live view of one deployment through GET /api/deployments/:id/logs/stream.
 //
 // Returns { deployment, logs, connection, ended, error }:
-//   deployment  the deployment as last sent by the server (status events)
+//   deployment  the deployment as last sent by the server (status events,
+//               sent whenever the record changes: status, health check, ...)
 //   logs        every log line, each once, in database order
 //   connection  'connecting' | 'live' | 'reconnecting' | 'closed' | 'failed'
-//   ended       true once the deployment reached SUCCESS or FAILED
+//   ended       true once the deployment reached a final status
 //
 // Reconnects: the browser's EventSource reconnects by itself and sends
 // Last-Event-ID. If it gives up (e.g. the dev proxy answered 502 while the
