@@ -126,11 +126,18 @@ export async function checkContainerHealth({
   }
 }
 
+// How many attempts a health check gets: `retries`, but at least 1 and never
+// more than MAX_ATTEMPTS.
+export function maxHealthCheckAttempts(retries = config.healthCheck.retries) {
+  return Math.min(Math.max(Math.trunc(retries) || 1, 1), MAX_ATTEMPTS);
+}
+
 // Checks the application until it is healthy or the attempts are used up:
 //   wait startupGracePeriod -> attempt 1 -> (fail) wait interval -> attempt 2 -> ...
 // A single failed request is never final, and the loop is bounded by
-// `retries` (at most MAX_ATTEMPTS). Each step is reported through
-// `onLog(level, message)`. Returns the last check result plus `attempts`:
+// `retries` (at most MAX_ATTEMPTS). Each attempt is handed to
+// `onAttempt({ attempt, maxAttempts, result })`, and each step is reported
+// through `onLog(level, message)`. Returns the last check result plus `attempts`:
 //   { healthy: true,  attempts: 3, statusCode: 200, responseTime: 143 }
 //   { healthy: false, attempts: 5, statusCode: 500, error: 'Health check returned HTTP 500' }
 export async function waitForHealthy({
@@ -141,11 +148,12 @@ export async function waitForHealthy({
   interval = config.healthCheck.intervalMs,
   retries = config.healthCheck.retries,
   startupGracePeriod = config.healthCheck.startupGraceMs,
+  onAttempt = () => {},
   onLog = () => {},
   check = checkContainerHealth,
   sleep = defaultSleep,
 }) {
-  const maxAttempts = Math.min(Math.max(Math.trunc(retries) || 1, 1), MAX_ATTEMPTS);
+  const maxAttempts = maxHealthCheckAttempts(retries);
 
   if (startupGracePeriod > 0) {
     await onLog('INFO', `Waiting ${startupGracePeriod / 1000}s for the application to start`);
@@ -159,6 +167,7 @@ export async function waitForHealthy({
     } catch (err) {
       result = { healthy: false, error: `Health check request failed: ${err.message}` };
     }
+    await onAttempt({ attempt, maxAttempts, result });
 
     if (result.healthy) {
       await onLog(

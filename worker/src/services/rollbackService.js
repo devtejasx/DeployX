@@ -19,7 +19,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //   find the project's last stable deployment -> remove the unhealthy
 //   container -> make sure the stable version runs (its container is normally
 //   still running; otherwise it is started again from its image) -> health
-//   check it -> record the outcome -> the failed deployment becomes FAILED.
+//   check it -> record the outcome -> the failed deployment becomes FAILED, or
+//   ROLLBACK_FAILED when the stable version could not be brought back.
 //
 // Safety rules:
 // - only the project's own stable deployment is ever used (looked up by
@@ -127,17 +128,21 @@ export function createRollbackService({ docker = dockerService } = {}) {
     await addLog(stable.id, 'INFO', `Restored as the live version: deployment ${ctx.deployment.id} failed its health check`);
   }
 
-  // Stores the rollback outcome, then moves the deployment to FAILED with its
-  // final log line (in that order, so the final status already carries it).
+  // Stores the rollback outcome, then moves the deployment to its final status
+  // with its last log line (in that order, so the final status already carries
+  // the outcome): ROLLBACK_FAILED after a failed rollback, FAILED otherwise.
   async function finish(ctx, { status, stable = null, errorMessage, message }) {
     await recordRollback(ctx.deployment.id, { status, rollbackDeploymentId: stable?.id ?? null });
-    await markFailed(ctx.deployment.id, errorMessage, message);
+    await markFailed(ctx.deployment.id, errorMessage, message, {
+      status: status === 'FAILED' ? 'ROLLBACK_FAILED' : 'FAILED',
+    });
     return { status, stableDeploymentId: stable?.id ?? null, errorMessage };
   }
 
   // Handles `ctx.deployment` having failed its health check (`reason`), with
   // its running `container` { containerId, name }. The caller holds the
-  // project lock. The deployment always ends as FAILED; returns
+  // project lock. The deployment always ends in a final status (FAILED, or
+  // ROLLBACK_FAILED when the rollback itself failed); returns
   // { status: 'COMPLETED' | 'FAILED' | 'NOT_AVAILABLE', stableDeploymentId, errorMessage }.
   return async function rollbackDeployment(ctx, { container, reason }) {
     const stable = await findStableDeployment(ctx.project.id);

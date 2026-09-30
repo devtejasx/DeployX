@@ -92,7 +92,7 @@ async function finished(deployment) {
   return waitFor(
     async () => {
       const current = await getDeployment(deployment.id);
-      return ['SUCCESS', 'FAILED'].includes(current.status) ? current : null;
+      return ['SUCCESS', 'FAILED', 'ROLLBACK_FAILED'].includes(current.status) ? current : null;
     },
     { timeout: 15000 },
   );
@@ -130,6 +130,16 @@ async function probe(deployment, path = '/health') {
   return { status: response.status, body: (await response.text()).trim() };
 }
 
+// The stored health-check details without their timings (which are checked
+// for plausibility).
+function healthCheck(deployment) {
+  const { started_at: startedAt, completed_at: completedAt, response_time: responseTime, ...details } =
+    deployment.health_check;
+  assert.ok(Date.parse(completedAt) >= Date.parse(startedAt), 'health check start and end times');
+  assert.ok(responseTime === null || Number.isInteger(responseTime));
+  return details;
+}
+
 // Asserts that `expected` patterns appear in `lines` in this order.
 function assertInOrder(lines, expected) {
   let index = 0;
@@ -153,6 +163,13 @@ describe('health check before SUCCESS', () => {
       assert.equal(deployment.rollback_status, null);
       assert.equal(deployment.error_message, null);
       assert.ok(deployment.finished_at);
+      assert.deepEqual(healthCheck(deployment), {
+        status: 'PASSED',
+        attempts: 1,
+        max_attempts: 3,
+        status_code: 200,
+        error: null,
+      });
 
       const statuses = recorder.forDeployment(deployment.id).filter((e) => e.type === 'status').map((e) => e.status);
       assert.deepEqual(statuses, ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'SUCCESS']);
@@ -183,6 +200,14 @@ describe('health check before SUCCESS', () => {
       await sleep(150);
 
       assert.equal(deployment.status, 'SUCCESS', deployment.error_message);
+      // The failed attempts are not an error of the deployment: it passed.
+      assert.deepEqual(healthCheck(deployment), {
+        status: 'PASSED',
+        attempts: 3,
+        max_attempts: 3,
+        status_code: 200,
+        error: null,
+      });
       assertInOrder(await logLines(deployment.id), [
         /^WARN Health check attempt 1\/3 failed: Health check returned HTTP 503$/,
         /^WARN Health check attempt 2\/3 failed: Health check returned HTTP 503$/,
@@ -258,6 +283,13 @@ describe('automatic rollback', () => {
       `Health check failed after 3 attempts: Health check returned HTTP 500. Rolled back to deployment ${a.id}.`,
     );
     assert.ok(b.finished_at);
+    assert.deepEqual(healthCheck(b), {
+      status: 'FAILED',
+      attempts: 3,
+      max_attempts: 3,
+      status_code: 500,
+      error: 'Health check returned HTTP 500',
+    });
     assert.ok(b.container_removed_at, 'the unhealthy container is recorded as removed');
     assert.equal(docker.container(b.container_id), null);
 
@@ -308,10 +340,23 @@ describe('automatic rollback', () => {
       stored,
     );
     assert.ok(stream.statuses().includes('ROLLING_BACK'), `streamed statuses: ${stream.statuses()}`);
+    // Health-check progress was streamed while the status was still HEALTH_CHECK.
+    assert.ok(
+      stream.events.some(
+        (e) =>
+          e.event === 'status' &&
+          e.data.status === 'HEALTH_CHECK' &&
+          e.data.health_check.status === 'RUNNING' &&
+          e.data.health_check.attempts >= 1 &&
+          e.data.health_check.status_code === 500,
+      ),
+      'expected a status event with the health check in progress',
+    );
     assert.equal(stream.statuses().at(-1), 'FAILED');
     const finalStatus = stream.events.findLast((e) => e.event === 'status').data;
     assert.equal(finalStatus.rollback_status, 'COMPLETED');
     assert.equal(finalStatus.rollback_deployment_id, a.id);
+    assert.equal(finalStatus.health_check.status, 'FAILED');
     assert.deepEqual(stream.events.at(-1), { event: 'end', data: { deploymentId: b.id, status: 'FAILED' } });
 
     // 13. History is intact: both deployments are there, and A's record was
@@ -429,7 +474,7 @@ describe('automatic rollback', () => {
     }
   });
 
-  test('the rollback fails when the restored version is unhealthy too, and says so', async () => {
+  test('the rollback fails when the restored version is unhealthy too: ROLLBACK_FAILED, no false success', async () => {
     const project = await createProject();
     const commitA = healthy();
     const a = await deployAndWait(project, commitA);
@@ -438,9 +483,19 @@ describe('automatic rollback', () => {
 
     // Version A stops being healthy (e.g. a dependency it needs went away).
     docker.setApp(commitA, () => 502);
+    const recorder = await recordDeploymentEvents();
     const b = await deployAndWait(project, unhealthy(500));
+    await sleep(150);
+    await recorder.close();
 
-    assert.equal(b.status, 'FAILED');
+    assert.deepEqual(
+      recorder.forDeployment(b.id).filter((e) => e.type === 'status').map((e) => e.status),
+      ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'ROLLING_BACK', 'ROLLBACK_FAILED'],
+    );
+    assert.ok(b.finished_at);
+    assert.equal(b.is_stable, false);
+
+    assert.equal(b.status, 'ROLLBACK_FAILED');
     assert.equal(b.rollback_status, 'FAILED');
     assert.equal(b.rollback_deployment_id, a.id);
     assert.equal(
@@ -478,7 +533,7 @@ describe('automatic rollback', () => {
     docker.removeImage(a.docker_image);
 
     const b = await deployAndWait(project, unhealthy(500));
-    assert.equal(b.status, 'FAILED');
+    assert.equal(b.status, 'ROLLBACK_FAILED');
     assert.equal(b.rollback_status, 'FAILED');
     assert.equal(b.rollback_deployment_id, a.id);
     assert.match(
@@ -511,6 +566,7 @@ describe('automatic rollback', () => {
     };
     try {
       const b = await deployAndWait(project, unhealthy(500));
+      assert.equal(b.status, 'ROLLBACK_FAILED');
       assert.equal(b.rollback_status, 'FAILED');
       assert.match(b.error_message, /failed: the stable container exited immediately \(exit code 1\)$/);
       assert.deepEqual(await liveDeployments(project), []);
@@ -528,6 +584,14 @@ describe('automatic rollback', () => {
       hanging.error_message,
       `Health check failed after 3 attempts: Health check timed out after 300ms. ${NO_STABLE}`,
     );
+    // No HTTP answer: there is an error, but no status code.
+    assert.deepEqual(healthCheck(hanging), {
+      status: 'FAILED',
+      attempts: 3,
+      max_attempts: 3,
+      status_code: null,
+      error: 'Health check timed out after 300ms',
+    });
 
     // The container stops listening right after it started.
     const run = docker.runContainer;
@@ -567,12 +631,173 @@ describe('automatic rollback', () => {
     worker.worker.resume();
 
     const failed = await finished(stuck);
-    assert.equal(failed.status, 'FAILED');
+    assert.equal(failed.status, 'ROLLBACK_FAILED');
     assert.equal(failed.rollback_status, 'FAILED');
     assert.equal(failed.rollback_deployment_id, a.id);
     assert.equal(failed.error_message, 'The worker stopped during the rollback; the rollback did not complete');
     assert.ok((await logLines(stuck.id)).includes('ERROR Deployment failed: the rollback was interrupted'));
     assert.deepEqual(await liveDeployments(project), [a.id]);
+  });
+});
+
+describe('degraded infrastructure', () => {
+  test('a browser that disconnects during the rollback changes nothing, and misses nothing after reconnecting', async () => {
+    const { subscriptionStats } = await import('../src/events/deploymentSubscriber.js');
+    const project = await createProject();
+    const a = await deployAndWait(project, healthy());
+    // The stable version answers slowly, so the rollback takes a moment.
+    docker.setApp(a.commit_sha, async () => {
+      await sleep(200);
+      return 200;
+    });
+
+    const queued = await deploy(project, unhealthy(500));
+    const first = await openLogStream(api.baseUrl, queued.id);
+    await first.waitFor((e) => e.event === 'status' && e.data.status === 'ROLLING_BACK');
+    const seen = first.events.filter((e) => e.event === 'log');
+    first.close(); // the tab is closed in the middle of the rollback
+
+    // Its Redis subscription is released...
+    const channel = `${process.env.QUEUE_PREFIX}:deployment:${queued.id}:events`;
+    await waitFor(() => !subscriptionStats().channels.includes(channel));
+
+    // ...and the rollback finishes without anyone watching.
+    const b = await finished(queued);
+    assert.equal(b.status, 'FAILED');
+    assert.equal(b.rollback_status, 'COMPLETED');
+    assert.equal(b.rollback_deployment_id, a.id);
+
+    // Reopening the page resumes after the last line it had received.
+    const second = await openLogStream(api.baseUrl, queued.id, { lastEventId: seen.at(-1).id });
+    await second.waitFor((e) => e.event === 'end');
+    const stored = await logLines(b.id);
+    assert.ok(second.logs().length > 0);
+    assert.deepEqual(
+      [...seen, ...second.events.filter((e) => e.event === 'log')].map((e) => `${e.data.level} ${e.data.message}`),
+      stored,
+    );
+    assert.equal(second.events.findLast((e) => e.event === 'status').data.rollback_status, 'COMPLETED');
+  });
+
+  test('Redis events unavailable: health check and rollback still end in the right state, and the stream falls back to PostgreSQL', async (t) => {
+    const { default: serverConfig } = await import('../src/config/index.js');
+    const project = await createProject();
+    const a = await deployAndWait(project, healthy());
+
+    // Every event the worker publishes fails, as on a broken Redis connection.
+    // (The job queue itself still works: without it there is no job to run.)
+    const publish = t.mock.method(worker.worker.opts.connection, 'publish', async () => {
+      throw new Error('Connection is closed.');
+    });
+    t.mock.method(console, 'warn', () => {});
+    const recorder = await recordDeploymentEvents();
+    serverConfig.logStream.pollMs = 100;
+    let good;
+    let bad;
+    let stream;
+    try {
+      good = await deployAndWait(project, healthy());
+      const queued = await deploy(project, unhealthy(500));
+      stream = await openLogStream(api.baseUrl, queued.id);
+      bad = await finished(queued);
+      await stream.waitFor((e) => e.event === 'end');
+    } finally {
+      serverConfig.logStream.pollMs = 2000;
+      await sleep(100);
+      await recorder.close();
+    }
+
+    // Nothing the worker did was published...
+    assert.ok(publish.mock.callCount() > 20, `publish attempts: ${publish.mock.callCount()}`);
+    for (const deployment of [good, bad]) {
+      assert.deepEqual(recorder.forDeployment(deployment.id).filter((e) => e.type === 'status'), []);
+    }
+
+    // ...but the persistent state is exactly what it would have been.
+    assert.equal(good.status, 'SUCCESS', good.error_message);
+    assert.equal(good.health_check.status, 'PASSED');
+    assert.equal(bad.status, 'FAILED');
+    assert.equal(bad.rollback_status, 'COMPLETED');
+    assert.equal(bad.rollback_deployment_id, good.id);
+    assert.equal(bad.health_check.status, 'FAILED');
+    assert.equal((await getDeployment(good.id)).is_stable, true);
+    assert.equal((await getDeployment(a.id)).is_stable, false);
+    await waitFor(async () => (await liveDeployments(project)).length === 1);
+    assert.deepEqual(await liveDeployments(project), [good.id]);
+
+    const stored = await logLines(bad.id);
+    assertInOrder(stored, [
+      /^ERROR Health check failed after 3 attempts/,
+      /^INFO Starting automatic rollback$/,
+      /^INFO Stable version is healthy$/,
+      /^INFO Rollback completed successfully/,
+    ]);
+    // The dashboard's stream re-reads PostgreSQL on a timer, so it still got every line and the end.
+    assert.deepEqual(
+      stream.events.filter((e) => e.event === 'log').map((e) => `${e.data.level} ${e.data.message}`),
+      stored,
+    );
+    assert.deepEqual(stream.events.at(-1), { event: 'end', data: { deploymentId: bad.id, status: 'FAILED' } });
+  });
+
+  test('PostgreSQL unreachable during the health check: never SUCCESS by accident, and the attempt is run again', async () => {
+    const { default: workerPool } = await import('../../worker/src/db/postgres.js');
+    const project = await createProject();
+
+    // The worker loses the database for a moment, right when the application
+    // answers its first health-check request.
+    let outageUntil = 0;
+    let outages = 0;
+    const realQuery = workerPool.query;
+    workerPool.query = function query(...args) {
+      if (Date.now() < outageUntil) return Promise.reject(new Error('Connection terminated unexpectedly'));
+      return realQuery.apply(this, args);
+    };
+    const commit = version(() => {
+      if (outages === 0) {
+        outages += 1;
+        outageUntil = Date.now() + 120;
+      }
+      return 200;
+    });
+
+    const recorder = await recordDeploymentEvents();
+    let deployment;
+    try {
+      deployment = await deployAndWait(project, commit);
+      await sleep(150);
+    } finally {
+      workerPool.query = realQuery;
+      await recorder.close();
+    }
+
+    // The application answered 200 during the outage, but the result could not
+    // be recorded, so the deployment did not become SUCCESS on that attempt.
+    // BullMQ ran the job again, which found it still in HEALTH_CHECK.
+    assert.equal(outages, 1);
+    assert.deepEqual(
+      recorder.forDeployment(deployment.id).filter((e) => e.type === 'status').map((e) => e.status),
+      ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'QUEUED', 'BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'SUCCESS'],
+    );
+    assert.equal(deployment.status, 'SUCCESS', deployment.error_message);
+    assert.equal(deployment.is_stable, true);
+    assert.deepEqual(healthCheck(deployment), {
+      status: 'PASSED',
+      attempts: 1,
+      max_attempts: 3,
+      status_code: 200,
+      error: null,
+    });
+    assertInOrder(await logLines(deployment.id), [
+      /^INFO Deployment job started \(attempt 1 of 3\)$/,
+      /^WARN Previous attempt was interrupted during HEALTH_CHECK; starting again$/,
+      /^INFO Deployment job started \(attempt 2 of 3\)$/,
+      /^INFO Health check attempt 1\/3 passed/,
+      /^INFO Deployment completed successfully$/,
+    ]);
+    // The container of the interrupted attempt was replaced, not leaked.
+    assert.deepEqual(await liveDeployments(project), [deployment.id]);
+    assert.equal(worker.worker.isRunning(), true);
   });
 });
 

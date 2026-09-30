@@ -157,6 +157,8 @@ export async function createFakeDeployPipeline({ docker }) {
 
     await ctx.setStage('DEPLOYING', 'Deployment is now deploying');
     const name = containerName(project.id, deployment.id);
+    // A container of an earlier attempt of this same deployment (as the real pipeline does).
+    if (await docker.inspectContainer(name)) await docker.removeContainer(name);
     const containerId = await docker.runContainer({
       image,
       name,

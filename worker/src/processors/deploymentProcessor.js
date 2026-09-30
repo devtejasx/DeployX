@@ -11,6 +11,10 @@ import {
   transitionDeploymentStatus,
 } from '../services/deploymentService.js';
 
+// Statuses only a running attempt leaves behind. A job that starts and finds
+// its deployment in one of them is picking up after an interrupted attempt.
+const INTERRUPTED_STATUSES = ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK'];
+
 // Delay BullMQ will wait before the next attempt (for the log message only).
 function nextRetryDelayMs(job, attempt) {
   const { backoff } = job.opts;
@@ -52,8 +56,19 @@ export function createDeploymentProcessor({ pipeline = runDockerDeployment } = {
         deploymentId,
         'The worker stopped during the rollback; the rollback did not complete',
         'Deployment failed: the rollback was interrupted',
+        { status: 'ROLLBACK_FAILED' },
       );
       return { skipped: true, reason: 'Rollback was interrupted' };
+    }
+    if (INTERRUPTED_STATUSES.includes(deployment.status)) {
+      // The previous attempt ended without recording how: the worker was
+      // killed, or PostgreSQL was unreachable when the attempt failed. The
+      // deployment goes back to QUEUED, as after any failed attempt, and
+      // this attempt starts from the beginning.
+      await transitionDeploymentStatus(deploymentId, 'QUEUED', {
+        message: `Previous attempt was interrupted during ${deployment.status}; starting again`,
+        level: 'WARN',
+      });
     }
 
     const context = {

@@ -77,8 +77,8 @@ describe('checkContainerHealth', () => {
     }
   });
 
-  test('HTTP 500, 503 and 404 are unhealthy', async () => {
-    for (const statusCode of [500, 503, 404]) {
+  test('HTTP 4xx and 5xx are unhealthy: 400, 404, 500, 503', async () => {
+    for (const statusCode of [400, 404, 500, 503]) {
       const app = await startApp(respondWith(statusCode));
       const result = await checkContainerHealth({ host: HOST, port: app.port, path: '/health', timeout: 1000 });
       assert.equal(result.healthy, false);
@@ -245,6 +245,23 @@ describe('waitForHealthy (retries)', () => {
       'WARN Health check attempt 2/5 failed: Health check returned HTTP 503',
     ]);
     assert.match(logs[2], /^INFO Health check attempt 3\/5 passed: HTTP 200 in \d+ms$/);
+  });
+
+  test('every attempt is handed to onAttempt, before its log line', async () => {
+    const app = await startApp((req, res, count) => respondWith(count < 2 ? 503 : 200)(req, res));
+    const { logs, onLog, sleep } = recorder();
+    const seen = [];
+    await waitForHealthy({
+      ...settings,
+      port: app.port,
+      retries: 3,
+      onLog,
+      sleep,
+      onAttempt: ({ attempt, maxAttempts, result }) => {
+        seen.push(`${attempt}/${maxAttempts} HTTP ${result.statusCode} healthy=${result.healthy} logged=${logs.length}`);
+      },
+    });
+    assert.deepEqual(seen, ['1/3 HTTP 503 healthy=false logged=0', '2/3 HTTP 200 healthy=true logged=1']);
   });
 
   test('when every attempt fails it stops after the configured number and reports the last error', async () => {

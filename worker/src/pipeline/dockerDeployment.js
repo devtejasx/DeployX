@@ -36,7 +36,7 @@ const release = createRelease();
 //   BUILDING:     workspace -> git clone -> checkout commit -> Dockerfile check -> docker build
 //   DEPLOYING:    docker run -> verify running
 //   HEALTH_CHECK: HTTP health check with retries (pipeline/release.js)
-//   SUCCESS, or ROLLING_BACK -> FAILED when the application is unhealthy
+//   SUCCESS, or ROLLING_BACK -> FAILED / ROLLBACK_FAILED when the application is unhealthy
 // The workspace is removed at the end whatever happens.
 export async function runDockerDeployment(ctx) {
   const { deployment, project } = ctx;

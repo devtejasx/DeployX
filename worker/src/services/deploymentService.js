@@ -2,7 +2,8 @@ import { UnrecoverableError } from 'bullmq';
 import { query } from '../db/postgres.js';
 import { publishLog, publishStatus } from '../events/deploymentEvents.js';
 
-export const TERMINAL_STATUSES = ['SUCCESS', 'FAILED'];
+// Final statuses: a deployment in one of them is never changed again.
+export const TERMINAL_STATUSES = ['SUCCESS', 'FAILED', 'ROLLBACK_FAILED'];
 
 // SQLSTATE raised by the database state machine for a transition that is not
 // in deployment_status_transitions (see the API's migration 1790671094193).
@@ -17,7 +18,7 @@ function invalidTransition(err) {
 
 const DEPLOYMENT_COLUMNS = `id, project_id, commit_sha, branch, status, docker_image, docker_image_id,
   container_id, container_name, host_port, container_removed_at, error_message,
-  rollback_status, rollback_deployment_id,
+  health_check, rollback_status, rollback_deployment_id,
   started_at, finished_at, created_at, updated_at`;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -81,26 +82,27 @@ export async function transitionDeploymentStatus(deploymentId, status, { message
 
 // Moves the deployment to FAILED (with its error message) through the state
 // machine unless it already reached a final state, logging `message` in the
-// same statement. Returns true if this call changed it, so the failure is
-// logged exactly once.
-export async function markFailed(deploymentId, errorMessage, message) {
+// same statement. `status` can be ROLLBACK_FAILED instead, for a deployment
+// whose rollback did not succeed. Returns true if this call changed it, so
+// the failure is logged exactly once.
+export async function markFailed(deploymentId, errorMessage, message, { status = 'FAILED' } = {}) {
   try {
     const { rows } = await query(
       `WITH current AS (
-         SELECT id FROM deployments WHERE id = $1 AND status NOT IN ('SUCCESS', 'FAILED')
+         SELECT id FROM deployments WHERE id = $1 AND status <> ALL($4::varchar[])
        ), updated AS (
-         SELECT t.id FROM current CROSS JOIN LATERAL transition_deployment_status(current.id, 'FAILED', $2) AS t
+         SELECT t.id FROM current CROSS JOIN LATERAL transition_deployment_status(current.id, $5, $2) AS t
        ), logged AS (
          INSERT INTO deployment_logs (deployment_id, level, message)
          SELECT id, 'ERROR', $3 FROM updated
          ${LOG_RETURNING}
        )
        SELECT (SELECT row_to_json(logged) FROM logged) AS log FROM updated`,
-      [deploymentId, clip(errorMessage, MAX_ERROR_LENGTH), clip(message, MAX_LOG_LENGTH)],
+      [deploymentId, clip(errorMessage, MAX_ERROR_LENGTH), clip(message, MAX_LOG_LENGTH), TERMINAL_STATUSES, status],
     );
     if (rows.length === 0) return false;
     await publishLog(deploymentId, rows[0].log);
-    await publishStatus(deploymentId, 'FAILED');
+    await publishStatus(deploymentId, status);
     return true;
   } catch (err) {
     // It reached a final state concurrently: nothing to mark.
@@ -158,15 +160,29 @@ export async function findStableDeployment(projectId) {
   return rows[0] ?? null;
 }
 
-// Of `deploymentIds`, the ones a job is still working on (not SUCCESS or FAILED).
+// Of `deploymentIds`, the ones a job is still working on (no final status yet).
 export async function unfinishedDeploymentIds(deploymentIds) {
   const ids = deploymentIds.filter((id) => UUID_PATTERN.test(id ?? ''));
   if (ids.length === 0) return new Set();
   const { rows } = await query(
-    `SELECT id FROM deployments WHERE id = ANY($1::uuid[]) AND status NOT IN ('SUCCESS', 'FAILED')`,
-    [ids],
+    'SELECT id FROM deployments WHERE id = ANY($1::uuid[]) AND status <> ALL($2::varchar[])',
+    [ids, TERMINAL_STATUSES],
   );
   return new Set(rows.map((row) => row.id));
+}
+
+// Health-check details of the deployment (deployments.health_check, one JSON
+// object): `details` is merged into what is stored, or replaces it when a new
+// health check starts (`reset`).
+//   { status: 'RUNNING' | 'PASSED' | 'FAILED', attempts, max_attempts,
+//     status_code, response_time, error, started_at, completed_at }
+export async function recordHealthCheck(deploymentId, details, { reset = false } = {}) {
+  await query(
+    `UPDATE deployments
+     SET health_check = CASE WHEN $3 THEN $2::jsonb ELSE COALESCE(health_check, '{}'::jsonb) || $2::jsonb END
+     WHERE id = $1`,
+    [deploymentId, JSON.stringify(details), reset],
+  );
 }
 
 // Outcome of the automatic rollback of an unhealthy deployment:

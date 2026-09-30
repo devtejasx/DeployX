@@ -65,7 +65,7 @@ async function deployAndWait(project, body = {}) {
   const { id } = created.data.deployment;
   return waitFor(async () => {
     const { body: current } = await api.get(`/api/deployments/${id}`);
-    return ['SUCCESS', 'FAILED'].includes(current.data.status) ? current.data : null;
+    return ['SUCCESS', 'FAILED', 'ROLLBACK_FAILED'].includes(current.data.status) ? current.data : null;
   });
 }
 
@@ -163,6 +163,9 @@ describe('Docker deployment pipeline', { skip: !ENABLED && 'set DEPLOYX_DOCKER_T
     assert.equal(deployment.error_message, null);
     assert.equal(deployment.is_stable, true);
     assert.equal(deployment.rollback_status, null);
+    assert.equal(deployment.health_check.status, 'PASSED');
+    assert.equal(deployment.health_check.status_code, 200);
+    assert.equal(deployment.health_check.max_attempts, 4);
     assert.ok(deployment.started_at && deployment.finished_at);
 
     const response = await fetch(`http://127.0.0.1:${deployment.host_port}/`);
@@ -326,6 +329,10 @@ describe('Docker deployment pipeline', { skip: !ENABLED && 'set DEPLOYX_DOCKER_T
         'No previous stable deployment available for rollback.',
     );
     assert.match(deployment.docker_image, /^deployx-test\/unhealthy-/); // the image built and the container ran
+    assert.equal(deployment.health_check.status, 'FAILED');
+    assert.equal(deployment.health_check.attempts, 4);
+    assert.equal(deployment.health_check.status_code, 503);
+    assert.equal(deployment.health_check.error, 'Health check returned HTTP 503');
     assert.ok(deployment.container_removed_at);
 
     const messages = await logMessages(deployment.id);
@@ -433,13 +440,14 @@ describe('Docker deployment pipeline', { skip: !ENABLED && 'set DEPLOYX_DOCKER_T
     stableDeployment = restored.data;
   });
 
-  test('Test 11: the rollback fails, and is reported as failed, when the stable image is gone too', async () => {
+  test('Test 11: the rollback fails, and ends as ROLLBACK_FAILED, when the stable image is gone too', async () => {
     await docker(['rm', '-f', stableDeployment.container_id]);
     await docker(['rmi', '-f', await imageIdOf(stableDeployment)]);
 
     const failed = await deployAndWait(rollbackProject);
-    assert.equal(failed.status, 'FAILED');
+    assert.equal(failed.status, 'ROLLBACK_FAILED');
     assert.equal(failed.rollback_status, 'FAILED');
+    assert.ok(failed.finished_at);
     assert.equal(failed.rollback_deployment_id, stableDeployment.id);
     assert.ok(
       failed.error_message.endsWith(
@@ -455,6 +463,6 @@ describe('Docker deployment pipeline', { skip: !ENABLED && 'set DEPLOYX_DOCKER_T
 
     // Nothing was rewritten: all four deployments are still in the history.
     const { body: history } = await api.get(`/api/projects/${rollbackProject.id}/deployments`);
-    assert.deepEqual(history.data.map((d) => d.status), ['FAILED', 'FAILED', 'FAILED', 'SUCCESS']);
+    assert.deepEqual(history.data.map((d) => d.status), ['ROLLBACK_FAILED', 'FAILED', 'FAILED', 'SUCCESS']);
   });
 });
