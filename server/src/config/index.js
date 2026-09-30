@@ -35,6 +35,12 @@ const config = {
     pollMs: positiveInt(process.env.LOG_STREAM_POLL_MS, 2000),
     heartbeatMs: positiveInt(process.env.LOG_STREAM_HEARTBEAT_MS, 15000),
   },
+  // GitHub push webhooks (POST /api/webhooks/github). Every delivery must be
+  // signed with this secret (X-Hub-Signature-256); without it, webhooks are
+  // refused. Only the API knows it; it is never logged or sent to clients.
+  github: {
+    webhookSecret: process.env.GITHUB_WEBHOOK_SECRET || '',
+  },
   // Temporary stand-in for authentication (see middleware/devUser.js).
   devUser: {
     email: (process.env.DEV_USER_EMAIL || 'dev@deployx.local').toLowerCase(),

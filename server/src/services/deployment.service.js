@@ -10,8 +10,11 @@ import { getProject } from './project.service.js';
 // the definition the worker uses to choose a rollback target).
 // health_check: what the worker recorded while checking the application
 // ({ status, attempts, max_attempts, status_code, response_time, error, ... }).
-const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.commit_sha, d.branch, d.status, d.docker_image,
-  d.container_id, d.container_name, d.host_port, d.container_removed_at, d.error_message,
+// trigger: MANUAL or GITHUB_PUSH. deployment_target: LOCAL or AWS_ECS, with
+// image_digest and aws_task_definition_arn identifying what runs on AWS.
+const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.commit_sha, d.branch, d.status, d.trigger, d.deployment_target,
+  d.docker_image, d.image_digest, d.container_id, d.container_name, d.host_port, d.container_removed_at,
+  d.aws_task_definition_arn, d.error_message,
   d.health_check, d.rollback_status, d.rollback_deployment_id,
   COALESCE(d.id = stable_deployment_id(d.project_id), false) AS is_stable,
   d.started_at, d.finished_at, d.created_at, d.updated_at`;
@@ -31,25 +34,41 @@ async function appendLog(deploymentId, level, message) {
   await publishLog(deploymentId, rows[0]);
 }
 
-// Creates the QUEUED record and hands it to the job queue. The API returns as
-// soon as the job is stored in Redis; the worker does the actual processing.
-export async function createDeployment(userId, projectId, data) {
-  const project = await getProject(userId, projectId);
-
-  if (project.status !== 'ACTIVE') {
-    throw ApiError.conflict('Project is inactive; set its status to ACTIVE before deploying');
-  }
-
+// The one way a deployment comes into existence, whatever asked for it (the
+// API or a GitHub push): the QUEUED record, its first log lines, then the job
+// for the worker. Every trigger shares the same queue, worker and pipeline.
+// The deployment runs on the project's deployment target as it is now.
+//
+// A push deployment (trigger GITHUB_PUSH) is created at most once per project
+// and commit (unique index deployments_github_push_commit_key): for a commit
+// that already has one, nothing is created or queued and the existing
+// deployment is returned with `duplicate: true`.
+//
+// Returns { deployment, jobId, duplicate }.
+export async function queueDeployment(project, { commitSha = null, branch, trigger = 'MANUAL', logLines = [] }) {
   const { rows } = await query(
     `WITH d AS (
-       INSERT INTO deployments (project_id, commit_sha, branch, status)
-       VALUES ($1, $2, $3, 'QUEUED')
+       INSERT INTO deployments (project_id, commit_sha, branch, status, trigger, deployment_target)
+       VALUES ($1, $2, $3, 'QUEUED', $4, $5)
+       ON CONFLICT (project_id, commit_sha) WHERE trigger = 'GITHUB_PUSH' DO NOTHING
        RETURNING *
      )
      SELECT ${DEPLOYMENT_DETAIL_COLUMNS} FROM d JOIN projects p ON p.id = d.project_id`,
-    [project.id, data.commit_sha ?? null, data.branch ?? project.github_branch],
+    [project.id, commitSha, branch, trigger, project.deployment_target],
   );
+
+  if (rows.length === 0) {
+    const existing = await query(
+      `SELECT ${DEPLOYMENT_DETAIL_COLUMNS}
+       FROM deployments d JOIN projects p ON p.id = d.project_id
+       WHERE d.project_id = $1 AND d.commit_sha = $2 AND d.trigger = 'GITHUB_PUSH'`,
+      [project.id, commitSha],
+    );
+    return { deployment: existing.rows[0], jobId: null, duplicate: true };
+  }
+
   const deployment = rows[0];
+  for (const line of logLines) await appendLog(deployment.id, 'INFO', line);
   await appendLog(deployment.id, 'INFO', 'Deployment created');
 
   let job;
@@ -65,7 +84,24 @@ export async function createDeployment(userId, projectId, data) {
     throw new ApiError(503, 'Deployment queue is unavailable; the deployment was marked as FAILED');
   }
 
-  return { deployment, jobId: job.id };
+  return { deployment, jobId: job.id, duplicate: false };
+}
+
+// A manual deployment, requested through the API. The API returns as soon as
+// the job is stored in Redis; the worker does the actual processing.
+export async function createDeployment(userId, projectId, data) {
+  const project = await getProject(userId, projectId);
+
+  if (project.status !== 'ACTIVE') {
+    throw ApiError.conflict('Project is inactive; set its status to ACTIVE before deploying');
+  }
+
+  const { deployment, jobId } = await queueDeployment(project, {
+    commitSha: data.commit_sha ?? null,
+    branch: data.branch ?? project.github_branch,
+    trigger: 'MANUAL',
+  });
+  return { deployment, jobId };
 }
 
 // Newest first.

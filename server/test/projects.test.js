@@ -235,3 +235,128 @@ describe('DELETE /api/projects/:id', () => {
     assert.equal((await api.delete(`/api/projects/${id}`)).status, 404);
   });
 });
+
+describe('deployment target and repository settings', () => {
+  let serviceCounter = 0;
+  const awsSettings = () => {
+    serviceCounter += 1;
+    return {
+      deployment_target: 'AWS_ECS',
+      aws_ecs_service: `my-app-${serviceCounter}`,
+      aws_service_url: `https://app-${serviceCounter}.example.com`,
+    };
+  };
+
+  test('projects deploy locally by default', async () => {
+    const { body } = await api.post('/api/projects', projectPayload());
+    assert.equal(body.data.deployment_target, 'LOCAL');
+    assert.equal(body.data.aws_ecs_service, null);
+    assert.equal(body.data.aws_service_url, null);
+  });
+
+  test('an AWS_ECS project stores its ECS service and a normalized service URL', async () => {
+    const { status, body } = await api.post('/api/projects', {
+      ...projectPayload(),
+      deployment_target: 'AWS_ECS',
+      aws_ecs_service: ' web_api-1 ',
+      aws_service_url: 'HTTPS://My-App.Example.com:8443/',
+    });
+    assert.equal(status, 201, JSON.stringify(body));
+    assert.equal(body.data.deployment_target, 'AWS_ECS');
+    assert.equal(body.data.aws_ecs_service, 'web_api-1');
+    assert.equal(body.data.aws_service_url, 'https://my-app.example.com:8443');
+  });
+
+  test('an AWS_ECS project needs both its service and its URL', async () => {
+    for (const missing of ['aws_ecs_service', 'aws_service_url']) {
+      const payload = { ...projectPayload(), ...awsSettings() };
+      delete payload[missing];
+      const { status, body } = await api.post('/api/projects', payload);
+      assert.equal(status, 400, missing);
+      assert.deepEqual(body.error.details, ['An AWS_ECS project needs aws_ecs_service and aws_service_url']);
+    }
+
+    // Switching an existing project to AWS_ECS without them is refused too.
+    const project = (await api.post('/api/projects', projectPayload())).body.data;
+    const { status, body } = await api.put(`/api/projects/${project.id}`, { deployment_target: 'AWS_ECS' });
+    assert.equal(status, 400);
+    assert.deepEqual(body.error.details, ['An AWS_ECS project needs aws_ecs_service and aws_service_url']);
+    assert.equal((await api.get(`/api/projects/${project.id}`)).body.data.deployment_target, 'LOCAL');
+  });
+
+  test('rejects unknown targets, invalid service names and service URLs that are not a plain origin', async () => {
+    const target = await api.post('/api/projects', { ...projectPayload(), deployment_target: 'KUBERNETES' });
+    assert.equal(target.status, 400);
+    assert.deepEqual(target.body.error.details, ['Deployment target must be one of: LOCAL, AWS_ECS']);
+
+    const service = await api.post('/api/projects', { ...projectPayload(), ...awsSettings(), aws_ecs_service: 'my app;rm' });
+    assert.equal(service.status, 400);
+    assert.deepEqual(service.body.error.details, ['AWS ECS service must contain only letters, digits, hyphens and underscores']);
+
+    for (const url of [
+      'ftp://app.example.com',
+      'https://user:secret@app.example.com',
+      'https://app.example.com/health',
+      'https://app.example.com?next=/',
+      'https://app.example.com/#x',
+      'javascript:alert(1)',
+      'https://[::1]:8080',
+      'app.example.com',
+    ]) {
+      const { status, body } = await api.post('/api/projects', { ...projectPayload(), ...awsSettings(), aws_service_url: url });
+      assert.equal(status, 400, url);
+      assert.deepEqual(
+        body.error.details,
+        ['AWS service URL must be an http(s) origin such as https://my-app.example.com'],
+        url,
+      );
+    }
+  });
+
+  test('two projects cannot deploy to the same ECS service', async () => {
+    const settings = awsSettings();
+    assert.equal((await api.post('/api/projects', { ...projectPayload(), ...settings })).status, 201);
+    const { status, body } = await api.post('/api/projects', {
+      ...projectPayload(),
+      ...settings,
+      aws_service_url: 'https://other.example.com',
+    });
+    assert.equal(status, 409);
+    assert.equal(body.error.message, `ECS service "${settings.aws_ecs_service}" is already used by another project`);
+  });
+
+  test('the repository, branch and target can be changed together, and back to LOCAL', async () => {
+    const project = (await api.post('/api/projects', projectPayload())).body.data;
+    const settings = awsSettings();
+    const { status, body } = await api.put(`/api/projects/${project.id}`, {
+      github_repo: 'https://github.com/Octo-Org/New-App.git',
+      github_branch: 'release/1.x',
+      ...settings,
+    });
+    assert.equal(status, 200, JSON.stringify(body));
+    assert.equal(body.data.github_repo, 'https://github.com/Octo-Org/New-App');
+    assert.equal(body.data.github_branch, 'release/1.x');
+    assert.equal(body.data.deployment_target, 'AWS_ECS');
+    assert.equal(body.data.aws_ecs_service, settings.aws_ecs_service);
+
+    const local = await api.put(`/api/projects/${project.id}`, { deployment_target: 'LOCAL' });
+    assert.equal(local.status, 200);
+    assert.equal(local.body.data.deployment_target, 'LOCAL');
+    // The AWS settings are kept for switching back.
+    assert.equal(local.body.data.aws_service_url, settings.aws_service_url);
+  });
+
+  test('a deployment keeps the target it was created for', async () => {
+    const project = (await api.post('/api/projects', { ...projectPayload(), ...awsSettings() })).body.data;
+    const { deployment } = (await api.post(`/api/projects/${project.id}/deployments`, {})).body.data;
+    assert.equal(deployment.deployment_target, 'AWS_ECS');
+    assert.equal(deployment.trigger, 'MANUAL');
+    assert.equal(deployment.image_digest, null);
+    assert.equal(deployment.aws_task_definition_arn, null);
+
+    await api.put(`/api/projects/${project.id}`, { deployment_target: 'LOCAL' });
+    assert.equal((await api.get(`/api/deployments/${deployment.id}`)).body.data.deployment_target, 'AWS_ECS');
+    const next = (await api.post(`/api/projects/${project.id}/deployments`, {})).body.data.deployment;
+    assert.equal(next.deployment_target, 'LOCAL');
+  });
+});

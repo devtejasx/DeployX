@@ -73,6 +73,8 @@ services:
       QUEUE_PREFIX: ${QUEUE_PREFIX:-deployx}
       DEPLOYMENT_JOB_ATTEMPTS: ${DEPLOYMENT_JOB_ATTEMPTS:-3}
       DEPLOYMENT_JOB_BACKOFF_MS: ${DEPLOYMENT_JOB_BACKOFF_MS:-2000}
+      # Verifies GitHub webhook signatures; only the API gets it.
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
     ports:
       - "127.0.0.1:${PORT:-5000}:5000"
     depends_on:
