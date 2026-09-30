@@ -21,3 +21,17 @@ curl -X POST http://localhost:5000/api/projects -H "Content-Type: application/js
   "container_port": 3000
 }'
 ```
+
+DeployX checks each app on the project's `health_check_path`, which defaults to `/health`.
+
+## Trying a rollback
+
+Deploy `hello-app` first, so the project has a stable deployment. Then point the same project at `unhealthy-app` and deploy again:
+
+```bash
+curl -X PUT http://localhost:5000/api/projects/<projectId> -H "Content-Type: application/json" \
+  -d '{ "dockerfile_path": "examples/unhealthy-app/Dockerfile" }'
+curl -X POST http://localhost:5000/api/projects/<projectId>/deployments -H "Content-Type: application/json" -d '{}'
+```
+
+The second deployment fails its health check, ends as `FAILED` with `rollback_status: "COMPLETED"`, and `hello-app` keeps answering on its port. Deployed as a project's **first** deployment, `unhealthy-app` ends as `FAILED` with `rollback_status: "NOT_AVAILABLE"`: there is no stable deployment to go back to. See "Phase 6 — Health Checks & Automatic Rollback" in the main [README](../README.md).
