@@ -32,6 +32,9 @@ describe('schema', () => {
       'deployments_project_id_created_at_idx',
       'deployment_logs_deployment_id_id_idx',
       'deployments_stable_idx',
+      'deployments_github_push_commit_key',
+      'projects_github_repo_lower_idx',
+      'projects_aws_ecs_service_key',
     ]) {
       assert.ok(names.includes(index), `missing index ${index}`);
     }
@@ -125,6 +128,119 @@ describe('schema', () => {
       );
     }
     await pool.query(`UPDATE projects SET health_check_path = '/api/v1/health?probe=1' WHERE id = $1`, [project.id]);
+  });
+
+  test('CHECK constraints guard the deployment target, trigger and AWS columns', async () => {
+    const project = (await api.post('/api/projects', projectPayload())).body.data;
+    const sha = 'a'.repeat(40);
+    const insert = (columns, values) =>
+      pool.query(
+        `INSERT INTO deployments (project_id, branch, ${columns.join(', ')})
+         VALUES ($1, 'main', ${columns.map((_, i) => `$${i + 2}`).join(', ')}) RETURNING *`,
+        [project.id, ...values],
+      );
+
+    // Existing and new rows default to a manual deployment on the local target.
+    const { rows } = await insert(['commit_sha'], ['abc1234']);
+    assert.equal(rows[0].trigger, 'MANUAL');
+    assert.equal(rows[0].deployment_target, 'LOCAL');
+    assert.equal(rows[0].image_digest, null);
+    assert.equal(rows[0].aws_task_definition_arn, null);
+
+    await insert(
+      ['trigger', 'commit_sha', 'deployment_target', 'image_digest', 'aws_task_definition_arn'],
+      ['GITHUB_PUSH', sha, 'AWS_ECS', `sha256:${'0'.repeat(64)}`, 'arn:aws:ecs:eu-west-1:123456789012:task-definition/my-app:7'],
+    );
+    for (const [columns, values] of [
+      [['trigger'], ['CRON']],
+      [['deployment_target'], ['EKS']],
+      [['image_digest'], ['sha256:abc']],
+      [['image_digest'], [`md5:${'0'.repeat(64)}`]],
+      [['aws_task_definition_arn'], ['arn:aws:ecs:eu-west-1:123456789012:service/my-app']],
+      [['aws_task_definition_arn'], ['my-app:7']],
+      // A push deployment is pinned to a full commit SHA.
+      [['trigger'], ['GITHUB_PUSH']],
+      [['trigger', 'commit_sha'], ['GITHUB_PUSH', 'abc1234']],
+    ]) {
+      await assert.rejects(insert(columns, values), { code: '23514' }, `${columns} = ${values} should be rejected`);
+    }
+
+    // One push deployment per project and commit; manual ones may repeat it.
+    await assert.rejects(insert(['trigger', 'commit_sha'], ['GITHUB_PUSH', sha]), {
+      code: '23505',
+      constraint: 'deployments_github_push_commit_key',
+    });
+    await insert(['commit_sha'], [sha]);
+    await insert(['commit_sha'], [sha]);
+    const other = (await api.post('/api/projects', projectPayload())).body.data;
+    await pool.query(`INSERT INTO deployments (project_id, branch, trigger, commit_sha) VALUES ($1, 'main', 'GITHUB_PUSH', $2)`, [
+      other.id,
+      sha,
+    ]);
+  });
+
+  test('an AWS_ECS project needs its ECS service and URL, and owns the service', async () => {
+    const project = (await api.post('/api/projects', projectPayload())).body.data;
+    const setTarget = (id, service, url) =>
+      pool.query(
+        `UPDATE projects SET deployment_target = 'AWS_ECS', aws_ecs_service = $2, aws_service_url = $3
+         WHERE id = $1 RETURNING deployment_target`,
+        [id, service, url],
+      );
+
+    const { rows } = await pool.query('SELECT deployment_target FROM projects WHERE id = $1', [project.id]);
+    assert.equal(rows[0].deployment_target, 'LOCAL');
+
+    await assert.rejects(setTarget(project.id, null, 'https://app.example.com'), { code: '23514' });
+    await assert.rejects(setTarget(project.id, 'my-app', null), { code: '23514' });
+    for (const url of [
+      'ftp://app.example.com',
+      'https://user:pass@app.example.com',
+      'https://app.example.com/health',
+      'https://app.example.com?x=1',
+      'https://App.Example.com',
+      'https://',
+    ]) {
+      await assert.rejects(setTarget(project.id, 'my-app', url), { code: '23514' }, `${url} should be rejected`);
+    }
+    await assert.rejects(setTarget(project.id, 'my app', 'https://app.example.com'), { code: '23514' });
+    await setTarget(project.id, 'my-app_1', 'https://app.example.com:8443');
+
+    // Two projects cannot deploy to the same ECS service.
+    const other = (await api.post('/api/projects', projectPayload())).body.data;
+    await assert.rejects(setTarget(other.id, 'my-app_1', 'https://other.example.com'), {
+      code: '23505',
+      constraint: 'projects_aws_ecs_service_key',
+    });
+    // A LOCAL project may keep an old service name around.
+    await pool.query(`UPDATE projects SET aws_ecs_service = 'my-app_1' WHERE id = $1`, [other.id]);
+  });
+
+  test('the Phase 7 migration can be reverted and re-applied without losing rows', async () => {
+    const { runMigrations } = await import('../src/db/migrate.js');
+    const { testDatabaseUrl } = await import('./helpers.js');
+    const project = (await api.post('/api/projects', projectPayload())).body.data;
+    const { deployment } = (await api.post(`/api/projects/${project.id}/deployments`, {})).body.data;
+    const columns = async (table) =>
+      (
+        await pool.query(
+          `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`,
+          [table],
+        )
+      ).rows.map((row) => row.column_name);
+
+    await runMigrations({ direction: 'down', count: 1, databaseUrl: testDatabaseUrl, log: () => {} });
+    try {
+      assert.ok(!(await columns('deployments')).includes('trigger'));
+      assert.ok(!(await columns('projects')).includes('deployment_target'));
+      assert.equal((await pool.query('SELECT count(*)::int AS n FROM deployments WHERE id = $1', [deployment.id])).rows[0].n, 1);
+    } finally {
+      await runMigrations({ databaseUrl: testDatabaseUrl, log: () => {} });
+    }
+
+    const { rows } = await pool.query('SELECT trigger, deployment_target FROM deployments WHERE id = $1', [deployment.id]);
+    assert.deepEqual(rows[0], { trigger: 'MANUAL', deployment_target: 'LOCAL' });
+    assert.ok((await columns('projects')).includes('aws_service_url'));
   });
 
   test('deleting a project cascades to its deployments and logs', async () => {
