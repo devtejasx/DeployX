@@ -2,7 +2,7 @@
 
 A self-service deployment platform: connect a GitHub repository, build it into a Docker image, deploy it, watch it run and roll back automatically when a release goes bad.
 
-> **Status: Phase 6 of 8. Health checks and automatic rollback.** DeployX is being built one phase at a time. Creating a deployment queues a job; the worker clones the public GitHub repository at the requested commit, builds a Docker image and starts it as a container on an isolated network. It then **checks the application's health over HTTP**: only a healthy deployment becomes `SUCCESS`, and an unhealthy one is **rolled back to the last stable version automatically**. Every status change goes through a database-enforced state machine, and the dashboard shows each application's deployment history with **live logs over Server-Sent Events**. GitHub/AWS integration (Phase 7) and production-grade isolation (Phase 8) come later. See [Security measures and limitations](#security-measures-and-limitations-development-setup) before deploying code you don't trust.
+> **Status: Phase 7 of 8. GitHub integration and AWS deployment.** DeployX is being built one phase at a time. A deployment is queued from the dashboard or API, or **automatically by a signed GitHub push webhook**. The worker clones the repository at the exact commit (private repositories through a **GitHub App**), builds a Docker image, and runs it either as a local container or on **Amazon ECS** after pushing it to **Amazon ECR**. It then **checks the application's health over HTTP**: only a healthy deployment becomes `SUCCESS`, and an unhealthy one is **rolled back to the last stable version automatically**, on AWS by redeploying the stable image digest. Every status change goes through a database-enforced state machine, and the dashboard shows each application's deployment history with **live logs over Server-Sent Events**. Production-grade authentication, isolation and monitoring (Phase 8) come later. See [Security measures and limitations](#security-measures-and-limitations-development-setup) before deploying code you don't trust.
 
 ## Overview
 
@@ -58,6 +58,16 @@ A self-service deployment platform: connect a GitHub repository, build it into a
 - **Health-check details** (attempts, last status code, response time, error) recorded on the deployment and pushed to the dashboard after every attempt
 - See [Phase 6 — Health Checks & Automatic Rollback](#phase-6--health-checks--automatic-rollback)
 
+**Phase 7 (GitHub integration and AWS deployment)**
+
+- **`POST /api/webhooks/github`**: GitHub push webhooks, **HMAC-SHA256 signature verified** (constant time) before anything else is read; a push to a project's branch creates a deployment of **that exact commit** through the same queue, worker and pipeline as a manual deployment
+- **Duplicate protection**: a redelivered push never creates a second deployment (one push deployment per project and commit, enforced by a unique index)
+- **Private repositories** through a **GitHub App**: a read-only token for the one repository, created per deployment and passed to git outside its arguments, config and logs
+- **Deployment targets**: `LOCAL` (a container on the worker's Docker host, as before) or **`AWS_ECS`**: image pushed to **ECR** by commit tag, run on the project's **ECS/Fargate service by digest**, health-checked on the service URL, **rolled back by digest** through the Phase 6 rollback
+- Deployment records name their **trigger** (`MANUAL` / `GITHUB_PUSH`), **target**, **image digest** and **ECS task definition**
+- Dashboard **Settings** for repository, branch and target; history shows trigger and target; details show commit link, image version, digest and task definition
+- See [Phase 7 — GitHub Integration & AWS Deployment](#phase-7--github-integration--aws-deployment)
+
 ## Architecture
 
 ```text
@@ -66,35 +76,38 @@ A self-service deployment platform: connect a GitHub repository, build it into a
                 └────────────┬─────────────┘
                              │  /api/*  (dev proxy)
                              ▼
-                ┌──────────────────────────┐
-                │  server  (Express API)   │  :5000
-                │  routes → controllers →  │
-                │  services → db / queues  │
-                └──────┬────────────┬──────┘
-                       │            │ add job (BullMQ)
-                  SQL  │            ▼
-                       │       ┌──────────┐
-                       │       │  Redis   │  :6379   "deployments" queue
-                       │       └────┬─────┘
-                       │            │ next job (BullMQ, concurrency 2)
-                       │            ▼
-                       │  ┌──────────────────────────┐   git clone   ┌────────────┐
-                       │  │  worker  (Node.js)       │◀──────────────│   GitHub   │
-                       │  └──────┬─────────────┬─────┘               └────────────┘
-                       ▼         │ status+logs │ docker build / run (Docker socket), then HTTP health check
-             ┌──────────────┐    │             ▼
-             │  PostgreSQL  │◀───┘   ┌────────────────────────────────────────┐
-             │    :5432     │        │  Docker daemon                         │
-             └──────▲───────┘        │   network "deployx-apps" (isolated)    │
-                    │                │    └── app containers  127.0.0.1:<port>│
-             ┌──────┴───────┐        └────────────────────────────────────────┘
-             │   migrate    │  (one-shot job: applies migrations, then exits)
-             └──────────────┘
+                ┌──────────────────────────┐   push webhook (signed)   ┌────────────┐
+                │  server  (Express API)   │◀──────────────────────────│   GitHub   │
+                │  routes → controllers →  │  POST /api/webhooks/github└─────┬──────┘
+                │  services → db / queues  │                                 │
+                └──────┬────────────┬──────┘                                 │
+                       │            │ add job (BullMQ)                       │
+                  SQL  │            ▼                                        │
+                       │       ┌──────────┐                                  │
+                       │       │  Redis   │  :6379   "deployments" queue     │
+                       │       └────┬─────┘                                  │
+                       │            │ next job (BullMQ, concurrency 2)       │
+                       │            ▼                                        │
+                       │  ┌──────────────────────────┐  git clone <sha>      │
+                       │  │  worker  (Node.js)       │◀──────────────────────┘ (GitHub App token for private repos)
+                       │  └──────┬─────────────┬─────┘
+                       ▼         │ status+logs │ docker build, then by deployment target
+             ┌──────────────┐    │       LOCAL ├────────────────────────────────┐ AWS_ECS
+             │  PostgreSQL  │◀───┘             ▼                                ▼
+             │    :5432     │      ┌────────────────────────────┐  ┌──────────────────────────┐
+             └──────▲───────┘      │ Docker daemon              │  │ Amazon ECR               │
+                    │              │  network "deployx-apps"    │  │  <project>-<id>-<sha12>  │
+             ┌──────┴───────┐      │   └── app containers       │  │ Amazon ECS service       │
+             │   migrate    │      │       127.0.0.1:<port>     │  │  <repository>@<digest>   │
+             └──────────────┘      └────────────────────────────┘  └──────────────────────────┘
+                                   then an HTTP health check (container port or service URL) → SUCCESS or rollback
 ```
 
 The browser only talks to the client. The Vite dev server forwards `/api/*` requests to the API, so the frontend never contains a hard-coded backend URL. Running deployments are followed over **Server-Sent Events** (`/api/deployments/:id/logs/stream`); the API learns about new log lines and status changes from **Redis Pub/Sub** events that the worker publishes (see [Real-Time Deployment Logs](#real-time-deployment-logs-phase-5)).
 
 Once a container runs, the worker requests the project's health-check path on the container's published port. A healthy answer makes the deployment `SUCCESS` and retires the previous container; an unhealthy one triggers a rollback to the last stable deployment (see [Phase 6](#phase-6--health-checks--automatic-rollback)).
+
+Since Phase 7 a deployment can also come from a **GitHub push webhook**, and it can run on **Amazon ECS** instead of the local Docker host. Both are ways into, and a target of, the **same pipeline**: the webhook only creates the deployment and queues it, and the AWS target plugs into the same build, health check and rollback (see [Phase 7](#phase-7--github-integration--aws-deployment)).
 
 Each API request passes through these layers:
 
@@ -119,6 +132,8 @@ Each API request passes through these layers:
 | Cache / queue  | Redis 7, BullMQ 6, `ioredis` 5               |
 | Tests          | Node.js built-in test runner (`node:test`)   |
 | Worker         | Node.js, BullMQ 6, `ioredis`, `pg`, `git`, Docker CLI (BuildKit) |
+| Cloud          | AWS SDK for JavaScript v3 (`@aws-sdk/client-ecr`, `@aws-sdk/client-ecs`): Amazon ECR, Amazon ECS (Fargate or EC2) |
+| GitHub         | push webhooks (HMAC-SHA256), GitHub App installation tokens (`node:crypto` RS256 JWT, no extra library) |
 | Local infra    | Docker, Docker Compose                       |
 
 ## Database
@@ -167,6 +182,9 @@ Every foreign key cascades. **Deleting a project deletes all of its deployments 
 | `dockerfile_path` | `varchar(255)` | default `Dockerfile` |
 | `container_port` | `integer` | port the app listens on in its container, 1–65535; required by the API (nullable only for pre-Phase-4 rows) |
 | `health_check_path` | `varchar(255)` | path requested to check the app's health, default `/health`; an absolute path with an optional query string (CHECK) |
+| `deployment_target` | `varchar(20)` | where deployments run: `LOCAL` \| `AWS_ECS` (CHECK), default `LOCAL` |
+| `aws_ecs_service` | `varchar(255)` | the project's ECS service (`AWS_ECS`); letters, digits, `-`, `_`; one project per service (unique while `AWS_ECS`) |
+| `aws_service_url` | `varchar(255)` | origin the ECS service answers on, e.g. `https://my-app.example.com` (no credentials, path or query; CHECK). Required with `aws_ecs_service` for `AWS_ECS` (CHECK) |
 | `status` | `varchar(20)` | `ACTIVE` \| `INACTIVE` (CHECK), default `ACTIVE` |
 | `created_at`, `updated_at` | `timestamptz` | |
 
@@ -179,8 +197,12 @@ Every foreign key cascades. **Deleting a project deletes all of its deployments 
 | `commit_sha` | `varchar(40)` | nullable; 7–40 lower-case hex (CHECK) |
 | `branch` | `varchar(255)` | |
 | `status` | `varchar(20)` | `QUEUED` \| `BUILDING` \| `DEPLOYING` \| `HEALTH_CHECK` \| `ROLLING_BACK` \| `SUCCESS` \| `FAILED` \| `ROLLBACK_FAILED` (CHECK), default `QUEUED` |
-| `docker_image` | `varchar(255)` | image built for this deployment, e.g. `deployx/my-api-0f8fad5b:abc123def456` |
-| `docker_image_id` | `varchar(80)` | immutable ID (`sha256:…`) of that image; what a rollback starts again. Internal, not returned by the API |
+| `trigger` | `varchar(20)` | what created it: `MANUAL` (API/dashboard) \| `GITHUB_PUSH` (webhook), default `MANUAL`. A `GITHUB_PUSH` deployment always has a full 40-character `commit_sha` (CHECK) |
+| `deployment_target` | `varchar(20)` | the project's target when the deployment was created: `LOCAL` \| `AWS_ECS`; it deploys and rolls back there even if the project is changed meanwhile |
+| `docker_image` | `varchar(255)` | the image version: `deployx/my-api-0f8fad5b:abc123def456` locally, the ECR reference `<account>.dkr.ecr.<region>.amazonaws.com/<repository>:my-api-0f8fad5b-abc123def456` on AWS |
+| `docker_image_id` | `varchar(80)` | immutable ID (`sha256:…`) of the local image; what a local rollback starts again. Internal, not returned by the API |
+| `image_digest` | `varchar(71)` | manifest digest (`sha256:…`) of the image in ECR (`AWS_ECS`): what ECS runs and an AWS rollback restores |
+| `aws_task_definition_arn` | `varchar(1024)` | the ECS task definition revision the deployment runs as (`AWS_ECS`) |
 | `container_id`, `container_name` | `varchar` | the container started for this deployment |
 | `host_port` | `integer` | host port (on 127.0.0.1) the container port is published on |
 | `container_removed_at` | `timestamptz` | when the container was removed (e.g. replaced by a newer deployment) |
@@ -214,6 +236,9 @@ There is no "stable" column. The API's `is_stable` field is derived by `stable_d
 | `deployments_project_id_created_at_idx` (`project_id, created_at DESC`) | "deployments of a project, newest first" |
 | `deployment_logs_deployment_id_id_idx` (`deployment_id, id`) | "logs of a deployment in order" |
 | `deployments_stable_idx` (`project_id, finished_at DESC`, only `SUCCESS` rows) | "the last stable deployment of a project" |
+| `deployments_github_push_commit_key` (unique `project_id, commit_sha`, only `GITHUB_PUSH` rows) | webhook duplicate protection: one push deployment per project and commit |
+| `projects_github_repo_lower_idx` (`lower(github_repo)`) | the webhook's "projects of this repository" lookup (GitHub names are case-insensitive) |
+| `projects_aws_ecs_service_key` (unique `aws_ecs_service`, only `AWS_ECS` rows) | two projects can never deploy to the same ECS service |
 
 No separate index is needed on `projects.user_id`, because the unique `(user_id, name)` index already covers lookups that start with `user_id`.
 
@@ -239,6 +264,7 @@ docker compose run --rm migrate         # apply pending migrations
 | `1790767006154_rollback-and-stable-deployments` | `ROLLING_BACK` status and its transitions; `deployments.rollback_status`, `rollback_deployment_id`; `projects.health_check_path`; `stable_deployment_id()` and its index |
 | `1790767291227_health-check-required-and-image-id` | removes `DEPLOYING → SUCCESS` (success requires the health check); `deployments.docker_image_id` |
 | `1790775116221_rollback-failed-status-and-health-check-details` | `ROLLBACK_FAILED` status and `ROLLING_BACK → ROLLBACK_FAILED`; `transition_deployment_status()` treats it as final; `deployments.health_check` |
+| `1790787875864_github-push-and-aws-targets` | `projects.deployment_target`, `aws_ecs_service`, `aws_service_url`; `deployments.trigger`, `deployment_target`, `image_digest`, `aws_task_definition_arn`; the push-duplicate, repository and ECS-service indexes. Existing rows become `MANUAL` / `LOCAL`; reversible |
 
 `docker compose up` runs the `migrate` service automatically, and the API starts only after it has finished successfully.
 
@@ -507,7 +533,7 @@ If two deployments of the same project finish at nearly the same moment, the one
 
 | Failure | Status path | Retried? | `error_message` |
 | ------- | ----------- | -------- | --------------- |
-| Repository or branch missing / private | `BUILDING → FAILED` | no | `Repository … not found or not public` / `Branch "x" not found in …` |
+| Repository or branch missing / private | `BUILDING → FAILED` | no | `Repository … not found or not public (for a private repository, install the DeployX GitHub App on it)` / `Branch "x" not found in …` (Phase 7: private repositories work through a [GitHub App](#private-repositories-github-app)) |
 | Commit not on the branch | `BUILDING → FAILED` | no | `Commit … not found on branch main` |
 | Dockerfile missing | `BUILDING → FAILED` | no | `Dockerfile not found at <path>` |
 | Project has no `container_port` | `FAILED` | no | `Project has no container_port configured; …` |
@@ -989,6 +1015,384 @@ Other scenarios:
   docker rmi -f $(docker image inspect --format '{{.Id}}' <repository>:deployment-<stable deployment id>)
   ```
 
+## Phase 7 — GitHub Integration & AWS Deployment
+
+A push to GitHub now deploys by itself, and a deployment can run on **Amazon ECS** instead of the worker's Docker host. Neither is a second system. The webhook only **creates a deployment and queues it**, exactly as `POST /api/projects/:id/deployments` does. AWS is a **deployment target** that the same worker pipeline, health check, state machine, rollback and live log stream use.
+
+```text
+Developer pushes code
+        ↓
+GitHub ── push webhook, signed with the shared secret ──▶ DeployX API  POST /api/webhooks/github
+                                                              ↓ verify signature → parse → repository → branch → commit
+                                                          PostgreSQL   deployment QUEUED, trigger GITHUB_PUSH, exact commit SHA
+                                                              ↓
+Manual deployment (dashboard / API) ─────────────────▶   BullMQ / Redis   the same "deployments" queue, job ID = deployment ID
+                                                              ↓
+                                                          Worker
+                                                              ↓ git clone + checkout <sha>   (GitHub App token for private repositories)
+                                                          Docker build   deployx/<project>-<id>:<sha12>
+                                                              ↓
+                                        ┌───────────── LOCAL ─┴─ AWS_ECS ──────────────────┐
+                                        ↓                                                  ↓
+                                   docker run                          ECR login, push  <project>-<id>-<sha12>  → digest
+                                        ↓                                                  ↓
+                                        │                              ECS: new task definition revision running
+                                        │                                   <repository>@<digest> → UpdateService → rollout
+                                        └──────────────────────┬───────────────────────────┘
+                                                               ↓
+                                                         HEALTH_CHECK  (Phase 6: container port, or the ECS service URL)
+                                                      ┌────────┴────────┐
+                                                   healthy          unhealthy
+                                                      ↓                  ↓
+                                                   SUCCESS          ROLLING_BACK ── stable version restored
+                                                   (stable)              ↓          (on AWS: its image digest, no rebuild)
+                                                                    HEALTH_CHECK of the stable version
+                                                                   ┌─────┴──────┐
+                                                                   ↓            ↓
+                                                           FAILED (recovered)  ROLLBACK_FAILED
+```
+
+### Audit: what existed and what was added
+
+| Area | Already there (Phases 1–6) | Added in Phase 7 |
+| ---- | -------------------------- | ---------------- |
+| Repository | `projects.github_repo` (canonical `https://github.com/<owner>/<repo>`), `github_branch`; exact-commit checkout | nothing new in the schema: owner and name are read from `github_repo`, so they are not stored twice |
+| Authentication | none; public repositories only, git credential helpers disabled | GitHub App installation tokens for private repositories (worker only) |
+| Webhook | none | `POST /api/webhooks/github`: signature, push parsing, project and branch matching, idempotency |
+| Pipeline | one Docker pipeline, release and rollback wired to Docker | a deployment-target interface with the Phase 4–6 Docker code as `LOCAL` and a new `AWS_ECS` target; one pipeline, one release, one rollback |
+| Images | `deployx/<project>-<id>:<sha12>` + `:deployment-<id>`, local image ID | ECR tags `<project>-<id>-<sha12>` + `…-deployment-<id>`, registry **digest** |
+| Records | commit, image, container, health check, rollback | `trigger`, `deployment_target`, `image_digest`, `aws_task_definition_arn` |
+
+### Repository configuration
+
+A project's repository is its `github_repo` and its deployed branch is `github_branch`, both already present since Phase 2. They can be edited in the dashboard (**Settings** on an application) or with `PUT /api/projects/:id`:
+
+```bash
+curl -X PUT localhost:5000/api/projects/<projectId> -H "Content-Type: application/json" \
+  -d '{ "github_repo": "https://github.com/octo-org/storefront", "github_branch": "main" }'
+```
+
+The repository owner and name (`octo-org`, `storefront`) are derived from the URL wherever they are needed: webhook matching, GitHub App tokens, the dashboard.
+
+### Webhook configuration
+
+On GitHub: **Repository → Settings → Webhooks → Add webhook** (or the webhook of a GitHub App, see [Private repositories](#private-repositories-github-app)):
+
+| Field | Value |
+| ----- | ----- |
+| Payload URL | `https://<your DeployX host>/api/webhooks/github` |
+| Content type | **`application/json`** (form-encoded deliveries are refused with `415`) |
+| Secret | the same random value as the API's `GITHUB_WEBHOOK_SECRET` |
+| Events | **Just the push event** |
+
+```bash
+# A secret for GITHUB_WEBHOOK_SECRET (and for GitHub)
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+GitHub sends a `ping` first, and DeployX answers it with `200`. The webhook is **disabled** (`503`) while `GITHUB_WEBHOOK_SECRET` is empty, so an unconfigured server never processes unsigned pushes.
+
+**Local development.** GitHub cannot reach `localhost`. Forward the deliveries with a tunnel, for example `npx smee-client --url https://smee.io/<channel> --target http://localhost:5000/api/webhooks/github` or `cloudflared tunnel --url http://localhost:5000`, and use the tunnel's URL as the Payload URL. The dashboard's **Settings** panel shows the path and the expected settings; it never shows the secret.
+
+### Webhook security
+
+A delivery is handled in this order. Nothing in the payload is read before the signature has been verified:
+
+| Step | Refused with |
+| ---- | ------------ |
+| 1. `GITHUB_WEBHOOK_SECRET` configured | `503 GitHub webhooks are not configured on this server` |
+| 2. `X-Hub-Signature-256` present | `401 Missing X-Hub-Signature-256 header` |
+| 3. `sha256=` + HMAC-SHA256 of the **raw body** with the secret, compared with `crypto.timingSafeEqual` | `401 Invalid webhook signature` |
+| 4. `X-GitHub-Event` present | `400 Missing X-GitHub-Event header` |
+| 5. `Content-Type: application/json` | `415` |
+| 6. body is JSON | `400 Malformed JSON payload` |
+| 7. event is `push` (`ping` answers `200`) | `400 Unsupported GitHub event "issues": only push events are handled` |
+| 8. push payload valid: `ref`, 40-hex `after`, `repository.html_url`, a valid branch name | `400 Invalid push payload` with the reasons |
+| 9. repository is used by a project | `404 No DeployX project uses repository octo-org/unknown` |
+
+- The raw body is kept for the signature: the webhook route is mounted **before** the JSON parser, with its own 5 MB limit (`413` above it).
+- The secret, the signature and the request headers are never logged or returned. The API logs one line per push: `[webhook] push to octo-org/storefront@main 65ea1cf (delivery …): 1 queued, 0 duplicate, 0 ignored`.
+- The webhook is not behind the development user: it acts for the **repository** and is authenticated by its signature. It can only create deployments of projects already connected to that repository, on their configured branch.
+- Commit messages go into the logs as one line with control characters removed and at most 120 characters.
+
+### Branch deployments and exact commits
+
+For a push to `refs/heads/<branch>` of a repository, **every project using that repository** is looked at on its own:
+
+| Project | Result |
+| ------- | ------ |
+| `github_branch` is the pushed branch, `ACTIVE` | deployment created and queued (`202`) |
+| another `github_branch` | ignored: `Project deploys branch main, not development` |
+| `INACTIVE` | ignored: `Project is inactive` |
+
+Tag pushes (`refs/tags/…`) and branch deletions are ignored with `200`. A push that deploys nothing also answers `200`, with the reasons in `ignored`, so GitHub shows a successful delivery:
+
+```json
+{
+  "success": true,
+  "data": {
+    "event": "push",
+    "delivery": "72d3162e-cc78-11e3-81ab-4c9367dc0958",
+    "repository": "octo-org/storefront",
+    "branch": "main",
+    "commit_sha": "65ea1cf20982350219c481ae50b96be383266c2f",
+    "deployments": [{ "project_id": "842dbc87-…", "deployment_id": "09f8e403-…", "duplicate": false }],
+    "ignored": [],
+    "message": "1 deployment queued"
+  }
+}
+```
+
+**The deployment is pinned to the commit GitHub sent** (`after`, the full 40-character SHA), never to the moving branch head: a newer push to the same branch cannot change what an earlier deployment builds. The database requires it: a `GITHUB_PUSH` deployment without a full SHA is rejected by a CHECK constraint. The worker checks out exactly that commit, and a retry of the job builds the same commit again. A manual deployment without `commit_sha` still resolves the branch head once, when it is built, and records that SHA as before.
+
+### Duplicate deliveries
+
+A delivery can arrive more than once: redelivered from the webhook's **Recent Deliveries** page or through GitHub's API, or sent by both a repository webhook and a GitHub App. A partial unique index allows **one push deployment per project and commit**. The insert uses `ON CONFLICT DO NOTHING`, so even simultaneous deliveries of the same push create exactly one deployment, one job and one set of log lines. A duplicate answers `200` with the existing deployment:
+
+```json
+{ "deployments": [{ "project_id": "…", "deployment_id": "09f8e403-…", "duplicate": true }], "message": "Already deployed: this commit was received before" }
+```
+
+Manual deployments are not affected: redeploying any commit by hand is always possible. BullMQ's own duplicate protection (job ID = deployment ID, since Phase 3) still applies underneath.
+
+### Private repositories (GitHub App)
+
+Public repositories need nothing. For private ones the worker uses a **GitHub App**:
+
+| Option | Why (not) |
+| ------ | --------- |
+| **GitHub App** ✔ | installed per repository or organisation, the worker gets a token for **one repository, `contents: read`, expiring within an hour**; no user account or long-lived token involved; its webhook can deliver the pushes too |
+| OAuth App | acts as a signed-in user with that user's access; needs a user login flow, which comes with authentication in Phase 8 |
+| Personal access token | long-lived, tied to a person, usually broader than one repository |
+| Deploy key | SSH; the worker only allows `https` for git (Phase 4 hardening), and every repository needs its own key |
+
+Setup: create a GitHub App (**Settings → Developer settings → GitHub Apps**) with **Repository permissions → Contents: Read-only** (and, to use its webhook, the **Push** event with the URL and secret above), install it on the repositories, and give the worker `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` (the `.pem`, with `\n` for line breaks in `.env`).
+
+For each deployment the worker:
+
+1. signs a 9-minute JWT for the App with its private key (RS256, `node:crypto`)
+2. asks GitHub whether the App is installed on the repository (`GET /repos/{owner}/{repo}/installation`); if not, it clones anonymously as before
+3. creates an installation token limited to that repository and `contents: read`
+4. hands it to git as an `Authorization` header for `https://github.com/` only, through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` in git's environment
+
+The token is never in git's command line (visible to other processes), the remote URL, `.git/config`, the database, a log line or the API. It is not sent to any other host, even on a redirect. Credential helpers stay disabled. The API and the browser never see the App's key. Log line: `Using a GitHub App token for octo-org/storefront (read-only, expires 2026-10-01T11:00:00Z)`. Wrong App credentials (GitHub answers `401`) fail the deployment at once; GitHub outages and rate limits are retried like any network error.
+
+### Docker image versioning
+
+Every image is named after its commit, and every deployment records an identifier that cannot move:
+
+| | Local (`LOCAL`) | ECR (`AWS_ECS`) |
+| - | --------------- | --------------- |
+| commit tag | `deployx/my-api-0f8fad5b:abc123def456` | `<registry>/deployx-apps:my-api-0f8fad5b-abc123def456` |
+| deployment tag | `deployx/my-api-0f8fad5b:deployment-<id>` | `<registry>/deployx-apps:my-api-0f8fad5b-deployment-<id>` |
+| immutable identity | image ID `sha256:…` (`docker_image_id`) | manifest digest `sha256:…` (`image_digest`) |
+| what runs | the local image ID | `<registry>/deployx-apps@sha256:…` |
+
+`<project>-<first 8 of the project ID>` keeps projects apart even when their names sanitize the same. The commit tag tells which commit an image is, but it can move when the same commit is built again. The digest cannot move, so **ECS always runs, and a rollback always restores, the exact image that was built and checked**. The deployment tag keeps every deployment's image referenced, so an ECR lifecycle rule that removes untagged images does not remove an older stable version. `latest` is never used.
+
+### ECR setup
+
+One ECR repository holds the images of all AWS projects. DeployX reads its URI from ECR, so no account ID has to be configured:
+
+```bash
+aws ecr create-repository --repository-name deployx-apps --image-scanning-configuration scanOnPush=true
+```
+
+Keep **tag mutability `MUTABLE`**: rebuilding a commit moves its commit tag (what runs is pinned by digest anyway). For each deployment the worker calls `GetAuthorizationToken`, logs Docker in with `docker login --password-stdin` (the password is never an argument), tags the local image and pushes both tags. It then reads the digest from ECR (`DescribeImages`), not from the push output. Logs: `Logging in to Amazon ECR` → `ECR login succeeded` → `Pushing image to ECR as …` → `Image pushed to ECR: … (digest sha256:…)`.
+
+### AWS deployment architecture
+
+**Amazon ECS on Fargate** (or EC2 capacity) with ECR, not EKS or Kubernetes: DeployX already produces one container image per deployment, and an ECS service with a load balancer is the smallest managed platform that runs one, replaces it with a rolling update and reports its progress. **DeployX does not create infrastructure.** The operator sets up once:
+
+1. an ECS **cluster** (`AWS_ECS_CLUSTER`)
+2. per project, a **task definition** whose app container maps the project's `container_port`, and a **service** (networking, load balancer, IAM roles, CPU/memory, desired count), preferably with the deployment circuit breaker enabled
+3. the project in DeployX: target `AWS_ECS`, `aws_ecs_service`, and `aws_service_url` = the URL the service answers on (its load balancer or domain)
+
+```bash
+curl -X PUT localhost:5000/api/projects/<projectId> -H "Content-Type: application/json" -d '{
+  "deployment_target": "AWS_ECS",
+  "aws_ecs_service": "storefront",
+  "aws_service_url": "https://storefront.example.com"
+}'
+```
+
+A deployment then changes **only the image** ([`awsDeploymentService.js`](worker/src/services/awsDeploymentService.js)):
+
+```text
+DescribeServices         the service, and the task definition it runs now
+DescribeTaskDefinition   that task definition (with its tags)
+RegisterTaskDefinition   a new revision: identical, except the app container's image = <repository>@<digest>
+                         (the app container: the only one, or the one mapping container_port; sidecars untouched)
+UpdateService            the service rolls over to the new revision
+DescribeServices …       every AWS_ECS_POLL_INTERVAL_MS until the ECS deployment is COMPLETED,
+                         FAILED (e.g. the circuit breaker) or AWS_ECS_DEPLOY_TIMEOUT_MS passes
+```
+
+All AWS calls of the worker are in [`ecrService.js`](worker/src/services/ecrService.js) and [`awsDeploymentService.js`](worker/src/services/awsDeploymentService.js). The target [`awsEcsTarget.js`](worker/src/targets/awsEcsTarget.js) puts them in order. The worker pipeline itself contains no AWS code.
+
+**IAM permissions of the worker** (replace `<…>`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*" },
+    {
+      "Effect": "Allow",
+      "Action": ["ecr:DescribeRepositories", "ecr:DescribeImages", "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage",
+                 "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"],
+      "Resource": "arn:aws:ecr:<region>:<account>:repository/deployx-apps"
+    },
+    { "Effect": "Allow", "Action": ["ecs:DescribeServices", "ecs:UpdateService"], "Resource": "arn:aws:ecs:<region>:<account>:service/<cluster>/*" },
+    { "Effect": "Allow", "Action": ["ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition", "ecs:TagResource"], "Resource": "*" },
+    {
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": ["arn:aws:iam::<account>:role/<task execution role>", "arn:aws:iam::<account>:role/<task role>"],
+      "Condition": { "StringEquals": { "iam:PassedToService": "ecs-tasks.amazonaws.com" } }
+    }
+  ]
+}
+```
+
+**Credentials are never configured in DeployX or stored in PostgreSQL.** The AWS SDK uses its default chain: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` or `AWS_PROFILE` in the worker's environment, or preferably the IAM role of the machine or task the worker runs on. Child processes (git, docker build) do not inherit them (the Phase 4 environment allow-list), so a build cannot read them.
+
+### Deployment targets
+
+```text
+Pipeline (pipeline/dockerDeployment.js)          one for every deployment
+  build.js                  clone → checkout → Dockerfile → docker build           (same for both)
+  target.publish            LOCAL: nothing          AWS_ECS: ECR login + push → digest
+  target.deploy             LOCAL: docker run       AWS_ECS: task definition revision → UpdateService → rollout
+  release.js                HEALTH_CHECK → SUCCESS | rollbackService.js            (same for both)
+    target.healthCheck      LOCAL: 127.0.0.1:<host_port>    AWS_ECS: aws_service_url
+    target.restoreStable    LOCAL: stable container / image ID    AWS_ECS: stable digest → rollout
+```
+
+| | `LOCAL` | `AWS_ECS` |
+| - | ------- | --------- |
+| runs as | a container on the worker's Docker host | the project's ECS service |
+| health check | `http://127.0.0.1:<host_port><health_check_path>` | `<aws_service_url><health_check_path>` (http or https) |
+| identity recorded | `container_id`, `container_name`, `host_port`, `docker_image_id` | `image_digest`, `aws_task_definition_arn`, `docker_image` = ECR reference |
+| deployments of one project | side by side; promotion and rollback serialized | one at a time (the service is one live slot): the per-project lock covers rollout, health check and promotion/rollback |
+| previous version during the health check | keeps running in its container | replaced by the rolling update; the rollback deploys it again |
+
+A deployment records its target when it is created and is deployed, and rolled back, there even if the project is switched meanwhile. A rollback only uses a stable deployment **of the same target**. After switching a project from `LOCAL` to `AWS_ECS`, the first unhealthy AWS deployment has nothing to roll back to on AWS and says so: `No previous stable deployment on AWS_ECS available for rollback (the last stable deployment ran on LOCAL).` The first successful AWS deployment retires the project's local container. Local Docker deployments are unchanged and remain the default.
+
+### Health checks on AWS (Phase 6, unchanged rules)
+
+`DEPLOYING` ends when the ECS rollout completed. The deployment then goes through the Phase 6 health check (same attempts, interval, timeout, grace period and `health_check` details), requesting `GET <aws_service_url><health_check_path>`. Only a healthy answer leads to `SUCCESS`.
+
+The host now comes from the project, so the worker makes sure the check cannot be used to reach internal systems:
+
+- `aws_service_url` must be an http(s) **origin**: no credentials, path, query or fragment. The API, a database CHECK and the worker each enforce this.
+- The host is resolved once. **Every** address it resolves to must be allowed, and the request is pinned to the checked address, so a DNS answer that changes in between (rebinding) cannot redirect it. HTTPS still verifies the certificate for the host name.
+- **Never allowed:** link-local addresses, including the instance metadata service (`169.254.169.254`, `fd00:ec2::254`), and unspecified, multicast and reserved ones. **Private and loopback addresses** (`10/8`, `172.16/12`, `192.168/16`, `127/8`, `100.64/10`, `fc00::/7`, `::1`) are refused unless `HEALTH_CHECK_ALLOW_PRIVATE_URLS=true`, which is meant for internal load balancers when the worker runs in the same VPC.
+- Redirects are not followed, as before.
+
+### Rollback on AWS
+
+The Phase 6 [`rollbackService.js`](worker/src/services/rollbackService.js) is still the only rollback, with the same statuses, outcomes and log lines. Only the infrastructure step differs:
+
+```text
+b91d2e7 unhealthy → ROLLING_BACK → stable deployment a81f4c2 (same project, same target)
+   → is its digest still in ECR?  ── no ──▶ ROLLBACK_FAILED  "image … is no longer available in ECR"
+   → new task definition revision with <repository>@<a81f4c2's digest> → UpdateService → rollout
+   → HEALTH_CHECK of the stable version ── unhealthy ──▶ ROLLBACK_FAILED
+   → healthy → b91d2e7 FAILED, rollback COMPLETED; a81f4c2 stays the stable deployment
+```
+
+**Nothing is rebuilt**: the stable version returns from the exact image it was built and checked as. The stable deployment's record keeps its history; only `aws_task_definition_arn` is updated to the revision it now runs in (the AWS counterpart of recording its new container locally). Without a stable deployment on AWS (`NOT_AVAILABLE`), the service is pointed back at the task definition it ran before this deployment. ECS finishes that rollback on its own.
+
+### Deployment records
+
+`GET /api/deployments/:id` now also returns:
+
+```json
+{
+  "trigger": "GITHUB_PUSH",
+  "deployment_target": "AWS_ECS",
+  "commit_sha": "65ea1cf20982350219c481ae50b96be383266c2f",
+  "docker_image": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/deployx-apps:storefront-842dbc87-65ea1cf20982",
+  "image_digest": "sha256:18e0f01a505b4e4242ddb50dc4bfcd541a670ef5238de05f811c13855383a84a",
+  "aws_task_definition_arn": "arn:aws:ecs:eu-west-1:123456789012:task-definition/storefront:8",
+  "container_id": null
+}
+```
+
+The job payload in Redis is unchanged: identifiers only, no repository credentials, tokens or AWS settings.
+
+### Logs
+
+Every step is a log line in PostgreSQL, published over Redis Pub/Sub and streamed to the dashboard over SSE, through the same Phase 5 pipeline. A push deployment to AWS (the format as asserted by the end-to-end test; IDs shortened):
+
+```text
+INFO  GitHub webhook received: push to main (delivery 72d3162e-…)
+INFO  Repository identified: octo-org/storefront, deploying branch main
+INFO  Commit identified: 65ea1cf20982350219c481ae50b96be383266c2f (Add checkout page)
+INFO  Deployment created
+INFO  Deployment job started (attempt 1 of 3)
+INFO  Deployment is now building                                                        status BUILDING
+INFO  Using a GitHub App token for octo-org/storefront (read-only, expires …)          private repositories only
+INFO  Cloning repository https://github.com/octo-org/storefront (branch main)
+INFO  Checking out commit 65ea1cf20982350219c481ae50b96be383266c2f
+INFO  Docker image created: deployx/storefront-842dbc87:65ea1cf20982
+INFO  Logging in to Amazon ECR (repository deployx-apps)
+INFO  ECR login succeeded
+INFO  Pushing image to ECR as storefront-842dbc87-65ea1cf20982
+INFO  Image pushed to ECR: 123456789012.dkr.ecr.eu-west-1.amazonaws.com/deployx-apps:storefront-842dbc87-65ea1cf20982 (digest sha256:18e0…)
+INFO  Deployment is now deploying                                                       status DEPLOYING
+INFO  AWS deployment started: ECS service storefront in cluster deployx
+INFO  Registered task definition storefront:8 (container app)
+INFO  ECS deployment ecs-svc/4271503921374856018 started; waiting for the new tasks
+INFO  AWS deployment progressing: 0/2 tasks running, 2 pending
+INFO  AWS deployment progressing: 2/2 tasks running, 0 pending
+INFO  ECS rollout completed: 2/2 tasks running
+INFO  AWS deployment completed: ECS service storefront runs storefront:8
+INFO  Running health checks: GET https://storefront.example.com/health (up to 5 attempts, 2s timeout, 2s apart)   status HEALTH_CHECK
+INFO  Health check attempt 1/5 passed: HTTP 200 in 84ms
+INFO  Deployment completed successfully                                                 status SUCCESS
+```
+
+A rollback on AWS adds `The unhealthy version is replaced on ECS service storefront`, `Starting stable version from image … (digest 18e0f01a505b)`, the rollout lines, `Running health check on the stable version`, `Stable version is healthy` and `Rollback completed successfully: deployment … is live`. No secret appears in any of them: not the webhook secret, the signature, the GitHub token, the ECR password or AWS credentials.
+
+### Failure handling
+
+| Situation | Result |
+| --------- | ------ |
+| Webhook without or with a wrong signature, malformed, unsupported, unknown repository | refused (`401`/`400`/`415`/`404`), nothing is created |
+| Push to another branch, a tag, a deleted branch, an inactive project | ignored (`200`), nothing is created |
+| Redelivered push | `200`, the existing deployment; nothing new |
+| Redis unavailable when the webhook queues | `503`; that deployment is recorded `FAILED` (Phase 3 rule), and a manual deployment redeploys the commit |
+| GitHub API unavailable / rate-limited (token) | the attempt fails and is retried (BullMQ backoff) |
+| GitHub App credentials wrong | `FAILED` at once, `…check GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY` |
+| Private repository without the App | `FAILED`, `Repository … not found or not public (for a private repository, install the DeployX GitHub App on it)` |
+| `docker build` fails | unchanged (Phase 4): retried, then `FAILED` |
+| ECR push fails (network, throttling) | retried; the ECR repository missing, access denied or no credentials: `FAILED` at once, e.g. `ECR GetAuthorizationToken failed: AccessDeniedException: …` |
+| ECS rollout fails (tasks do not start, circuit breaker) or times out | the service is pointed back at its previous task definition, the attempt is retried, then `FAILED` with `ECS rollout failed: …` / `ECS deployment did not complete within 600s (…)`. The version never ran, so there is no health check and no rollback |
+| ECS service or cluster missing, container port not in the task definition, permissions missing | `FAILED` at once with the reason |
+| AWS settings missing on the worker | `FAILED` at once: `AWS deployments are not configured on this worker: set AWS_REGION, …` |
+| Unhealthy after deployment | Phase 6 rollback: `FAILED` (restored) / `ROLLBACK_FAILED` (stable image gone from ECR, rollout failed, or stable version unhealthy too) / `NOT_AVAILABLE` |
+| Worker crash, PostgreSQL outage | unchanged (Phase 6): an interrupted attempt starts again from `QUEUED`; an interrupted rollback ends `ROLLBACK_FAILED`; nothing becomes `SUCCESS` without a recorded health check |
+
+### Concurrency and isolation
+
+Projects are independent. Each has its own ECS service (a unique index prevents sharing one), its own image tags (`<project>-<id>-…`), its own deployments, BullMQ jobs (job ID = deployment ID) and Redis channels (`<prefix>:deployment:<id>:events`). A rollback only ever looks at the project's own stable deployment, on the same target. Deployments of **one** AWS project are serialized by the per-project PostgreSQL lock, so two pushes never update the same service at once. Local deployments keep the Phase 6 behaviour. The end-to-end tests deploy three AWS projects at once and check all of this.
+
+### Security summary
+
+- Webhooks: HMAC-SHA256 over the raw body, constant-time comparison, refused while no secret is configured, payload validated after verification, 5 MB limit.
+- No secret in source code, `.env.example`, the database, Redis job payloads, logs, API responses or the browser. `GITHUB_WEBHOOK_SECRET` is in the API only; the GitHub App key and AWS credentials are in the worker only.
+- No shell anywhere: git and docker run with argument arrays. Repository URLs, branch names, commit SHAs, service names and URLs are validated by the API, the database and again by the worker. The ECR password goes through stdin, and the GitHub token through git's environment, scoped to `https://github.com/`.
+- Health checks on AWS cannot reach metadata or (by default) private addresses, and cannot be redirected.
+- AWS changes are limited to one repository and the project's own service; DeployX never creates or deletes AWS resources.
+
+### Not in Phase 7
+
+Deliberately left for Phase 8 or later: user authentication and OAuth sign-in (still the development user), per-user GitHub/AWS accounts, reading task logs from CloudWatch, creating AWS infrastructure, other GitHub events (pull requests, releases), multi-region, autoscaling, monitoring and Kubernetes.
+
+**Known limitations.** On `ROLLBACK_FAILED` the ECS service may still run the unhealthy version (when the stable image was missing) or the unhealthy stable revision. The status exists to say that someone has to look. Several projects on one repository and branch are handled in one webhook request; if the queue fails midway, the ones already created stay queued and the response is `503`.
+
 ## Dashboard (Phase 5)
 
 `http://localhost:3000` has three parts under the system status card:
@@ -1012,6 +1416,14 @@ Other scenarios:
 
 None of this is computed in the browser: the steps, the boxes and the tag are read from `status`, `health_check`, `rollback_status`, `rollback_deployment_id` and `is_stable` as the API sends them.
 
+**Phase 7 additions:**
+
+- **Settings** on every application: repository URL, branch, and deployment target (Local Docker, or AWS ECS with its ECS service and service URL), saved with `PUT /api/projects/:id`. The API's validation messages are shown as they are. The panel also lists the GitHub webhook settings (payload URL, `application/json`, push events) and names the secret only by its variable; no secret is ever sent to the browser.
+- The application list shows `owner/repo · branch` and an **AWS** tag; the history header links the repository and shows the target and ECS service.
+- The history has **Trigger** (Manual / GitHub push) and **Target** (Local Docker / AWS ECS) columns.
+- The details show the trigger, repository, branch, the commit as a link to it on GitHub, the target, the **image version** (the ECR reference on AWS), the **image digest**, and the **ECS task definition** (or the container, locally), plus the service URL of the stable AWS deployment. A running AWS deployment says **Building the image and pushing it to Amazon ECR…** / **Rolling out the new version on Amazon ECS…**.
+- Webhook, ECR, ECS, health-check and rollback lines appear in the live log viewer like every other line.
+
 The selection is in the URL (`#/projects/<id>/deployments/<id>`), so reloads and links keep it. All state comes from the API. The UI keeps no second copy of deployment status.
 
 ## Project Structure
@@ -1022,9 +1434,9 @@ DeployX/
 │   ├── public/
 │   ├── src/
 │   │   ├── api/                    # http.js (envelope), systemApi.js, deploymentsApi.js
-│   │   ├── components/             # SystemStatus, ProjectList, DeploymentHistory, DeploymentDetails,
-│   │   │                           # HealthCheckSummary, RollbackSummary, LogViewer, StatusSteps,
-│   │   │                           # StatusBadge, StatusRow
+│   │   ├── components/             # SystemStatus, ProjectList, ProjectSettings, DeploymentHistory,
+│   │   │                           # DeploymentDetails, HealthCheckSummary, RollbackSummary, LogViewer,
+│   │   │                           # StatusSteps, StatusBadge, StatusRow
 │   │   ├── hooks/                  # useDeploymentStream (SSE), usePolling, useHashRoute, useSystemStatus
 │   │   ├── utils/format.js         # dates, durations, short ids
 │   │   ├── App.jsx
@@ -1036,16 +1448,17 @@ DeployX/
 ├── server/                         # Express API
 │   ├── src/
 │   │   ├── config/index.js         # environment configuration
-│   │   ├── controllers/            # health, system, project, deployment, log
-│   │   ├── routes/                 # one router per resource + index.js
-│   │   ├── services/               # business logic + SQL (project, deployment, log, user, systemStatus)
+│   │   ├── controllers/            # health, system, project, deployment, log, logStream, webhook
+│   │   ├── routes/                 # one router per resource + index.js; webhook.routes.js (raw body)
+│   │   ├── services/               # business logic + SQL (project, deployment, log, user, systemStatus);
+│   │   │                           # githubWebhook.service.js: signature, push parsing, queueDeployment()
 │   │   ├── validators/             # zod schemas for request bodies
 │   │   ├── middleware/
 │   │   │   ├── validation.js       # validate({ params, body })
 │   │   │   ├── devUser.js          # TEMPORARY current-user stand-in
 │   │   │   ├── notFound.js
 │   │   │   └── errorHandler.js     # single error format, DB error mapping
-│   │   ├── utils/                  # ApiError, sendSuccess
+│   │   ├── utils/                  # ApiError, sendSuccess, github.js (repository URL parsing)
 │   │   ├── db/
 │   │   │   ├── postgres.js         # pool + query()
 │   │   │   ├── redis.js            # the API's single ioredis connection
@@ -1065,18 +1478,27 @@ DeployX/
 │   │   ├── processors/
 │   │   │   └── deploymentProcessor.js  # job runner: idempotency, attempts, failure bookkeeping, resuming interrupted attempts
 │   │   ├── pipeline/
-│   │   │   ├── dockerDeployment.js     # clone → checkout → build → run → verify running
-│   │   │   └── release.js              # health check → SUCCESS and retire the previous container, or rollback
+│   │   │   ├── dockerDeployment.js     # the one pipeline: build → target.publish → target.deploy → release
+│   │   │   ├── build.js                # workspace → GitHub App token → clone → checkout → Dockerfile → docker build
+│   │   │   └── release.js              # health check → SUCCESS and retire the previous version, or rollback
+│   │   ├── targets/
+│   │   │   ├── index.js                # LOCAL and AWS_ECS, by deployments.deployment_target
+│   │   │   ├── localDockerTarget.js    # docker run, container health target, restore container/image
+│   │   │   └── awsEcsTarget.js         # ECR push, ECS rollout, service-URL health target, restore by digest
 │   │   ├── services/
-│   │   │   ├── deploymentService.js    # status + logs + container tracking + stable lookup in PostgreSQL
-│   │   │   ├── healthCheckService.js   # one HTTP health check; retries, interval, grace period
-│   │   │   ├── rollbackService.js      # restore and verify the last stable deployment
-│   │   │   ├── gitService.js           # safe clone + exact commit checkout
-│   │   │   ├── dockerService.js        # image/container naming, build, restricted run
+│   │   │   ├── deploymentService.js    # status + logs + container/image/task tracking + stable lookup in PostgreSQL
+│   │   │   ├── healthCheckService.js   # HTTP health checks (container port or service URL, SSRF guard); retries
+│   │   │   ├── rollbackService.js      # restore and verify the last stable deployment, through the target
+│   │   │   ├── gitService.js           # safe clone + exact commit checkout (token via git's environment)
+│   │   │   ├── githubAppService.js     # GitHub App JWT → repository-scoped read-only installation token
+│   │   │   ├── dockerService.js        # image/container naming, build, restricted run, tag/push/login
+│   │   │   ├── ecrService.js           # Amazon ECR: login, push by tag, digest lookup
+│   │   │   ├── awsDeploymentService.js # Amazon ECS: task definition revision, UpdateService, rollout wait
 │   │   │   └── workspace.js            # per-deployment workspace, path + Dockerfile checks
 │   │   ├── lib/
-│   │   │   ├── exec.js                 # spawn without a shell, env allowlist, timeouts
+│   │   │   ├── exec.js                 # spawn without a shell, env allowlist, timeouts, stdin for secrets
 │   │   │   ├── buildLog.js             # build output filtering and limits
+│   │   │   ├── awsErrors.js            # AWS SDK errors → retryable or final, readable messages
 │   │   │   └── errors.js               # RecordedFailureError: failed for good, already recorded
 │   │   ├── config/
 │   │   │   ├── index.js            # environment configuration
@@ -1124,6 +1546,16 @@ cp .env.example .env
 | `HEALTH_CHECK_INTERVAL_MS` | `2000`                                      | worker: pause between two attempts |
 | `HEALTH_CHECK_RETRIES` | `5`                                             | worker: attempts before a deployment is unhealthy |
 | `HEALTH_CHECK_STARTUP_GRACE_MS` | `5000`                                 | worker: wait before the first attempt (`0` disables it) |
+| `HEALTH_CHECK_ALLOW_PRIVATE_URLS` | `false`                              | worker: allow AWS service URLs that resolve to private/loopback addresses (internal load balancers); link-local/metadata stay refused |
+| `GITHUB_WEBHOOK_SECRET` | *(empty: webhooks refused)*                    | **server only**: verifies `X-Hub-Signature-256` of GitHub deliveries |
+| `GITHUB_APP_ID` | *(empty)*                                              | worker: GitHub App for private repositories |
+| `GITHUB_APP_PRIVATE_KEY` | *(empty)*                                     | worker: the App's PEM key (`\n` for line breaks); never leaves the worker |
+| `AWS_REGION` | *(empty: AWS off)*                                        | worker: region of ECR and ECS |
+| `AWS_ECR_REPOSITORY` | *(empty)*                                         | worker: ECR repository for all AWS images |
+| `AWS_ECS_CLUSTER` | *(empty)*                                            | worker: ECS cluster of the projects' services |
+| `AWS_ECS_DEPLOY_TIMEOUT_MS` | `600000`                                   | worker: how long an ECS rollout may take |
+| `AWS_ECS_POLL_INTERVAL_MS` | `10000`                                     | worker: how often rollout progress is checked |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE` | *(not set)* | worker: standard AWS SDK credentials, read by the SDK only. Prefer an IAM role. Never stored by DeployX |
 | `APP_MEMORY_LIMIT` / `APP_CPU_LIMIT` | `512m` / `1`                       | worker: limits per app container |
 | `WORKSPACE_ROOT`    | `<os temp>/deployx-workspaces`                      | worker: where repositories are cloned |
 | `DOCKER_SOCKET_GID` | `0`                                                 | Compose: group owning the Docker socket |
@@ -1171,9 +1603,9 @@ docker compose up --build
 | `postgres` | `postgres:17-alpine` | 127.0.0.1:5432 | `postgres-data` volume, healthcheck |
 | `redis`    | `redis:7-alpine`     | 127.0.0.1:6379 | `redis-data` volume, healthcheck, **password required** |
 | `migrate`  | `./server`           | -              | applies migrations, then exits with code 0 |
-| `server`   | `./server`           | 127.0.0.1:5000 | starts after `migrate` succeeds and the DBs are healthy |
+| `server`   | `./server`           | 127.0.0.1:5000 | starts after `migrate` succeeds and the DBs are healthy; the only service with `GITHUB_WEBHOOK_SECRET` |
 | `client`   | `./client`           | 127.0.0.1:3000 | Vite dev server, proxies `/api` to `server` |
-| `worker`   | `./worker`           | -              | runs deployments; **the only service with the Docker socket**; health-checks apps through `host.docker.internal`; 30 s stop grace period |
+| `worker`   | `./worker`           | -              | runs deployments; **the only service with the Docker socket**, the GitHub App key and AWS credentials (passed through from your environment, empty by default); health-checks apps through `host.docker.internal`; 30 s stop grace period |
 
 Deployed apps are **not** Compose services. The worker starts them on the `deployx-apps` network, so `docker compose down` leaves them running. Remove them with `docker rm -f $(docker ps -aq --filter label=deployx.managed=true)`.
 
@@ -1217,11 +1649,15 @@ Validation failures add `details`, with one readable message per problem:
 | ---- | ---- |
 | 200 | success |
 | 201 | resource created |
+| 202 | GitHub webhook: deployments were queued |
 | 400 | validation failed, malformed ID, or malformed JSON |
+| 401 | GitHub webhook: signature missing or invalid |
 | 404 | resource or route not found |
+| 413 | request body too large (webhooks: over 5 MB) |
+| 415 | GitHub webhook: not `application/json` |
 | 409 | conflict: duplicate project name, deploying an inactive project, or an invalid deployment state transition (response includes `from` and `to`) |
 | 500 | unexpected error; the response says `Internal server error`, and details go only to the server log |
-| 503 | `/api/system/status`: PostgreSQL or Redis unreachable; creating a deployment: job queue unavailable |
+| 503 | `/api/system/status`: PostgreSQL or Redis unreachable; creating a deployment: job queue unavailable; GitHub webhook: `GITHUB_WEBHOOK_SECRET` not configured |
 
 Rules that apply to every endpoint:
 
@@ -1247,6 +1683,7 @@ Rules that apply to every endpoint:
 | POST | `/api/deployments/:deploymentId/logs` | add a log line |
 | GET | `/api/deployments/:deploymentId/logs` | list log lines (chronological) |
 | GET | `/api/deployments/:deploymentId/logs/stream` | live logs and status as Server-Sent Events ([details](#real-time-deployment-logs-phase-5)) |
+| POST | `/api/webhooks/github` | GitHub push webhook, signature required ([details](#webhook-security)) |
 
 ### Health and status
 
@@ -1278,6 +1715,9 @@ Rules that apply to every endpoint:
 | `dockerfile_path` | no | relative path inside the repo (no leading `/`, no `..`), default `Dockerfile` |
 | `container_port` | **yes** | integer 1–65535: the port the app listens on inside its container |
 | `health_check_path` | no | absolute path the worker requests to check the app's health, default `/health`. Letters, digits, `. _ ~ -` and `/`, plus an optional query string; no host, no `//`, at most 255 characters |
+| `deployment_target` | no | `LOCAL` (default) or `AWS_ECS` |
+| `aws_ecs_service` | with `AWS_ECS` | the project's ECS service: letters, digits, `-`, `_`; not used by another AWS project (`409`) |
+| `aws_service_url` | with `AWS_ECS` | http(s) origin the service answers on, e.g. `https://my-app.example.com`; no credentials, path or query. Stored normalized (lower-case host, no trailing `/`) |
 | `status` | no | `ACTIVE` (default) or `INACTIVE` |
 
 ```bash
@@ -1306,6 +1746,9 @@ curl -X POST http://localhost:5000/api/projects \
     "dockerfile_path": "Dockerfile",
     "container_port": 3000,
     "health_check_path": "/health",
+    "deployment_target": "LOCAL",
+    "aws_ecs_service": null,
+    "aws_service_url": null,
     "status": "ACTIVE",
     "created_at": "2026-09-25T10:06:11.680Z",
     "updated_at": "2026-09-25T10:06:11.680Z"
@@ -1360,11 +1803,15 @@ curl -X POST http://localhost:5000/api/projects/<projectId>/deployments \
       "commit_sha": "abc1234",
       "branch": "main",
       "status": "QUEUED",
+      "trigger": "MANUAL",
+      "deployment_target": "LOCAL",
       "docker_image": null,
+      "image_digest": null,
       "container_id": null,
       "container_name": null,
       "host_port": null,
       "container_removed_at": null,
+      "aws_task_definition_arn": null,
       "error_message": null,
       "health_check": null,
       "rollback_status": null,
@@ -1385,7 +1832,7 @@ curl -X POST http://localhost:5000/api/projects/<projectId>/deployments \
 
 **List**: `GET /api/projects/:projectId/deployments` → `200`, the project's deployments newest first (`404` if the project doesn't exist). At most one of them has `is_stable: true`: the project's last stable deployment.
 
-**Get**: `GET /api/deployments/:deploymentId` → `200` with the same fields as the `deployment` in the create response. Once the worker has run, it shows the real outcome: resolved `commit_sha`, `docker_image`, `container_id`, `container_name`, `host_port`, `error_message` and timestamps (example in [Deployment lifecycle](#deployment-lifecycle)). `health_check` holds the recorded health-check details (see [Health checks and retries](#health-checks-and-retries)). For a deployment that failed its health check, `rollback_status` and `rollback_deployment_id` report what the automatic rollback did (see [Rollback](#rollback)); `is_stable` tells whether this is the project's last stable deployment.
+**Get**: `GET /api/deployments/:deploymentId` → `200` with the same fields as the `deployment` in the create response. Once the worker has run, it shows the real outcome: resolved `commit_sha`, `docker_image`, `container_id`, `container_name`, `host_port`, `error_message` and timestamps (example in [Deployment lifecycle](#deployment-lifecycle)). `health_check` holds the recorded health-check details (see [Health checks and retries](#health-checks-and-retries)). `trigger` says whether it was created by hand or by a GitHub push; `deployment_target`, `image_digest` and `aws_task_definition_arn` identify where and as what it runs (see [Deployment records](#deployment-records)). For a deployment that failed its health check, `rollback_status` and `rollback_deployment_id` report what the automatic rollback did (see [Rollback](#rollback)); `is_stable` tells whether this is the project's last stable deployment.
 
 **Update status**: `PATCH /api/deployments/:deploymentId/status` → `200` with the updated deployment
 
@@ -1444,6 +1891,7 @@ The tests start the real Express app on a random port and send HTTP requests to 
 - a **separate queue prefix** (`deployx-test`), emptied before each test file.
 - short timings: the retry backoff is 200 ms, then 400 ms. The queue tests use a fast fake pipeline ([`fakePipeline.js`](server/test/fakePipeline.js)) instead of Docker.
 - the health-check and rollback tests run the worker's real release stage against a fake Docker ([`fakeDocker.js`](server/test/fakeDocker.js)) whose "containers" are real HTTP servers in the test process, so real health checks hit them.
+- the AWS tests replace only the AWS endpoints ([`fakeAws.js`](server/test/fakeAws.js)): the real ECR/ECS services send real AWS SDK command objects to a fake ECR and ECS, whose services are HTTP servers answering as the image they currently run. **No AWS account or credentials are needed.**
 
 ```bash
 npm run install:all       # the queue tests load the worker's dependencies too
@@ -1451,7 +1899,7 @@ npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The default suite (200 tests, about 45 s, no Docker or network needed) covers:
+The default suite (274 tests, about 60 s, no Docker, AWS or network needed) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
@@ -1484,6 +1932,17 @@ The default suite (200 tests, about 45 s, no Docker or network needed) covers:
   - a rollback interrupted by a worker restart
   - **degraded infrastructure:** a browser disconnecting in the middle of a rollback (subscription released, nothing missed after reconnecting); Redis events failing (same database state, the stream falls back to PostgreSQL); PostgreSQL unreachable during the health check (never `SUCCESS` by accident, the attempt is run again, no leaked container)
   - **concurrency:** three projects at once, each rolled back only to its own stable deployment (or to none); in one project a healthy and an unhealthy deployment at the same time, in both orders; two healthy ones leave exactly one container
+- **GitHub webhook** ([`github-webhook.test.js`](server/test/github-webhook.test.js)): valid push; missing, wrong-secret, altered-body, malformed and wrong-format signatures (nothing created); no secret configured (`503`); the payload is only parsed after verification; malformed JSON and invalid payloads with reasons; form-encoded (`415`); `ping`, unsupported and missing events; oversized bodies (`413`); correct branch → a `GITHUB_PUSH` deployment of the exact commit, the same BullMQ job as a manual one, the webhook log lines; other branch, tag, branch deletion, inactive project ignored; unknown repository `404`; case-insensitive repositories with several projects; branches with `/`; commit summaries cleaned; redelivery and **8 simultaneous deliveries → one deployment**; one deployment per project and commit; manual deployments unaffected; no secret or signature in responses or logs
+- **project settings** ([`projects.test.js`](server/test/projects.test.js), [`database.test.js`](server/test/database.test.js)): `LOCAL` by default; `AWS_ECS` needs its service and URL (create and update); invalid targets, service names and non-origin URLs refused; one ECS service per project (`409`); repository, branch and target changed together; a deployment keeps its target; CHECK constraints and indexes; the migration reverts and re-applies without losing rows
+- **GitHub App** ([`github-app.test.js`](server/test/github-app.test.js)): RS256 JWT verified with the public key; a token for exactly one repository with `contents: read`; not configured / not installed → anonymous; GitHub outages retryable, bad credentials final, invalid key; the **real git** receives the header for `github.com` only, never in its arguments; secrets through stdin
+- **AWS services** ([`aws-services.test.js`](server/test/aws-services.test.js), SDK calls mocked): ECR login with the password on stdin, push under both tags, digest from ECR, missing image, missing repository (final), throttling and push errors (retryable); ECS: a new revision with only the app image changed (sidecar, settings and tags kept), the rollout followed to completion, circuit-breaker failure (also with ECS's own rollback), timeout, replaced deployment, services without a rollout state, missing service/cluster/port (final), throttling vs. access denied; the `AWS_ECS` target's checks; service-URL health checks: address classes, origin-only URLs, the request pinned to the checked address, private/metadata/rebinding refusals without a request
+- **GitHub push → AWS, end to end** ([`aws-deploy.test.js`](server/test/aws-deploy.test.js), webhook → API → BullMQ → worker → ECR → ECS → health check → PostgreSQL → Redis → SSE):
+  - push commit A → `BUILDING → DEPLOYING → HEALTH_CHECK → SUCCESS`, ECR reference and digest, task definition revision, the service running A by digest, stable, the exact log sequence, the same lines over SSE, no secrets
+  - push unhealthy commit B → `ROLLING_BACK → FAILED`, rollback `COMPLETED`: A's **digest** redeployed as a new revision, **A not rebuilt**, A's record untouched except its task definition, history intact, a redelivered push ignored
+  - a manual deployment to AWS through the same pipeline
+  - first deployment unhealthy (`NOT_AVAILABLE`, service back to its previous task definition); tasks that never start (reverted, retried, `FAILED`, no health check); rollout timeout; ECR push retried; ECR access denied (final); stable image deleted from ECR and stable version unhealthy (`ROLLBACK_FAILED`, no false recovery); AWS settings missing
+  - **isolation:** three projects pushed at once, each on its own service with its own images, jobs and event channels; two pushes to one project deployed one after the other; switching a project from `LOCAL` to `AWS_ECS` (no cross-target rollback, local container retired)
+- **live stream race** ([`log-stream.test.js`](server/test/log-stream.test.js)): the last log line, committed together with the final status between the stream's two reads, is still sent before `end` (found by the AWS end-to-end test and fixed in the SSE controller)
 
 ### Docker end-to-end tests
 
@@ -1507,7 +1966,9 @@ npm run test:docker       # 11 tests, about 2.5 min
 | 10. Restore from the image | stable container removed by hand → the rollback starts it again from its image **ID** (the commit tag meanwhile points at the unhealthy build) and health-checks it |
 | 11. Rollback failure | stable container and image removed → `ROLLBACK_FAILED` with the reason; history intact |
 
-They use their own image prefix (`deployx-test/`) and network (`deployx-apps-test`), and they remove everything they created. They clone the `main` branch; set `DEPLOYX_TEST_BRANCH` to test example apps from another branch.
+They use their own image prefix (`deployx-test/`) and network (`deployx-apps-test`), and they remove everything they created. They clone the `main` branch; set `DEPLOYX_TEST_BRANCH` to test example apps from another branch. Since Phase 7 they run through the deployment-target pipeline (`LOCAL`) and pass unchanged, which shows that the local Docker path behaves exactly as before.
+
+**No test needs AWS.** To try a real AWS deployment, set up ECR and ECS as in [AWS deployment architecture](#aws-deployment-architecture), give the worker `AWS_REGION`, `AWS_ECR_REPOSITORY`, `AWS_ECS_CLUSTER` and credentials, point a project at its service, and deploy `examples/hello-app` (port 3000) and then `examples/unhealthy-app` to see the rollback.
 
 ### Manual verification with Docker
 
@@ -1542,6 +2003,24 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 - Every deployment fails with `Connection refused` when the worker runs in Docker Compose on Linux: the worker container can't reach ports bound to the host's `127.0.0.1`. Run the worker on the host (`npm run dev:worker`).
 
 **Deployment fails with `Project has no container_port configured`.** Projects created before Phase 4 have no port. Set it with `PUT /api/projects/:id` and `{"container_port": 3000}`.
+
+**GitHub shows failed webhook deliveries.** Open the delivery under **Recent Deliveries**; the response body says why:
+- `401 Invalid webhook signature`: the webhook's secret differs from `GITHUB_WEBHOOK_SECRET` (or a proxy changed the body). `401 Missing X-Hub-Signature-256 header`: no secret is set on GitHub.
+- `503 GitHub webhooks are not configured on this server`: set `GITHUB_WEBHOOK_SECRET` for the API and restart it.
+- `415`: set the webhook's content type to `application/json`.
+- `400 Unsupported GitHub event "…"`: subscribe only to push events. A GitHub App also receives `installation` events, which show as failed deliveries and can be ignored.
+- `404 No DeployX project uses repository …`: the project's `github_repo` must be this repository.
+- `200` with `ignored`: the push was to a branch no project deploys, or the project is inactive. `200` with `duplicate: true`: that commit was already deployed by push; deploy it again by hand if needed.
+
+**Private repository: `not found or not public`.** Install the DeployX GitHub App on the repository (Contents: read-only) and set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` for the worker. The worker logs at startup whether an App is configured.
+
+**AWS deployment fails.**
+- `AWS deployments are not configured on this worker`: set `AWS_REGION`, `AWS_ECR_REPOSITORY` and `AWS_ECS_CLUSTER` for the worker (the startup log says which are missing).
+- `… failed: CredentialsProviderError` / `AccessDeniedException`: the worker has no AWS credentials or lacks a permission from the [IAM policy](#aws-deployment-architecture).
+- `ECS service … was not found in cluster …`: create the service, or fix `aws_ecs_service`.
+- `Task definition … has no container for port …`: the project's `container_port` must be the port the app container maps.
+- `ECS rollout failed: …` / `ECS deployment did not complete within …`: the new tasks did not start or become healthy on ECS. Look at the service's events and the tasks' stopped reasons and logs in the AWS console (DeployX does not read CloudWatch).
+- `Health check failed … resolves to the private address …`: the service URL points into a private network; if the worker can reach it there, set `HEALTH_CHECK_ALLOW_PRIVATE_URLS=true`.
 
 ## Project Status
 
@@ -1614,6 +2093,27 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 - [x] Unit, integration and rollback end-to-end tests; Phase 1–5 tests and the Docker e2e tests pass
 - [x] No GitHub OAuth or webhooks, private repositories, AWS, Kubernetes or monitoring (later phases)
 
+**Phase 7: GitHub integration and AWS deployment**
+
+- [x] Existing Phase 1–6 functionality still works: all earlier tests and the 11 Docker end-to-end tests pass
+- [x] GitHub repository and branch configurable (API and dashboard); owner and name derived, not duplicated
+- [x] `POST /api/webhooks/github` with HMAC-SHA256 signature verification (constant time) before any parsing
+- [x] Push events only; the configured branch is deployed, others ignored; the exact commit SHA is extracted and pinned
+- [x] Duplicate deliveries handled by a unique index (race-safe)
+- [x] A push creates a deployment through the same `queueDeployment()`, BullMQ queue, worker and pipeline as a manual one
+- [x] Existing Docker build unchanged; images tagged by commit, identified by image ID (local) and digest (ECR)
+- [x] Images pushed to Amazon ECR; ECR login without the password on a command line
+- [x] AWS deployment service (ECS/Fargate): task definition revision, UpdateService, rollout wait, failure and timeout detection, revert
+- [x] AWS deployments go through `HEALTH_CHECK`; healthy → `SUCCESS`; unhealthy → the Phase 6 rollback
+- [x] Rollback on AWS restores the stable **image digest** without rebuilding; `ROLLBACK_FAILED` when that is impossible
+- [x] Private repositories through a GitHub App (repository-scoped, read-only, short-lived token)
+- [x] Webhook, build, ECR, AWS, health and rollback lines streamed through the existing PostgreSQL → Redis → SSE pipeline
+- [x] Deployment history correct; records show trigger, target, image digest and task definition
+- [x] Dashboard: settings, trigger and target columns, image version, digest, task definition, commit links
+- [x] GitHub, AWS, end-to-end, isolation and regression tests (274 default + 11 Docker); no AWS account needed
+- [x] No secrets committed; no credentials in the database, Redis payloads, logs or the browser
+- [x] No Phase 8 work: no authentication/OAuth sign-in, monitoring, Kubernetes, autoscaling or multi-region
+
 ## Future Phases
 
 DeployX is developed incrementally across **8 phases**:
@@ -1625,6 +2125,6 @@ DeployX is developed incrementally across **8 phases**:
 | 3     | Job queue: BullMQ on Redis, worker job processing, retries, concurrency ✅ |
 | 4     | Build & run: git clone, Docker build, container deployment ✅         |
 | 5     | Deployment history, state machine, real-time logs (SSE) ✅            |
-| **6** | **Health checks for deployed apps, automatic rollback, stable versions (this phase)** ✅ |
-| 7     | GitHub OAuth & webhooks, AWS / EC2 cloud deployment                   |
+| 6     | Health checks for deployed apps, automatic rollback, stable versions ✅ |
+| **7** | **GitHub webhooks and App, AWS deployment: ECR + ECS/Fargate (this phase)** ✅ |
 | 8     | Production auth, security hardening, monitoring, CI/CD                |
