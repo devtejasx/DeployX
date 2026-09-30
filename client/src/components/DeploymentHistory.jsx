@@ -1,6 +1,14 @@
 import { useState } from 'react';
 import StatusBadge from './StatusBadge.jsx';
-import { formatDateTime, formatDuration, shortId, shortSha } from '../utils/format.js';
+import {
+  formatDateTime,
+  formatDuration,
+  repositoryName,
+  shortId,
+  shortSha,
+  targetLabel,
+  triggerLabel,
+} from '../utils/format.js';
 
 // What the automatic rollback of a deployment did, in a few words.
 function rollbackNote(deployment, numberOf) {
@@ -18,7 +26,16 @@ function rollbackNote(deployment, numberOf) {
 
 // Deployments of one application, newest first (the API's order). Numbers
 // count from the oldest deployment (#1).
-export default function DeploymentHistory({ project, deployments, error, loading, selectedId, onSelect, onDeploy }) {
+export default function DeploymentHistory({
+  project,
+  deployments,
+  error,
+  loading,
+  selectedId,
+  onSelect,
+  onDeploy,
+  onOpenSettings,
+}) {
   const [deploying, setDeploying] = useState(false);
   const [deployError, setDeployError] = useState(null);
 
@@ -42,12 +59,27 @@ export default function DeploymentHistory({ project, deployments, error, loading
     <section className="card history" aria-labelledby="history-heading">
       <div className="card__header">
         <h2 id="history-heading">Deployments · {project.name}</h2>
-        <button type="button" onClick={deploy} disabled={deploying || project.status !== 'ACTIVE'}>
-          {deploying ? 'Queueing…' : 'Deploy'}
-        </button>
+        <div className="card__actions">
+          <button type="button" onClick={onOpenSettings}>
+            Settings
+          </button>
+          <button type="button" onClick={deploy} disabled={deploying || project.status !== 'ACTIVE'}>
+            {deploying ? 'Queueing…' : 'Deploy'}
+          </button>
+        </div>
       </div>
       <p className="muted history__meta">
-        {project.github_repo} · branch <code>{project.github_branch}</code> · <code>{project.dockerfile_path}</code>
+        <a href={project.github_repo} target="_blank" rel="noreferrer">
+          {repositoryName(project.github_repo)}
+        </a>{' '}
+        · branch <code>{project.github_branch}</code> · {targetLabel(project.deployment_target)}
+        {project.deployment_target === 'AWS_ECS' && (
+          <>
+            {' '}
+            (service <code>{project.aws_ecs_service}</code>)
+          </>
+        )}{' '}
+        · <code>{project.dockerfile_path}</code>
         {project.container_port ? ` · port ${project.container_port}` : ''}
         {project.health_check_path && (
           <>
@@ -69,6 +101,8 @@ export default function DeploymentHistory({ project, deployments, error, loading
               <tr>
                 <th scope="col">Deployment</th>
                 <th scope="col">Commit</th>
+                <th scope="col">Trigger</th>
+                <th scope="col">Target</th>
                 <th scope="col">Status</th>
                 <th scope="col">Created</th>
                 <th scope="col">Started</th>
@@ -90,6 +124,12 @@ export default function DeploymentHistory({ project, deployments, error, loading
                     <span className="muted mono">{shortId(deployment.id)}</span>
                   </td>
                   <td className="mono">{shortSha(deployment.commit_sha)}</td>
+                  <td>
+                    <span className={`trigger trigger--${deployment.trigger?.toLowerCase()}`}>
+                      {triggerLabel(deployment.trigger)}
+                    </span>
+                  </td>
+                  <td>{targetLabel(deployment.deployment_target)}</td>
                   <td>
                     <StatusBadge status={deployment.status} />
                     {deployment.is_stable && (

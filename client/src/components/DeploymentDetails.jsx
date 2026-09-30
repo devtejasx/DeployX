@@ -4,7 +4,16 @@ import LogViewer from './LogViewer.jsx';
 import RollbackSummary from './RollbackSummary.jsx';
 import StatusBadge from './StatusBadge.jsx';
 import StatusSteps from './StatusSteps.jsx';
-import { formatDateTime, formatDuration, isTerminal } from '../utils/format.js';
+import {
+  formatDateTime,
+  formatDuration,
+  isTerminal,
+  repositoryName,
+  shortDigest,
+  targetLabel,
+  taskDefinitionName,
+  triggerLabel,
+} from '../utils/format.js';
 
 // Re-renders every second while `active`, so running durations tick.
 function useNow(active) {
@@ -27,6 +36,12 @@ const ACTIVITY = {
   ROLLING_BACK: 'Health check failed. Restoring the previous stable version…',
 };
 
+// The same for deployments to AWS, where they differ.
+const AWS_ACTIVITY = {
+  BUILDING: 'Building the image and pushing it to Amazon ECR…',
+  DEPLOYING: 'Rolling out the new version on Amazon ECS…',
+};
+
 function Field({ label, children }) {
   return (
     <div className="field">
@@ -38,10 +53,13 @@ function Field({ label, children }) {
 
 // One deployment: its facts, rollback outcome, error and live logs. `stream`
 // comes from useDeploymentStream; its deployment is what the server last
-// sent. `numberOf(id)` gives the history number of another deployment.
-export default function DeploymentDetails({ stream, number, numberOf, onSelect, onClose }) {
+// sent. `numberOf(id)` gives the history number of another deployment;
+// `project` is the application it belongs to.
+export default function DeploymentDetails({ stream, project, number, numberOf, onSelect, onClose }) {
   const { deployment, logs, connection, ended, error } = stream;
   const now = useNow(deployment && !isTerminal(deployment.status));
+  const onAws = deployment?.deployment_target === 'AWS_ECS';
+  const activity = deployment && ((onAws && AWS_ACTIVITY[deployment.status]) || ACTIVITY[deployment.status]);
 
   if (error) {
     return (
@@ -72,9 +90,9 @@ export default function DeploymentDetails({ stream, number, numberOf, onSelect, 
         healthCheckFailed={deployment.health_check?.status === 'FAILED' || Boolean(deployment.rollback_status)}
       />
 
-      {ACTIVITY[deployment.status] && (
+      {activity && (
         <p className={`activity activity--${deployment.status.toLowerCase()}`} role="status">
-          <strong>{ACTIVITY[deployment.status]}</strong>
+          <strong>{activity}</strong>
           {logs.length > 0 && <span className="activity__line">{logs.at(-1).message}</span>}
         </p>
       )}
@@ -88,26 +106,70 @@ export default function DeploymentDetails({ stream, number, numberOf, onSelect, 
             </span>
           )}
         </Field>
-        <Field label="Commit">
-          <span className="mono">{deployment.commit_sha ?? 'branch head (resolved when built)'}</span>
+        <Field label="Trigger">{triggerLabel(deployment.trigger)}</Field>
+        <Field label="Repository">
+          {project ? (
+            <a href={project.github_repo} target="_blank" rel="noreferrer">
+              {repositoryName(project.github_repo)}
+            </a>
+          ) : (
+            '—'
+          )}
         </Field>
         <Field label="Branch">
           <span className="mono">{deployment.branch}</span>
         </Field>
+        <Field label="Commit">
+          {deployment.commit_sha && project ? (
+            <a
+              className="mono"
+              href={`${project.github_repo}/commit/${deployment.commit_sha}`}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {deployment.commit_sha}
+            </a>
+          ) : (
+            <span className="mono">{deployment.commit_sha ?? 'branch head (resolved when built)'}</span>
+          )}
+        </Field>
+        <Field label="Target">{targetLabel(deployment.deployment_target)}</Field>
         <Field label="Created">{formatDateTime(deployment.created_at)}</Field>
         <Field label="Started">{formatDateTime(deployment.started_at)}</Field>
         <Field label="Finished">{formatDateTime(deployment.finished_at)}</Field>
         <Field label="Duration">{formatDuration(deployment.started_at, deployment.finished_at, now)}</Field>
-        <Field label="Image">
+        <Field label="Image version">
           <span className="mono">{deployment.docker_image ?? '—'}</span>
         </Field>
-        <Field label="Container">
-          <span className="mono">
-            {deployment.container_name
-              ? `${deployment.container_name}${deployment.container_removed_at ? ' (removed)' : ''}`
-              : '—'}
-          </span>
-        </Field>
+        {deployment.image_digest && (
+          <Field label="Image digest">
+            <span className="mono" title={deployment.image_digest}>
+              {shortDigest(deployment.image_digest)}
+            </span>
+          </Field>
+        )}
+        {onAws ? (
+          <Field label="ECS task definition">
+            <span className="mono" title={deployment.aws_task_definition_arn ?? undefined}>
+              {taskDefinitionName(deployment.aws_task_definition_arn)}
+            </span>
+          </Field>
+        ) : (
+          <Field label="Container">
+            <span className="mono">
+              {deployment.container_name
+                ? `${deployment.container_name}${deployment.container_removed_at ? ' (removed)' : ''}`
+                : '—'}
+            </span>
+          </Field>
+        )}
+        {onAws && deployment.is_stable && project?.aws_service_url && (
+          <Field label="Service URL">
+            <a href={project.aws_service_url} target="_blank" rel="noreferrer">
+              {project.aws_service_url}
+            </a>
+          </Field>
+        )}
         {deployment.host_port && !deployment.container_removed_at && (
           <Field label="Local URL">
             <a href={`http://127.0.0.1:${deployment.host_port}/`} target="_blank" rel="noreferrer">

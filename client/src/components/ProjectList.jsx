@@ -1,3 +1,5 @@
+import { repositoryName } from '../utils/format.js';
+
 export default function ProjectList({ projects, error, loading, selectedId, onSelect }) {
   return (
     <section className="card projects" aria-labelledby="projects-heading">
@@ -20,8 +22,17 @@ export default function ProjectList({ projects, error, loading, selectedId, onSe
               aria-current={project.id === selectedId ? 'true' : undefined}
               onClick={() => onSelect(project.id)}
             >
-              <span className="project-list__name">{project.name}</span>
-              <span className="project-list__repo">{project.github_repo.replace('https://github.com/', '')}</span>
+              <span className="project-list__name">
+                {project.name}
+                {project.deployment_target === 'AWS_ECS' && (
+                  <span className="tag tag--aws" title="Deployed to Amazon ECS">
+                    AWS
+                  </span>
+                )}
+              </span>
+              <span className="project-list__repo">
+                {repositoryName(project.github_repo)} · {project.github_branch}
+              </span>
             </button>
           </li>
         ))}

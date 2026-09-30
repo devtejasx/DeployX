@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { createDeployment, listProjectDeployments, listProjects } from '../api/deploymentsApi.js';
 import { useDeploymentStream } from '../hooks/useDeploymentStream.js';
 import { useHashRoute } from '../hooks/useHashRoute.js';
@@ -7,6 +7,7 @@ import { isTerminal } from '../utils/format.js';
 import DeploymentDetails from './DeploymentDetails.jsx';
 import DeploymentHistory from './DeploymentHistory.jsx';
 import ProjectList from './ProjectList.jsx';
+import ProjectSettings from './ProjectSettings.jsx';
 
 const hasRunningDeployment = (deployments) => deployments?.some((deployment) => !isTerminal(deployment.status));
 
@@ -17,6 +18,11 @@ export default function Deployments() {
 
   const projects = usePolling(() => listProjects(), []);
   const project = projects.data?.find((candidate) => candidate.id === projectId) ?? null;
+
+  // The settings panel of the selected application; closed when another one
+  // is selected.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  useEffect(() => setSettingsOpen(false), [projectId]);
 
   // Refreshed every few seconds while any deployment is still running.
   const history = usePolling(() => (projectId ? listProjectDeployments(projectId) : Promise.resolve(null)), [projectId], {
@@ -62,6 +68,10 @@ export default function Deployments() {
           <p className="card notice notice--error">Application not found.</p>
         )}
 
+        {project && settingsOpen && (
+          <ProjectSettings project={project} onSaved={projects.reload} onClose={() => setSettingsOpen(false)} />
+        )}
+
         {project && (
           <DeploymentHistory
             project={project}
@@ -71,12 +81,14 @@ export default function Deployments() {
             selectedId={deploymentId}
             onSelect={(id) => navigate(projectId, id)}
             onDeploy={deploy}
+            onOpenSettings={() => setSettingsOpen(true)}
           />
         )}
 
         {project && deploymentId && (
           <DeploymentDetails
             stream={stream}
+            project={project}
             number={numberOf(deploymentId)}
             numberOf={numberOf}
             onSelect={(id) => navigate(projectId, id)}

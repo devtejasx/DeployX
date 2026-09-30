@@ -631,3 +631,91 @@ button:disabled {
 .steps__step--failed {
   color: var(--bad);
 }
+
+/* ---- Phase 7: repository settings, triggers and deployment targets ---- */
+
+.card__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.tag--aws {
+  color: var(--warn);
+}
+
+.trigger {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.trigger--github_push {
+  color: var(--accent);
+}
+
+.settings__form {
+  display: grid;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.settings__form fieldset {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px 20px;
+  margin: 0;
+  padding: 12px 16px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.settings__form legend {
+  padding: 0 6px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.settings__form label {
+  display: grid;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.settings__form input,
+.settings__form select {
+  font: inherit;
+  font-size: 0.875rem;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  min-width: 0;
+}
+
+.settings__form input:focus-visible,
+.settings__form select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.settings__hint {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 0.8125rem;
+}
+
+.settings__errors {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.settings__actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.settings__webhook {
+  margin-top: 0;
+}

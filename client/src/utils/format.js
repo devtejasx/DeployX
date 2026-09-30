@@ -48,3 +48,32 @@ export function shortSha(sha) {
 export function shortId(id) {
   return id ? id.slice(0, 8) : '';
 }
+
+// What created a deployment (deployments.trigger).
+const TRIGGERS = { MANUAL: 'Manual', GITHUB_PUSH: 'GitHub push' };
+
+export function triggerLabel(trigger) {
+  return TRIGGERS[trigger] ?? trigger ?? '—';
+}
+
+// Where a project's deployments run (deployment_target).
+const TARGETS = { LOCAL: 'Local Docker', AWS_ECS: 'AWS ECS' };
+
+export function targetLabel(target) {
+  return TARGETS[target] ?? target ?? '—';
+}
+
+// "owner/repo" of https://github.com/owner/repo.
+export function repositoryName(url) {
+  return (url ?? '').replace(/^https:\/\/github\.com\//, '');
+}
+
+// "sha256:3f9a0c1d2e4b…" of an image digest.
+export function shortDigest(digest) {
+  return digest ? `${digest.slice(0, 19)}…` : '—';
+}
+
+// "my-app:7" of an ECS task definition ARN.
+export function taskDefinitionName(arn) {
+  return arn ? arn.split('/').pop() : '—';
+}
