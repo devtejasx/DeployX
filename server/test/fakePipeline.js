@@ -1,7 +1,8 @@
 // Test double for the worker's deployment pipeline. The queue tests exercise
 // BullMQ behaviour (concurrency, retries, duplicates, shutdown), not Docker,
 // so they plug this fast, deterministic pipeline into the real processor.
-// The real pipeline is covered by docker-deploy.test.js.
+// The real pipeline is covered by docker-deploy.test.js; health checks and
+// rollback by rollback.test.js (fakeDocker.js).
 //
 // Deterministic failures, chosen by the deployment's branch:
 //   test/fail   - fails on every attempt
@@ -28,6 +29,10 @@ export function createFakePipeline({ stepMs }) {
     await ctx.setStage('DEPLOYING', 'Deployment is now deploying');
     await sleep(stepMs);
     await ctx.log('INFO', 'Fake deploy completed');
+
+    // SUCCESS is only reachable through HEALTH_CHECK (state machine rule).
+    await ctx.setStage('HEALTH_CHECK', 'Running health checks');
+    await ctx.log('INFO', 'Fake health check passed');
 
     await ctx.setStage('SUCCESS', 'Deployment completed successfully');
     return { status: 'SUCCESS' };

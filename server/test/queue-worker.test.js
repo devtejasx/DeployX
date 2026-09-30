@@ -103,7 +103,7 @@ describe('single deployment job', () => {
     await waitForStatus(deployment.id, ['SUCCESS']);
   });
 
-  test('walks QUEUED -> BUILDING -> DEPLOYING -> SUCCESS and records it in PostgreSQL', async () => {
+  test('walks QUEUED -> BUILDING -> DEPLOYING -> HEALTH_CHECK -> SUCCESS and records it in PostgreSQL', async () => {
     const { deployment } = await deploy({ commit_sha: 'def5678' });
 
     const seen = [];
@@ -113,7 +113,11 @@ describe('single deployment job', () => {
       return status === 'SUCCESS';
     });
     // Polling can miss the initial QUEUED, but never reorders states.
-    assert.deepEqual(seen.filter((status) => status !== 'QUEUED'), ['BUILDING', 'DEPLOYING', 'SUCCESS']);
+    // HEALTH_CHECK passes at once in the fake pipeline, so polling may miss it.
+    assert.deepEqual(
+      seen.filter((status) => status !== 'QUEUED' && status !== 'HEALTH_CHECK'),
+      ['BUILDING', 'DEPLOYING', 'SUCCESS'],
+    );
 
     const { rows } = await pool.query(
       'SELECT started_at, finished_at, created_at FROM deployments WHERE id = $1',
@@ -129,6 +133,8 @@ describe('single deployment job', () => {
       'INFO Fake build completed',
       'INFO Deployment is now deploying',
       'INFO Fake deploy completed',
+      'INFO Running health checks',
+      'INFO Fake health check passed',
       'INFO Deployment completed successfully',
     ]);
 
@@ -156,7 +162,7 @@ describe('single deployment job', () => {
       );
       assert.deepEqual(
         events.filter((e) => e.type === 'status').map((e) => e.status),
-        ['BUILDING', 'DEPLOYING', 'SUCCESS'],
+        ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'SUCCESS'],
       );
       // Each status arrives right after the log line written with it.
       const successIndex = events.findIndex((e) => e.type === 'status' && e.status === 'SUCCESS');

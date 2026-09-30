@@ -45,6 +45,14 @@ export function imageName(project, commitSha) {
   return `${imageRepository(project.name, project.id)}:${commitSha.slice(0, 12)}`;
 }
 
+// deployx/<project-slug>-<project-id-prefix>:deployment-<deployment-id>
+// A second tag on every built image, unique to its deployment. The commit tag
+// above moves when the same commit is built again; this one keeps the image
+// of a deployment on the Docker host, so a rollback can start it again.
+export function deploymentImageTag(project, deploymentId) {
+  return `${imageRepository(project.name, project.id)}:deployment-${deploymentId}`;
+}
+
 // Unique per deployment; a project can have several deployments over time.
 export function containerName(projectId, deploymentId) {
   return `deployx-${projectId}-${deploymentId}`;
@@ -77,8 +85,9 @@ export async function ensureAppNetwork(name = config.docker.appNetwork) {
 
 // docker build --file <dockerfile> --tag <image> <context>. Output lines go to
 // `onLine`; the exit code tells the caller whether the build succeeded.
-export function buildImage({ contextDir, dockerfile, image, labels, onLine }) {
+export function buildImage({ contextDir, dockerfile, image, extraTags = [], labels, onLine }) {
   const args = ['build', '--progress=plain', '--file', dockerfile, '--tag', image];
+  for (const tag of extraTags) args.push('--tag', tag);
   for (const label of labels) args.push('--label', label);
   args.push('--', contextDir);
   return docker(args, { onLine, timeoutMs: config.docker.buildTimeoutMs, tailSize: 40 });
@@ -128,6 +137,30 @@ export function publishedHostPort(inspection, containerPort) {
   const bindings = inspection?.NetworkSettings?.Ports?.[`${containerPort}/tcp`];
   const hostPort = Number(bindings?.[0]?.HostPort);
   return Number.isInteger(hostPort) && hostPort > 0 ? hostPort : null;
+}
+
+// The host port of a container's single published port, whatever the
+// container port is (DeployX publishes exactly one port per container).
+export function firstPublishedHostPort(inspection) {
+  for (const bindings of Object.values(inspection?.NetworkSettings?.Ports ?? {})) {
+    const hostPort = Number(bindings?.[0]?.HostPort);
+    if (Number.isInteger(hostPort) && hostPort > 0) return hostPort;
+  }
+  return null;
+}
+
+// The immutable ID (sha256:...) of an image, or null if the image does not
+// exist. A tag can be moved to another image by a later build; the ID cannot.
+export async function imageId(image) {
+  const result = await docker(['image', 'inspect', '--format', '{{.Id}}', '--', image]);
+  const id = result.stdout.trim();
+  return result.code === 0 && /^sha256:[0-9a-f]{64}$/.test(id) ? id : null;
+}
+
+// Whether the image (a tag or an ID) is still present on the Docker host.
+export async function imageExists(image) {
+  const result = await docker(['image', 'inspect', '--format', '{{.Id}}', '--', image]);
+  return result.code === 0;
 }
 
 export async function containerLogs(nameOrId, tail = 30) {

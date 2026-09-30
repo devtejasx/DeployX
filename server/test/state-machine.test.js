@@ -1,6 +1,7 @@
 // The deployment state machine is enforced by PostgreSQL itself
-// (migrations 1790671094193_deployment-state-machine and
-// 1790767006154_rollback-and-stable-deployments): these tests exercise
+// (migrations 1790671094193_deployment-state-machine,
+// 1790767006154_rollback-and-stable-deployments and
+// 1790767291227_require-health-check-before-success): these tests exercise
 // transition_deployment_status() and the trigger directly.
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
@@ -34,7 +35,6 @@ describe('allowed transitions', () => {
   for (const [from, to] of [
     ['QUEUED', 'BUILDING'],
     ['BUILDING', 'DEPLOYING'],
-    ['DEPLOYING', 'SUCCESS'],
     ['QUEUED', 'FAILED'],
     ['BUILDING', 'FAILED'],
     ['DEPLOYING', 'FAILED'],
@@ -68,6 +68,8 @@ describe('rejected transitions', () => {
     ['QUEUED', 'SUCCESS'],
     ['QUEUED', 'DEPLOYING'],
     ['BUILDING', 'SUCCESS'],
+    // A running container is not enough: SUCCESS only follows HEALTH_CHECK.
+    ['DEPLOYING', 'SUCCESS'],
     // The health check cannot be skipped into or re-entered.
     ['QUEUED', 'HEALTH_CHECK'],
     ['BUILDING', 'HEALTH_CHECK'],
@@ -160,7 +162,7 @@ describe('transition_deployment_status()', () => {
     );
     assert.deepEqual(Object.fromEntries(rows.map((row) => [row.from_status, row.targets])), {
       BUILDING: ['DEPLOYING', 'FAILED', 'QUEUED'],
-      DEPLOYING: ['FAILED', 'HEALTH_CHECK', 'QUEUED', 'SUCCESS'],
+      DEPLOYING: ['FAILED', 'HEALTH_CHECK', 'QUEUED'],
       HEALTH_CHECK: ['FAILED', 'QUEUED', 'ROLLING_BACK', 'SUCCESS'],
       QUEUED: ['BUILDING', 'FAILED'],
       ROLLING_BACK: ['FAILED'],

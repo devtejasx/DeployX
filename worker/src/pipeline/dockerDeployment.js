@@ -5,23 +5,20 @@ import {
   buildImage,
   containerLogs,
   containerName,
+  deploymentImageTag,
   deploymentLabels,
   ensureAppNetwork,
+  imageId,
   imageName,
   inspectContainer,
-  listProjectContainers,
   publishedHostPort,
   removeContainer,
   runContainer,
 } from '../services/dockerService.js';
-import {
-  recordCommit,
-  recordContainer,
-  recordContainerRemoved,
-  recordImage,
-} from '../services/deploymentService.js';
+import { recordCommit, recordContainer, recordImage } from '../services/deploymentService.js';
 import { GitSourceError, cloneAndCheckout } from '../services/gitService.js';
 import { DockerfileNotFoundError, createWorkspace, removeWorkspace, validateDockerfile } from '../services/workspace.js';
+import { createRelease } from './release.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -33,10 +30,13 @@ function unrecoverable(message) {
   return new UnrecoverableError(message);
 }
 
+const release = createRelease();
+
 // The real deployment pipeline:
-//   BUILDING:  workspace -> git clone -> checkout commit -> Dockerfile check -> docker build
-//   DEPLOYING: docker run -> verify running -> replace previous container
-//   SUCCESS
+//   BUILDING:     workspace -> git clone -> checkout commit -> Dockerfile check -> docker build
+//   DEPLOYING:    docker run -> verify running
+//   HEALTH_CHECK: HTTP health check with retries (pipeline/release.js)
+//   SUCCESS, or ROLLING_BACK -> FAILED when the application is unhealthy
 // The workspace is removed at the end whatever happens.
 export async function runDockerDeployment(ctx) {
   const { deployment, project } = ctx;
@@ -103,6 +103,7 @@ export async function runDockerDeployment(ctx) {
       contextDir: workspace.sourceDir,
       dockerfile,
       image,
+      extraTags: [deploymentImageTag(project, deployment.id)],
       labels,
       onLine: (line) => {
         const stored = buildLog.accept(line);
@@ -124,7 +125,8 @@ export async function runDockerDeployment(ctx) {
       const reason = buildLog.tail().findLast((line) => /error/i.test(line)) ?? `exit code ${build.code}`;
       throw new Error(`Docker build failed: ${reason}`);
     }
-    await recordImage(deployment.id, image);
+    // The ID is kept next to the tag: a rollback restarts exactly this image.
+    await recordImage(deployment.id, image, await imageId(image));
     await ctx.log('INFO', `Docker image created: ${image}`);
 
     // --- Run ---------------------------------------------------------------
@@ -141,7 +143,7 @@ export async function runDockerDeployment(ctx) {
     await ctx.log('INFO', `Starting container ${name}`);
     const containerId = await runContainer({ image, name, containerPort: project.container_port, labels });
 
-    // Not a health check (Phase 6): only make sure it did not exit at once.
+    // Not the health check yet: only make sure it did not exit at once.
     await sleep(config.docker.startupGraceMs);
     const state = await inspectContainer(containerId);
     if (!state?.State?.Running) {
@@ -161,20 +163,13 @@ export async function runDockerDeployment(ctx) {
         `127.0.0.1:${hostPort}`,
     );
 
-    // One active deployment per project: stop the previous container(s) only
-    // now that the new one is running. Deployment history stays in the database.
-    for (const previous of await listProjectContainers(project.id)) {
-      if (previous.id === containerId) continue;
-      await removeContainer(previous.id);
-      if (previous.deploymentId) {
-        await recordContainerRemoved(previous.deploymentId, `Container removed: replaced by deployment ${deployment.id}`);
-      }
-      await ctx.log('INFO', `Stopped previous container ${previous.name}`);
-    }
-
+    // The sources are no longer needed; the container runs from its image.
     await cleanUpWorkspace();
-    await ctx.setStage('SUCCESS', 'Deployment completed successfully');
-    return { status: 'SUCCESS', image, containerId, hostPort };
+
+    // A running container is not a successful deployment yet: the health
+    // check decides, and an unhealthy deployment is rolled back. The previous
+    // container keeps running until then.
+    return await release(ctx, { containerId, name, hostPort, image });
   } finally {
     await cleanUpWorkspace();
   }

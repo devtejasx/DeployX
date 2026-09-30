@@ -130,6 +130,61 @@ export async function recordDeploymentEvents() {
   };
 }
 
+export async function waitFor(check, { timeout = 5000, interval = 20 } = {}) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const result = await check();
+    if (result) return result;
+    if (Date.now() > deadline) throw new Error('Timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+}
+
+// Opens the SSE log stream of a deployment and parses its events:
+// [{ event, id, data }].
+export async function openLogStream(baseUrl, deploymentId, { lastEventId } = {}) {
+  const controller = new AbortController();
+  const headers = lastEventId ? { 'Last-Event-ID': lastEventId } : {};
+  const response = await fetch(`${baseUrl}/api/deployments/${deploymentId}/logs/stream`, {
+    headers,
+    signal: controller.signal,
+  });
+  const stream = { response, events: [], ended: false, comments: 0 };
+  if (!response.headers.get('content-type')?.startsWith('text/event-stream')) return stream;
+
+  (async () => {
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      for await (const chunk of response.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        let boundary;
+        while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const event = {};
+          for (const line of frame.split('\n')) {
+            if (line.startsWith(':')) stream.comments += 1;
+            else if (line.startsWith('event: ')) event.event = line.slice(7);
+            else if (line.startsWith('id: ')) event.id = line.slice(4);
+            else if (line.startsWith('data: ')) event.data = JSON.parse(line.slice(6));
+          }
+          if (event.event) stream.events.push(event);
+        }
+      }
+    } catch {
+      // aborted by the test
+    }
+    stream.ended = true;
+  })();
+
+  stream.logs = () => stream.events.filter((e) => e.event === 'log').map((e) => e.data.message);
+  stream.statuses = () => stream.events.filter((e) => e.event === 'status').map((e) => e.data.status);
+  stream.waitFor = (predicate, options) => waitFor(() => stream.events.find(predicate), options);
+  stream.close = () => controller.abort();
+  return stream;
+}
+
 let projectCounter = 0;
 
 export function projectPayload(overrides = {}) {

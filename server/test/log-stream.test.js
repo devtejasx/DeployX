@@ -1,7 +1,7 @@
 // GET /api/deployments/:deploymentId/logs/stream (Server-Sent Events).
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
-import { MISSING_ID, pool, projectPayload, setupTestServer } from './helpers.js';
+import { MISSING_ID, openLogStream, pool, projectPayload, setupTestServer, waitFor } from './helpers.js';
 
 const { default: config } = await import('../src/config/index.js');
 const { subscriptionStats } = await import('../src/events/deploymentSubscriber.js');
@@ -16,59 +16,7 @@ before(async () => {
 
 after(() => api.close());
 
-async function waitFor(check, { timeout = 5000, interval = 20 } = {}) {
-  const deadline = Date.now() + timeout;
-  for (;;) {
-    const result = await check();
-    if (result) return result;
-    if (Date.now() > deadline) throw new Error('Timed out waiting for condition');
-    await new Promise((resolve) => setTimeout(resolve, interval));
-  }
-}
-
-// Opens an SSE stream and parses its events: [{ event, id, data }].
-async function openStream(deploymentId, { lastEventId } = {}) {
-  const controller = new AbortController();
-  const headers = lastEventId ? { 'Last-Event-ID': lastEventId } : {};
-  const response = await fetch(`${api.baseUrl}/api/deployments/${deploymentId}/logs/stream`, {
-    headers,
-    signal: controller.signal,
-  });
-  const stream = { response, events: [], ended: false, comments: 0 };
-  if (!response.headers.get('content-type')?.startsWith('text/event-stream')) return stream;
-
-  (async () => {
-    const decoder = new TextDecoder();
-    let buffer = '';
-    try {
-      for await (const chunk of response.body) {
-        buffer += decoder.decode(chunk, { stream: true });
-        let boundary;
-        while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-          const frame = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          const event = {};
-          for (const line of frame.split('\n')) {
-            if (line.startsWith(':')) stream.comments += 1;
-            else if (line.startsWith('event: ')) event.event = line.slice(7);
-            else if (line.startsWith('id: ')) event.id = line.slice(4);
-            else if (line.startsWith('data: ')) event.data = JSON.parse(line.slice(6));
-          }
-          if (event.event) stream.events.push(event);
-        }
-      }
-    } catch {
-      // aborted by the test
-    }
-    stream.ended = true;
-  })();
-
-  stream.logs = () => stream.events.filter((e) => e.event === 'log').map((e) => e.data.message);
-  stream.statuses = () => stream.events.filter((e) => e.event === 'status').map((e) => e.data.status);
-  stream.waitFor = (predicate, options) => waitFor(() => stream.events.find(predicate), options);
-  stream.close = () => controller.abort();
-  return stream;
-}
+const openStream = (deploymentId, options) => openLogStream(api.baseUrl, deploymentId, options);
 
 async function createDeployment(target = project) {
   return (await api.post(`/api/projects/${target.id}/deployments`, {})).body.data.deployment;
@@ -135,12 +83,13 @@ describe('live updates', () => {
     await setStatus(deployment.id, 'BUILDING');
     await setStatus(deployment.id, 'DEPLOYING');
     await addLog(deployment.id, 'Container started');
+    await setStatus(deployment.id, 'HEALTH_CHECK');
     await setStatus(deployment.id, 'SUCCESS');
 
     const end = await stream.waitFor((e) => e.event === 'end');
     assert.deepEqual(end.data, { deploymentId: deployment.id, status: 'SUCCESS' });
     await waitFor(() => stream.ended);
-    assert.deepEqual(stream.statuses(), ['QUEUED', 'BUILDING', 'DEPLOYING', 'SUCCESS']);
+    assert.deepEqual(stream.statuses(), ['QUEUED', 'BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'SUCCESS']);
     assert.ok(stream.logs().includes('Container started'));
     assert.equal(stream.events.at(-1).event, 'end');
   });

@@ -15,9 +15,12 @@ function invalidTransition(err) {
   return new UnrecoverableError(`Invalid deployment state transition: ${from} -> ${to}`);
 }
 
-const DEPLOYMENT_COLUMNS = `id, project_id, commit_sha, branch, status, docker_image,
+const DEPLOYMENT_COLUMNS = `id, project_id, commit_sha, branch, status, docker_image, docker_image_id,
   container_id, container_name, host_port, container_removed_at, error_message,
+  rollback_status, rollback_deployment_id,
   started_at, finished_at, created_at, updated_at`;
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Log messages are capped to fit deployment_logs (and to stay readable).
 const MAX_LOG_LENGTH = 4000;
@@ -35,7 +38,8 @@ export async function getDeploymentWithProject(deploymentId) {
     `SELECT d.*,
             json_build_object(
               'id', p.id, 'name', p.name, 'github_repo', p.github_repo,
-              'dockerfile_path', p.dockerfile_path, 'container_port', p.container_port
+              'dockerfile_path', p.dockerfile_path, 'container_port', p.container_port,
+              'health_check_path', p.health_check_path
             ) AS project
      FROM deployments d JOIN projects p ON p.id = d.project_id
      WHERE d.id = $1`,
@@ -124,8 +128,14 @@ export async function recordCommit(deploymentId, commitSha) {
   await query('UPDATE deployments SET commit_sha = $2 WHERE id = $1', [deploymentId, commitSha]);
 }
 
-export async function recordImage(deploymentId, image) {
-  await query('UPDATE deployments SET docker_image = $2 WHERE id = $1', [deploymentId, image]);
+// The image the deployment was built as: its tag, and its immutable ID when
+// known (what a rollback starts the deployment from again).
+export async function recordImage(deploymentId, image, imageId = null) {
+  await query('UPDATE deployments SET docker_image = $2, docker_image_id = $3 WHERE id = $1', [
+    deploymentId,
+    image,
+    imageId,
+  ]);
 }
 
 export async function recordContainer(deploymentId, { containerId, containerName, hostPort }) {
@@ -135,6 +145,38 @@ export async function recordContainer(deploymentId, { containerId, containerName
      WHERE id = $1`,
     [deploymentId, containerId, containerName, hostPort],
   );
+}
+
+// The project's last stable deployment: its most recently finished SUCCESS
+// deployment (stable_deployment_id() in PostgreSQL, the definition the API
+// reports as is_stable), or null if the project never had one.
+export async function findStableDeployment(projectId) {
+  const { rows } = await query(
+    `SELECT ${DEPLOYMENT_COLUMNS} FROM deployments WHERE id = stable_deployment_id($1)`,
+    [projectId],
+  );
+  return rows[0] ?? null;
+}
+
+// Of `deploymentIds`, the ones a job is still working on (not SUCCESS or FAILED).
+export async function unfinishedDeploymentIds(deploymentIds) {
+  const ids = deploymentIds.filter((id) => UUID_PATTERN.test(id ?? ''));
+  if (ids.length === 0) return new Set();
+  const { rows } = await query(
+    `SELECT id FROM deployments WHERE id = ANY($1::uuid[]) AND status NOT IN ('SUCCESS', 'FAILED')`,
+    [ids],
+  );
+  return new Set(rows.map((row) => row.id));
+}
+
+// Outcome of the automatic rollback of an unhealthy deployment:
+// COMPLETED, FAILED or NOT_AVAILABLE, and the stable deployment it targeted.
+export async function recordRollback(deploymentId, { status, rollbackDeploymentId = null }) {
+  await query('UPDATE deployments SET rollback_status = $2, rollback_deployment_id = $3 WHERE id = $1', [
+    deploymentId,
+    status,
+    rollbackDeploymentId,
+  ]);
 }
 
 // The deployment's container was removed (e.g. replaced by a newer

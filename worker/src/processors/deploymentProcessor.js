@@ -1,11 +1,13 @@
 import { UnrecoverableError } from 'bullmq';
 import config from '../config/index.js';
+import { RecordedFailureError } from '../lib/errors.js';
 import { runDockerDeployment } from '../pipeline/dockerDeployment.js';
 import {
   TERMINAL_STATUSES,
   addLog,
   getDeploymentWithProject,
   markFailed,
+  recordRollback,
   transitionDeploymentStatus,
 } from '../services/deploymentService.js';
 
@@ -41,6 +43,18 @@ export function createDeploymentProcessor({ pipeline = runDockerDeployment } = {
     if (TERMINAL_STATUSES.includes(deployment.status)) {
       return { skipped: true, reason: `Deployment already finished with status ${deployment.status}` };
     }
+    if (deployment.status === 'ROLLING_BACK') {
+      // Only possible when a worker died in the middle of a rollback and
+      // BullMQ hands the job out again. A rollback is not resumed or redone:
+      // the deployment failed, and its rollback did not complete.
+      await recordRollback(deploymentId, { status: 'FAILED', rollbackDeploymentId: deployment.rollback_deployment_id });
+      await markFailed(
+        deploymentId,
+        'The worker stopped during the rollback; the rollback did not complete',
+        'Deployment failed: the rollback was interrupted',
+      );
+      return { skipped: true, reason: 'Rollback was interrupted' };
+    }
 
     const context = {
       job,
@@ -65,6 +79,10 @@ export function createDeploymentProcessor({ pipeline = runDockerDeployment } = {
       await addLog(deploymentId, 'INFO', `Deployment job started (attempt ${attempt} of ${maxAttempts})`);
       return await pipeline(context);
     } catch (err) {
+      // An unhealthy deployment: the pipeline already recorded the failure
+      // and the rollback. The job just ends as failed, without a retry.
+      if (err instanceof RecordedFailureError) throw err;
+
       // Record what happened, then rethrow so BullMQ applies its retry policy.
       // Bookkeeping errors must not replace the original error.
       try {

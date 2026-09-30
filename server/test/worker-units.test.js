@@ -14,7 +14,8 @@ const { createBuildLogCollector, sanitizeLine } = await import('../../worker/src
 const { createWorkspace, removeWorkspace, resolveInside, validateDockerfile, DockerfileNotFoundError } =
   await import('../../worker/src/services/workspace.js');
 const { buildCloneArgs, GitSourceError } = await import('../../worker/src/services/gitService.js');
-const { containerName, imageName, imageRepository } = await import('../../worker/src/services/dockerService.js');
+const { containerName, deploymentImageTag, firstPublishedHostPort, imageName, imageRepository, publishedHostPort } =
+  await import('../../worker/src/services/dockerService.js');
 
 const PROJECT_ID = '0f8fad5b-d9cb-469f-a165-70867728950e';
 const DEPLOYMENT_ID = '7c9e6679-7425-40de-944b-e07fc1f90ae7';
@@ -34,6 +35,24 @@ describe('image and container naming', () => {
 
   test('container names contain both project and deployment IDs', () => {
     assert.equal(containerName(PROJECT_ID, DEPLOYMENT_ID), `deployx-${PROJECT_ID}-${DEPLOYMENT_ID}`);
+  });
+
+  test('every image also gets a tag of its own deployment, which a later build cannot move', () => {
+    assert.equal(
+      deploymentImageTag({ id: PROJECT_ID, name: 'My API' }, DEPLOYMENT_ID),
+      `deployx/my-api-0f8fad5b:deployment-${DEPLOYMENT_ID}`,
+    );
+  });
+
+  test('the published host port is read from the container, whatever its container port is', () => {
+    const inspection = (ports) => ({ NetworkSettings: { Ports: ports } });
+    const binding = [{ HostIp: '127.0.0.1', HostPort: '32771' }];
+    assert.equal(publishedHostPort(inspection({ '3000/tcp': binding }), 3000), 32771);
+    assert.equal(publishedHostPort(inspection({ '3000/tcp': binding }), 8080), null);
+    assert.equal(firstPublishedHostPort(inspection({ '3000/tcp': binding })), 32771);
+    assert.equal(firstPublishedHostPort(inspection({ '9000/tcp': null, '3000/tcp': binding })), 32771);
+    assert.equal(firstPublishedHostPort(inspection({ '3000/tcp': null })), null);
+    assert.equal(firstPublishedHostPort(null), null);
   });
 });
 

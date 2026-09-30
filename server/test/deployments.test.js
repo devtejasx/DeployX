@@ -231,7 +231,17 @@ describe('deployment state machine through the API', () => {
       error: { message: 'Invalid deployment state transition', from: 'QUEUED', to: 'SUCCESS' },
     });
 
-    for (const status of ['BUILDING', 'DEPLOYING', 'SUCCESS']) {
+    await patch('BUILDING');
+    await patch('DEPLOYING');
+    // A running container is not enough: SUCCESS needs the health check.
+    const unchecked = await patch('SUCCESS');
+    assert.equal(unchecked.status, 409);
+    assert.deepEqual(unchecked.body.error, {
+      message: 'Invalid deployment state transition',
+      from: 'DEPLOYING',
+      to: 'SUCCESS',
+    });
+    for (const status of ['HEALTH_CHECK', 'SUCCESS']) {
       assert.equal((await patch(status)).status, 200);
     }
     for (const [to, from] of [
