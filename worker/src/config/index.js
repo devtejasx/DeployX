@@ -16,6 +16,11 @@ function positiveInt(value, fallback) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function nonNegativeInt(value, fallback) {
+  const parsed = Number(value);
+  return value !== undefined && value !== '' && Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 const config = {
   env: process.env.NODE_ENV || 'development',
   databaseUrl: process.env.DATABASE_URL || 'postgresql://deployx:deployx@localhost:5432/deployx',
@@ -60,6 +65,24 @@ const config = {
     appPidsLimit: positiveInt(process.env.APP_PIDS_LIMIT, 256),
     // Build output stored per attempt (see lib/buildLog.js).
     buildLogMaxLines: positiveInt(process.env.BUILD_LOG_MAX_LINES, 150),
+  },
+
+  // HTTP health checks of deployed apps: GET http://<host>:<port><path>.
+  // The path is set per project (projects.health_check_path, "/health" by
+  // default) and the port is the host port Docker published the project's
+  // container_port on; the rest applies to every deployment.
+  healthCheck: {
+    // Where published container ports are reachable from the worker:
+    // 127.0.0.1 on the Docker host, host.docker.internal in Docker Compose.
+    host: process.env.HEALTH_CHECK_HOST || '127.0.0.1',
+    // How long one request may take.
+    timeoutMs: positiveInt(process.env.HEALTH_CHECK_TIMEOUT_MS, 2000),
+    // Pause between two attempts.
+    intervalMs: positiveInt(process.env.HEALTH_CHECK_INTERVAL_MS, 2000),
+    // Attempts before the deployment counts as unhealthy.
+    retries: positiveInt(process.env.HEALTH_CHECK_RETRIES, 5),
+    // Time the application gets to start before the first attempt.
+    startupGraceMs: nonNegativeInt(process.env.HEALTH_CHECK_STARTUP_GRACE_MS, 5000),
   },
 };
 

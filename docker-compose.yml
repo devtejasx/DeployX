@@ -114,6 +114,15 @@ services:
       CONTAINER_STARTUP_GRACE_MS: ${CONTAINER_STARTUP_GRACE_MS:-3000}
       APP_MEMORY_LIMIT: ${APP_MEMORY_LIMIT:-512m}
       APP_CPU_LIMIT: ${APP_CPU_LIMIT:-1}
+      # Health checks go to the app's port published on the Docker host, which
+      # this container reaches as host.docker.internal (see extra_hosts).
+      HEALTH_CHECK_HOST: host.docker.internal
+      HEALTH_CHECK_TIMEOUT_MS: ${HEALTH_CHECK_TIMEOUT_MS:-2000}
+      HEALTH_CHECK_INTERVAL_MS: ${HEALTH_CHECK_INTERVAL_MS:-2000}
+      HEALTH_CHECK_RETRIES: ${HEALTH_CHECK_RETRIES:-5}
+      HEALTH_CHECK_STARTUP_GRACE_MS: ${HEALTH_CHECK_STARTUP_GRACE_MS:-5000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # DEVELOPMENT ONLY: the worker drives the host's Docker daemon to build
     # images and start app containers. Access to this socket is equivalent to
     # root on the Docker host, so ONLY the worker gets it - never the API,
