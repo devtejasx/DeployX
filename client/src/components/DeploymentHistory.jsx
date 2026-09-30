@@ -2,11 +2,30 @@ import { useState } from 'react';
 import StatusBadge from './StatusBadge.jsx';
 import { formatDateTime, formatDuration, shortId, shortSha } from '../utils/format.js';
 
+// What the automatic rollback of a deployment did, in a few words.
+function rollbackNote(deployment, numberOf) {
+  switch (deployment.rollback_status) {
+    case 'COMPLETED':
+      return `Rolled back to #${numberOf(deployment.rollback_deployment_id)}`;
+    case 'FAILED':
+      return 'Rollback failed';
+    case 'NOT_AVAILABLE':
+      return 'No stable version to roll back to';
+    default:
+      return null;
+  }
+}
+
 // Deployments of one application, newest first (the API's order). Numbers
 // count from the oldest deployment (#1).
 export default function DeploymentHistory({ project, deployments, error, loading, selectedId, onSelect, onDeploy }) {
   const [deploying, setDeploying] = useState(false);
   const [deployError, setDeployError] = useState(null);
+
+  function numberOf(id) {
+    const index = deployments.findIndex((deployment) => deployment.id === id);
+    return index >= 0 ? deployments.length - index : '?';
+  }
 
   async function deploy() {
     setDeploying(true);
@@ -30,6 +49,12 @@ export default function DeploymentHistory({ project, deployments, error, loading
       <p className="muted history__meta">
         {project.github_repo} · branch <code>{project.github_branch}</code> · <code>{project.dockerfile_path}</code>
         {project.container_port ? ` · port ${project.container_port}` : ''}
+        {project.health_check_path && (
+          <>
+            {' '}
+            · health check <code>{project.health_check_path}</code>
+          </>
+        )}
       </p>
 
       {deployError && <p className="notice notice--error">{deployError}</p>}
@@ -67,6 +92,16 @@ export default function DeploymentHistory({ project, deployments, error, loading
                   <td className="mono">{shortSha(deployment.commit_sha)}</td>
                   <td>
                     <StatusBadge status={deployment.status} />
+                    {deployment.is_stable && (
+                      <span className="tag tag--stable" title="The last stable deployment: the live version">
+                        Stable
+                      </span>
+                    )}
+                    {deployment.rollback_status && (
+                      <div className={`history__rollback history__rollback--${deployment.rollback_status.toLowerCase()}`}>
+                        {rollbackNote(deployment, numberOf)}
+                      </div>
+                    )}
                     {deployment.error_message && (
                       <div className="history__error" title={deployment.error_message}>
                         {deployment.error_message}

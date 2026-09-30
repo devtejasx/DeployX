@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import LogViewer from './LogViewer.jsx';
+import RollbackSummary from './RollbackSummary.jsx';
 import StatusBadge from './StatusBadge.jsx';
 import StatusSteps from './StatusSteps.jsx';
 import { formatDateTime, formatDuration, isTerminal } from '../utils/format.js';
@@ -15,6 +16,16 @@ function useNow(active) {
   return now;
 }
 
+// What a deployment that is still running is doing, by status. The line
+// under it is always the latest log line the server sent.
+const ACTIVITY = {
+  QUEUED: 'Waiting for a worker…',
+  BUILDING: 'Building the image…',
+  DEPLOYING: 'Starting the container…',
+  HEALTH_CHECK: 'Running health checks…',
+  ROLLING_BACK: 'Health check failed. Restoring the previous stable version…',
+};
+
 function Field({ label, children }) {
   return (
     <div className="field">
@@ -24,9 +35,10 @@ function Field({ label, children }) {
   );
 }
 
-// One deployment: its facts, error and live logs. `stream` comes from
-// useDeploymentStream; its deployment is what the server last sent.
-export default function DeploymentDetails({ stream, number, onClose }) {
+// One deployment: its facts, rollback outcome, error and live logs. `stream`
+// comes from useDeploymentStream; its deployment is what the server last
+// sent. `numberOf(id)` gives the history number of another deployment.
+export default function DeploymentDetails({ stream, number, numberOf, onSelect, onClose }) {
   const { deployment, logs, connection, ended, error } = stream;
   const now = useNow(deployment && !isTerminal(deployment.status));
 
@@ -54,11 +66,23 @@ export default function DeploymentDetails({ stream, number, onClose }) {
         </button>
       </div>
 
-      <StatusSteps status={deployment.status} />
+      <StatusSteps status={deployment.status} rollbackStatus={deployment.rollback_status} />
+
+      {ACTIVITY[deployment.status] && (
+        <p className={`activity activity--${deployment.status.toLowerCase()}`} role="status">
+          <strong>{ACTIVITY[deployment.status]}</strong>
+          {logs.length > 0 && <span className="activity__line">{logs.at(-1).message}</span>}
+        </p>
+      )}
 
       <dl className="details__grid">
         <Field label="Status">
           <StatusBadge status={deployment.status} />
+          {deployment.is_stable && (
+            <span className="tag tag--stable" title="The last stable deployment of this application: the live version">
+              Stable
+            </span>
+          )}
         </Field>
         <Field label="Commit">
           <span className="mono">{deployment.commit_sha ?? 'branch head (resolved when built)'}</span>
@@ -92,6 +116,8 @@ export default function DeploymentDetails({ stream, number, onClose }) {
         </Field>
       </dl>
 
+      <RollbackSummary deployment={deployment} numberOf={numberOf} onSelect={onSelect} />
+
       {deployment.status === 'FAILED' && (
         <div className="notice notice--error" role="alert">
           <strong>Error</strong>
@@ -99,7 +125,13 @@ export default function DeploymentDetails({ stream, number, onClose }) {
         </div>
       )}
 
-      <LogViewer logs={logs} connection={connection} status={deployment.status} ended={ended} />
+      <LogViewer
+        logs={logs}
+        connection={connection}
+        status={deployment.status}
+        rollbackStatus={deployment.rollback_status}
+        ended={ended}
+      />
     </section>
   );
 }

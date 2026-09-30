@@ -199,6 +199,9 @@ button:disabled {
 
 .deployments__main {
   display: grid;
+  /* minmax(0, ...) lets a wide history table scroll inside its card instead
+     of stretching the cards past the page. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 20px;
   min-width: 0;
 }
@@ -327,6 +330,7 @@ button:disabled {
 .badge--building { --badge: var(--warn); }
 .badge--deploying { --badge: var(--info); }
 .badge--health_check { --badge: var(--info); }
+.badge--rolling_back { --badge: var(--warn); }
 .badge--success { --badge: var(--ok); }
 .badge--failed { --badge: var(--bad); }
 
@@ -334,12 +338,119 @@ button:disabled {
   animation: pulse 1.2s ease-in-out infinite;
 }
 
+/* ROLLING_BACK: a turning arrow instead of the dot. */
+.badge__icon {
+  display: inline-block;
+  line-height: 1;
+  animation: spin 1.4s linear infinite;
+}
+
 @keyframes pulse {
   50% { opacity: 0.25; }
 }
 
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .badge--running .badge__dot { animation: none; }
+  .badge--running .badge__dot,
+  .badge__icon { animation: none; }
+}
+
+/* ---- Phase 6: health checks, stable version and rollback ---- */
+
+.tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+
+.tag--stable {
+  color: var(--ok);
+}
+
+.history__rollback {
+  margin-top: 4px;
+  color: var(--muted);
+}
+
+.history__rollback--completed {
+  color: var(--ok);
+}
+
+.history__rollback--failed {
+  color: var(--bad);
+}
+
+.activity {
+  display: grid;
+  gap: 2px;
+  margin: 14px 0 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  font-size: 0.875rem;
+}
+
+.activity--rolling_back {
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+
+.activity__line {
+  color: var(--muted);
+  font-family: ui-monospace, 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.rollback {
+  margin: 16px 0 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.rollback__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px 20px;
+  margin: 0;
+}
+
+.rollback__outcome {
+  font-weight: 600;
+}
+
+.rollback__note {
+  margin: 8px 0 0;
+  font-size: 0.8125rem;
+  color: var(--muted);
+}
+
+.rollback--ok {
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  background: color-mix(in srgb, var(--ok) 6%, transparent);
+}
+
+.rollback--ok .rollback__outcome {
+  color: var(--ok);
+}
+
+.rollback--error {
+  border-color: color-mix(in srgb, var(--bad) 40%, transparent);
+  background: color-mix(in srgb, var(--bad) 6%, transparent);
+}
+
+.rollback--error .rollback__outcome {
+  color: var(--bad);
 }
 
 .details h3 {

@@ -34,8 +34,11 @@ export default function Deployments() {
     if (streamedStatus) reloadHistory();
   }, [streamedStatus, reloadHistory]);
 
-  const index = history.data?.findIndex((deployment) => deployment.id === deploymentId) ?? -1;
-  const number = index >= 0 ? history.data.length - index : '';
+  // Deployments are numbered from the oldest (#1); the API lists newest first.
+  function numberOf(id) {
+    const index = history.data?.findIndex((deployment) => deployment.id === id) ?? -1;
+    return index >= 0 ? history.data.length - index : '';
+  }
 
   async function deploy() {
     const { deployment } = await createDeployment(projectId);
@@ -72,7 +75,13 @@ export default function Deployments() {
         )}
 
         {project && deploymentId && (
-          <DeploymentDetails stream={stream} number={number} onClose={() => navigate(projectId)} />
+          <DeploymentDetails
+            stream={stream}
+            number={numberOf(deploymentId)}
+            numberOf={numberOf}
+            onSelect={(id) => navigate(projectId, id)}
+            onClose={() => navigate(projectId)}
+          />
         )}
       </div>
     </div>

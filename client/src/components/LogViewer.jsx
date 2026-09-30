@@ -9,9 +9,16 @@ const CONNECTION_LABELS = {
   failed: 'Stream unavailable',
 };
 
+// Closing line for a failed deployment, by its rollback outcome.
+const FAILURE_NOTES = {
+  COMPLETED: 'Deployment failed its health check. The previous stable version was restored.',
+  FAILED: 'Deployment failed its health check, and the automatic rollback failed.',
+  NOT_AVAILABLE: 'Deployment failed its health check. There was no stable version to roll back to.',
+};
+
 // Deployment log lines, following new lines while the reader is at the bottom
 // (scrolling up to read earlier output pauses the auto-scroll).
-export default function LogViewer({ logs, connection, status, ended }) {
+export default function LogViewer({ logs, connection, status, rollbackStatus, ended }) {
   const listRef = useRef(null);
   const stickToBottom = useRef(true);
 
@@ -48,7 +55,9 @@ export default function LogViewer({ logs, connection, status, ended }) {
       </ol>
 
       {ended && status === 'SUCCESS' && <p className="notice notice--ok">Deployment completed successfully.</p>}
-      {ended && status === 'FAILED' && <p className="notice notice--error">Deployment failed.</p>}
+      {ended && status === 'FAILED' && (
+        <p className="notice notice--error">{FAILURE_NOTES[rollbackStatus] ?? 'Deployment failed.'}</p>
+      )}
     </div>
   );
 }
