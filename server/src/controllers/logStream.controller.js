@@ -3,7 +3,7 @@ import { subscribeToDeployment } from '../events/deploymentSubscriber.js';
 import * as deploymentService from '../services/deployment.service.js';
 import * as logService from '../services/log.service.js';
 
-const TERMINAL_STATUSES = ['SUCCESS', 'FAILED'];
+const TERMINAL_STATUSES = ['SUCCESS', 'FAILED', 'ROLLBACK_FAILED'];
 // Browsers wait this long before reconnecting a dropped stream.
 const CLIENT_RETRY_MS = 3000;
 
@@ -27,11 +27,14 @@ function parseLogId(value) {
 //
 // 1. Stored logs after Last-Event-ID (all of them on a fresh connection) are
 //    sent first, then the current status.
-// 2. New lines and status changes follow as they happen. Redis events (and a
+// 2. New lines follow as they happen, and a status event is sent whenever the
+//    deployment record changes (its status, but also e.g. its health-check
+//    progress or container). Redis events (and a
 //    periodic check as a safety net) only trigger a re-read of PostgreSQL, so
 //    the stream is always in database order with no gaps or duplicates, even
 //    if an event is missed or Redis is down.
-// 3. The stream ends once the deployment is SUCCESS or FAILED.
+// 3. The stream ends once the deployment is final: SUCCESS, FAILED or
+//    ROLLBACK_FAILED.
 // 4. On disconnect everything is released: timers and the Redis listener.
 export async function streamLogs(req, res) {
   const userId = req.user.id;
@@ -41,7 +44,7 @@ export async function streamLogs(req, res) {
   await deploymentService.getDeployment(userId, deploymentId);
 
   let lastLogId = parseLogId(req.get('Last-Event-ID') ?? req.query.lastEventId);
-  let lastStatusSent = null;
+  let lastDeploymentSent = null;
   let closed = false;
   let syncing = false;
   let syncAgain = false;
@@ -78,8 +81,8 @@ export async function streamLogs(req, res) {
     res.end();
   }
 
-  // Sends every stored line newer than the last one sent, then the status if
-  // it changed; ends the stream on a final status.
+  // Sends every stored line newer than the last one sent, then the deployment
+  // if anything about it changed; ends the stream on a final status.
   async function sync() {
     for (;;) {
       const logs = await logService.listLogsAfter(deploymentId, lastLogId.toString());
@@ -91,9 +94,10 @@ export async function streamLogs(req, res) {
     }
 
     const deployment = await deploymentService.getDeployment(userId, deploymentId);
-    if (deployment.status !== lastStatusSent) {
+    const snapshot = JSON.stringify(deployment);
+    if (snapshot !== lastDeploymentSent) {
       send('status', deployment);
-      lastStatusSent = deployment.status;
+      lastDeploymentSent = snapshot;
     }
     if (TERMINAL_STATUSES.includes(deployment.status)) {
       send('end', { deploymentId, status: deployment.status });

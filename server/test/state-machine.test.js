@@ -1,7 +1,8 @@
 // The deployment state machine is enforced by PostgreSQL itself
 // (migrations 1790671094193_deployment-state-machine,
-// 1790767006154_rollback-and-stable-deployments and
-// 1790767291227_require-health-check-before-success): these tests exercise
+// 1790767006154_rollback-and-stable-deployments,
+// 1790767291227_health-check-required-and-image-id and
+// 1790775116221_rollback-failed-status-and-health-check-details): these tests exercise
 // transition_deployment_status() and the trigger directly.
 import assert from 'node:assert/strict';
 import { after, before, describe, test } from 'node:test';
@@ -49,6 +50,8 @@ describe('allowed transitions', () => {
     // Rollback: an unhealthy deployment restores the last stable one, then fails.
     ['HEALTH_CHECK', 'ROLLING_BACK'],
     ['ROLLING_BACK', 'FAILED'],
+    // ...or, when the stable one cannot be brought back, as ROLLBACK_FAILED.
+    ['ROLLING_BACK', 'ROLLBACK_FAILED'],
   ]) {
     test(`${from} -> ${to} passes`, async () => {
       const id = await deploymentIn(from);
@@ -86,6 +89,17 @@ describe('rejected transitions', () => {
     ['ROLLING_BACK', 'HEALTH_CHECK'],
     ['ROLLING_BACK', 'QUEUED'],
     ['ROLLING_BACK', 'BUILDING'],
+    // ROLLBACK_FAILED is only the outcome of a rollback...
+    ['HEALTH_CHECK', 'ROLLBACK_FAILED'],
+    ['DEPLOYING', 'ROLLBACK_FAILED'],
+    ['SUCCESS', 'ROLLBACK_FAILED'],
+    ['FAILED', 'ROLLBACK_FAILED'],
+    // ...and final, like SUCCESS and FAILED.
+    ['ROLLBACK_FAILED', 'FAILED'],
+    ['ROLLBACK_FAILED', 'SUCCESS'],
+    ['ROLLBACK_FAILED', 'ROLLING_BACK'],
+    ['ROLLBACK_FAILED', 'HEALTH_CHECK'],
+    ['ROLLBACK_FAILED', 'QUEUED'],
   ]) {
     test(`${from} -> ${to} fails and leaves the deployment unchanged`, async () => {
       const id = await deploymentIn(from);
@@ -146,6 +160,18 @@ describe('transition_deployment_status()', () => {
     assert.deepEqual(failed.started_at, building.started_at);
   });
 
+  test('ROLLBACK_FAILED finishes the deployment and carries its error, like FAILED', async () => {
+    const id = await deploymentIn('QUEUED');
+    const building = await transition(id, 'BUILDING');
+    for (const status of ['DEPLOYING', 'HEALTH_CHECK', 'ROLLING_BACK']) await transition(id, status);
+
+    const failed = await transition(id, 'ROLLBACK_FAILED', 'Rollback failed: the stable deployment is unhealthy too');
+    assert.equal(failed.status, 'ROLLBACK_FAILED');
+    assert.ok(failed.finished_at);
+    assert.equal(failed.error_message, 'Rollback failed: the stable deployment is unhealthy too');
+    assert.deepEqual(failed.started_at, building.started_at);
+  });
+
   test('setting the current status again is a no-op, and unknown deployments return nothing', async () => {
     const id = await deploymentIn('FAILED');
     const { rows: before } = await pool.query('SELECT * FROM deployments WHERE id = $1', [id]);
@@ -165,9 +191,9 @@ describe('transition_deployment_status()', () => {
       DEPLOYING: ['FAILED', 'HEALTH_CHECK', 'QUEUED'],
       HEALTH_CHECK: ['FAILED', 'QUEUED', 'ROLLING_BACK', 'SUCCESS'],
       QUEUED: ['BUILDING', 'FAILED'],
-      ROLLING_BACK: ['FAILED'],
+      ROLLING_BACK: ['FAILED', 'ROLLBACK_FAILED'],
     });
-    // SUCCESS and FAILED are final: nothing starts from them.
-    assert.ok(!rows.some((row) => ['SUCCESS', 'FAILED'].includes(row.from_status)));
+    // SUCCESS, FAILED and ROLLBACK_FAILED are final: nothing starts from them.
+    assert.ok(!rows.some((row) => ['SUCCESS', 'FAILED', 'ROLLBACK_FAILED'].includes(row.from_status)));
   });
 });

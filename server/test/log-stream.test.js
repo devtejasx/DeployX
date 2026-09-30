@@ -108,6 +108,54 @@ describe('live updates', () => {
     await waitFor(() => stream.ended);
   });
 
+  test('the stream stays open through a rollback and closes after ROLLBACK_FAILED', async () => {
+    const deployment = await createDeployment();
+    const stream = await openStream(deployment.id);
+    await stream.waitFor((e) => e.event === 'status');
+
+    for (const status of ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'ROLLING_BACK']) {
+      await setStatus(deployment.id, status);
+    }
+    await stream.waitFor((e) => e.event === 'status' && e.data.status === 'ROLLING_BACK');
+    await addLog(deployment.id, 'Rollback failed: the stable deployment is unhealthy too');
+    assert.equal(stream.ended, false);
+
+    await setStatus(deployment.id, 'ROLLBACK_FAILED');
+    const end = await stream.waitFor((e) => e.event === 'end');
+    assert.deepEqual(end.data, { deploymentId: deployment.id, status: 'ROLLBACK_FAILED' });
+    await waitFor(() => stream.ended);
+    assert.equal(stream.statuses().at(-1), 'ROLLBACK_FAILED');
+    assert.ok(stream.logs().includes('Rollback failed: the stable deployment is unhealthy too'));
+  });
+
+  test('a change of the deployment record is pushed even when its status stays the same', async () => {
+    config.logStream.pollMs = 100;
+    try {
+      const deployment = await createDeployment();
+      for (const status of ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK']) await setStatus(deployment.id, status);
+      const stream = await openStream(deployment.id);
+      await stream.waitFor((e) => e.event === 'status' && e.data.status === 'HEALTH_CHECK');
+
+      // As the worker does after each health-check attempt.
+      const progress = { status: 'RUNNING', attempts: 2, max_attempts: 5, status_code: 503 };
+      await pool.query('UPDATE deployments SET health_check = $2 WHERE id = $1', [deployment.id, progress]);
+
+      const update = await stream.waitFor((e) => e.event === 'status' && e.data.health_check?.attempts === 2, {
+        timeout: 2000,
+      });
+      assert.equal(update.data.status, 'HEALTH_CHECK');
+      assert.deepEqual(update.data.health_check, progress);
+
+      // Nothing changed since: no further status events.
+      const sent = stream.statuses().length;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      assert.equal(stream.statuses().length, sent);
+      stream.close();
+    } finally {
+      config.logStream.pollMs = 2000;
+    }
+  });
+
   test('a deployment that is already finished gets its logs, status and end at once', async () => {
     const deployment = await createDeployment();
     await setStatus(deployment.id, 'FAILED');

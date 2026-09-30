@@ -9,6 +9,7 @@ export const DEPLOYMENT_STATUSES = [
   'ROLLING_BACK',
   'SUCCESS',
   'FAILED',
+  'ROLLBACK_FAILED',
 ];
 
 // Abbreviated (7+) or full (40) hex commit hash, stored lower-case.

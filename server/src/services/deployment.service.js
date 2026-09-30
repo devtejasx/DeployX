@@ -8,9 +8,11 @@ import { getProject } from './project.service.js';
 // is_stable: this is the project's last stable deployment, i.e. its most
 // recently finished SUCCESS deployment (stable_deployment_id() in PostgreSQL,
 // the definition the worker uses to choose a rollback target).
+// health_check: what the worker recorded while checking the application
+// ({ status, attempts, max_attempts, status_code, response_time, error, ... }).
 const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.commit_sha, d.branch, d.status, d.docker_image,
   d.container_id, d.container_name, d.host_port, d.container_removed_at, d.error_message,
-  d.rollback_status, d.rollback_deployment_id,
+  d.health_check, d.rollback_status, d.rollback_deployment_id,
   COALESCE(d.id = stable_deployment_id(d.project_id), false) AS is_stable,
   d.started_at, d.finished_at, d.created_at, d.updated_at`;
 

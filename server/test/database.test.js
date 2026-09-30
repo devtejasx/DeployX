@@ -76,6 +76,7 @@ describe('schema', () => {
       'host_port',
       'container_removed_at',
       'error_message',
+      'health_check',
       'rollback_status',
       'rollback_deployment_id',
     ]) {
@@ -89,10 +90,25 @@ describe('schema', () => {
     const project = (await api.post('/api/projects', projectPayload())).body.data;
     const { deployment } = (await api.post(`/api/projects/${project.id}/deployments`, {})).body.data;
 
-    // ROLLING_BACK is a valid status.
-    await pool.query(`INSERT INTO deployments (project_id, branch, status) VALUES ($1, 'main', 'ROLLING_BACK')`, [
-      project.id,
+    // ROLLING_BACK and ROLLBACK_FAILED are valid statuses.
+    for (const status of ['ROLLING_BACK', 'ROLLBACK_FAILED']) {
+      await pool.query('INSERT INTO deployments (project_id, branch, status) VALUES ($1, $2, $3)', [
+        project.id,
+        'main',
+        status,
+      ]);
+    }
+    // Health-check details are one JSON object.
+    await pool.query(`UPDATE deployments SET health_check = '{"status": "PASSED", "attempts": 1}' WHERE id = $1`, [
+      deployment.id,
     ]);
+    for (const value of ['[]', '"PASSED"', '3']) {
+      await assert.rejects(
+        pool.query('UPDATE deployments SET health_check = $2::jsonb WHERE id = $1', [deployment.id, value]),
+        { code: '23514' },
+        `health_check ${value} should be rejected`,
+      );
+    }
     await assert.rejects(
       pool.query(`UPDATE deployments SET rollback_status = 'MAYBE' WHERE id = $1`, [deployment.id]),
       { code: '23514' },

@@ -35,6 +35,7 @@ async function finish(deployment, ...statuses) {
 const HEALTHY = ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'SUCCESS'];
 const UNHEALTHY = ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'FAILED'];
 const ROLLED_BACK = ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'ROLLING_BACK', 'FAILED'];
+const ROLLBACK_FAILED = ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'ROLLING_BACK', 'ROLLBACK_FAILED'];
 
 async function stableId(project) {
   const { rows } = await pool.query('SELECT stable_deployment_id($1) AS id', [project.id]);
@@ -99,12 +100,14 @@ describe('stable_deployment_id()', () => {
     await finish(unhealthy, ...UNHEALTHY);
     const rolledBack = await createDeployment(project);
     await finish(rolledBack, ...ROLLED_BACK);
+    const rollbackFailed = await createDeployment(project);
+    await finish(rollbackFailed, ...ROLLBACK_FAILED);
     const buildFailure = await createDeployment(project);
     await finish(buildFailure, 'BUILDING', 'FAILED');
 
     assert.equal(await stableId(project), stable.id);
     const rows = await history(project);
-    assert.equal(rows.length, 4);
+    assert.equal(rows.length, 5);
     assert.deepEqual(rows.filter((deployment) => deployment.is_stable).map((deployment) => deployment.id), [stable.id]);
   });
 
@@ -177,5 +180,44 @@ describe('rollback fields on a deployment', () => {
     const failed = await patch('FAILED');
     assert.equal(failed.body.data.status, 'FAILED');
     assert.ok(failed.body.data.finished_at);
+  });
+
+  test('ROLLBACK_FAILED can be reached only from ROLLING_BACK, and is final', async () => {
+    const project = await createProject();
+    const deployment = await createDeployment(project);
+    const patch = (status) => api.patch(`/api/deployments/${deployment.id}/status`, { status });
+
+    for (const status of ['BUILDING', 'DEPLOYING', 'HEALTH_CHECK']) await patch(status);
+    const tooEarly = await patch('ROLLBACK_FAILED');
+    assert.equal(tooEarly.status, 409);
+    assert.deepEqual(tooEarly.body.error, {
+      message: 'Invalid deployment state transition',
+      from: 'HEALTH_CHECK',
+      to: 'ROLLBACK_FAILED',
+    });
+
+    await patch('ROLLING_BACK');
+    const failed = await patch('ROLLBACK_FAILED');
+    assert.equal(failed.status, 200);
+    assert.equal(failed.body.data.status, 'ROLLBACK_FAILED');
+    assert.ok(failed.body.data.finished_at);
+    assert.equal(failed.body.data.is_stable, false);
+
+    for (const status of ['FAILED', 'SUCCESS', 'ROLLING_BACK', 'QUEUED']) {
+      assert.equal((await patch(status)).status, 409, `ROLLBACK_FAILED -> ${status}`);
+    }
+  });
+
+  test('the API returns the health-check details recorded for a deployment', async () => {
+    const project = await createProject();
+    const deployment = await createDeployment(project);
+    assert.equal(deployment.health_check, null);
+
+    const details = { status: 'PASSED', attempts: 2, max_attempts: 5, status_code: 200, response_time: 38, error: null };
+    await pool.query('UPDATE deployments SET health_check = $2 WHERE id = $1', [deployment.id, details]);
+
+    assert.deepEqual((await api.get(`/api/deployments/${deployment.id}`)).body.data.health_check, details);
+    const [listed] = await history(project);
+    assert.deepEqual(listed.health_check, details);
   });
 });
