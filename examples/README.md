@@ -1,10 +1,11 @@
 # DeployX test apps
 
-Small apps used to test the Docker deployment pipeline (Phase 4). This public repository doubles as the **test repository**: create a DeployX project pointing at `https://github.com/devtejasx/DeployX` and pick an app with `dockerfile_path`. The build context is always the repository root.
+Small apps used to test the Docker deployment pipeline (Phase 4) and health checks with automatic rollback (Phase 6). This public repository doubles as the **test repository**: create a DeployX project pointing at `https://github.com/devtejasx/DeployX` and pick an app with `dockerfile_path`. The build context is always the repository root.
 
 | App | `dockerfile_path` | `container_port` | Expected result |
 | --- | ----------------- | ---------------- | --------------- |
-| [hello-app](hello-app) | `examples/hello-app/Dockerfile` | `3000` | `SUCCESS`; `GET /` returns `Hello from DeployX` |
+| [hello-app](hello-app) | `examples/hello-app/Dockerfile` | `3000` | `SUCCESS`; `GET /` returns `Hello from DeployX`, `GET /health` returns `200` |
+| [unhealthy-app](unhealthy-app) | `examples/unhealthy-app/Dockerfile` | `3000` | the container keeps running, but `GET /health` returns `503`, so `FAILED` (and a rollback to the last stable deployment, if there is one) |
 | [crash-app](crash-app) | `examples/crash-app/Dockerfile` | `3000` | image builds, container exits, so `FAILED` |
 | [broken-dockerfile](broken-dockerfile) | `examples/broken-dockerfile/Dockerfile` | `3000` | `docker build` fails, so `FAILED` |
 | (none) | `examples/does-not-exist/Dockerfile` | `3000` | `Dockerfile not found`, so `FAILED` |
