@@ -27,6 +27,7 @@ describe('POST /api/projects', () => {
     assert.equal(body.data.github_branch, 'main');
     assert.equal(body.data.dockerfile_path, 'Dockerfile');
     assert.equal(body.data.container_port, 8080);
+    assert.equal(body.data.health_check_path, '/health');
     assert.equal(body.data.status, 'ACTIVE');
     assert.ok(body.data.user_id);
     assert.ok(body.data.created_at);
@@ -70,6 +71,32 @@ describe('POST /api/projects', () => {
 
     const asString = await api.post('/api/projects', { ...projectPayload(), container_port: '3000' });
     assert.deepEqual(asString.body.error.details, ['Container port must be a number']);
+  });
+
+  test('accepts a custom health-check path and rejects anything that is not a plain absolute path', async () => {
+    for (const path of ['/', '/healthz', '/api/v1/status/', '/health?probe=1&full=0']) {
+      const { status, body } = await api.post('/api/projects', { ...projectPayload(), health_check_path: path });
+      assert.equal(status, 201, `path ${path} should be accepted`);
+      assert.equal(body.data.health_check_path, path);
+    }
+
+    for (const path of [
+      'health',
+      '//evil.example/health',
+      'http://evil.example/health',
+      '/a//b',
+      '/has space',
+      '/@evil.example',
+      '/health#top',
+      `/${'a'.repeat(300)}`,
+    ]) {
+      const { status, body } = await api.post('/api/projects', { ...projectPayload(), health_check_path: path });
+      assert.equal(status, 400, `path ${path} should be rejected`);
+      assert.match(body.error.details[0], /^Health check path must be /);
+    }
+
+    const notAString = await api.post('/api/projects', { ...projectPayload(), health_check_path: 8080 });
+    assert.deepEqual(notAString.body.error.details, ['Health check path must be a string']);
   });
 
   test('rejects read-only and unknown fields', async () => {
@@ -141,10 +168,12 @@ describe('PUT /api/projects/:id', () => {
       description: 'After',
       github_branch: 'release/v2',
       container_port: 8081,
+      health_check_path: '/ready',
       status: 'INACTIVE',
     });
 
     assert.equal(status, 200);
+    assert.equal(body.data.health_check_path, '/ready');
     assert.equal(body.data.description, 'After');
     assert.equal(body.data.github_branch, 'release/v2');
     assert.equal(body.data.container_port, 8081);

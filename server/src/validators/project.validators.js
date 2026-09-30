@@ -47,6 +47,21 @@ const dockerfilePath = stringField('Dockerfile path')
 
 const status = enumField('Project status', PROJECT_STATUSES);
 
+// Path the worker requests on the deployed container to check its health.
+// An absolute path with an optional query string ("/health", "/api/status",
+// "/health?probe=1"): it can never name a scheme or another host. The same
+// rule is enforced by the database and re-checked by the worker.
+const HEALTH_CHECK_PATH_PATTERN =
+  /^\/(?:[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*\/?)?(?:\?[A-Za-z0-9._~=&-]*)?$/;
+
+const healthCheckPath = stringField('Health check path')
+  .trim()
+  .min(1, { error: 'Health check path is required' })
+  .max(255, { error: 'Health check path must be at most 255 characters' })
+  .regex(HEALTH_CHECK_PATH_PATTERN, {
+    error: 'Health check path must be an absolute path such as /health (no host, spaces or "//")',
+  });
+
 // Port the application listens on inside its container. Required: DeployX
 // never guesses it.
 const containerPort = z
@@ -67,6 +82,7 @@ export const createProjectSchema = z.strictObject({
   github_branch: branchField('GitHub branch').default('main'),
   dockerfile_path: dockerfilePath.default('Dockerfile'),
   container_port: containerPort,
+  health_check_path: healthCheckPath.default('/health'),
   status: status.default('ACTIVE'),
 });
 
@@ -79,6 +95,7 @@ export const updateProjectSchema = z
     github_branch: branchField('GitHub branch').optional(),
     dockerfile_path: dockerfilePath.optional(),
     container_port: containerPort.optional(),
+    health_check_path: healthCheckPath.optional(),
     status: status.optional(),
   })
   .refine((body) => Object.keys(body).length > 0, {

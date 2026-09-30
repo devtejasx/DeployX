@@ -31,6 +31,7 @@ describe('schema', () => {
       'projects_user_id_name_key',
       'deployments_project_id_created_at_idx',
       'deployment_logs_deployment_id_id_idx',
+      'deployments_stable_idx',
     ]) {
       assert.ok(names.includes(index), `missing index ${index}`);
     }
@@ -66,13 +67,48 @@ describe('schema', () => {
     );
   });
 
-  test('deployments expose container tracking fields', async () => {
+  test('deployments expose container tracking and rollback fields', async () => {
     const project = (await api.post('/api/projects', projectPayload())).body.data;
     const { deployment } = (await api.post(`/api/projects/${project.id}/deployments`, {})).body.data;
-    for (const field of ['container_id', 'container_name', 'host_port', 'container_removed_at', 'error_message']) {
+    for (const field of [
+      'container_id',
+      'container_name',
+      'host_port',
+      'container_removed_at',
+      'error_message',
+      'rollback_status',
+      'rollback_deployment_id',
+    ]) {
       assert.ok(field in deployment, `missing ${field}`);
       assert.equal(deployment[field], null);
     }
+    assert.equal(deployment.is_stable, false);
+  });
+
+  test('CHECK constraints guard the rollback and health-check columns', async () => {
+    const project = (await api.post('/api/projects', projectPayload())).body.data;
+    const { deployment } = (await api.post(`/api/projects/${project.id}/deployments`, {})).body.data;
+
+    // ROLLING_BACK is a valid status.
+    await pool.query(`INSERT INTO deployments (project_id, branch, status) VALUES ($1, 'main', 'ROLLING_BACK')`, [
+      project.id,
+    ]);
+    await assert.rejects(
+      pool.query(`UPDATE deployments SET rollback_status = 'MAYBE' WHERE id = $1`, [deployment.id]),
+      { code: '23514' },
+    );
+    await assert.rejects(
+      pool.query('UPDATE deployments SET rollback_deployment_id = gen_random_uuid() WHERE id = $1', [deployment.id]),
+      { code: '23503' },
+    );
+    for (const path of ['health', '//evil.example/health', 'http://evil.example/', '/has space', '']) {
+      await assert.rejects(
+        pool.query('UPDATE projects SET health_check_path = $2 WHERE id = $1', [project.id, path]),
+        { code: '23514' },
+        `health_check_path "${path}" should be rejected`,
+      );
+    }
+    await pool.query(`UPDATE projects SET health_check_path = '/api/v1/health?probe=1' WHERE id = $1`, [project.id]);
   });
 
   test('deleting a project cascades to its deployments and logs', async () => {

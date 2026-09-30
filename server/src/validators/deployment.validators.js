@@ -1,7 +1,15 @@
 import { z } from 'zod';
 import { branchField, enumField, stringField } from './common.js';
 
-export const DEPLOYMENT_STATUSES = ['QUEUED', 'BUILDING', 'DEPLOYING', 'HEALTH_CHECK', 'SUCCESS', 'FAILED'];
+export const DEPLOYMENT_STATUSES = [
+  'QUEUED',
+  'BUILDING',
+  'DEPLOYING',
+  'HEALTH_CHECK',
+  'ROLLING_BACK',
+  'SUCCESS',
+  'FAILED',
+];
 
 // Abbreviated (7+) or full (40) hex commit hash, stored lower-case.
 const commitSha = stringField('Commit SHA')

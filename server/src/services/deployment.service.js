@@ -5,8 +5,13 @@ import { ApiError } from '../utils/ApiError.js';
 import { transitionDeploymentStatus } from './deploymentStateMachine.js';
 import { getProject } from './project.service.js';
 
+// is_stable: this is the project's last stable deployment, i.e. its most
+// recently finished SUCCESS deployment (stable_deployment_id() in PostgreSQL,
+// the definition the worker uses to choose a rollback target).
 const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.commit_sha, d.branch, d.status, d.docker_image,
   d.container_id, d.container_name, d.host_port, d.container_removed_at, d.error_message,
+  d.rollback_status, d.rollback_deployment_id,
+  COALESCE(d.id = stable_deployment_id(d.project_id), false) AS is_stable,
   d.started_at, d.finished_at, d.created_at, d.updated_at`;
 
 // A single deployment, with a summary of the project it belongs to.

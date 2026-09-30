@@ -202,7 +202,7 @@ describe('PATCH /api/deployments/:deploymentId/status', () => {
       const response = await api.patch(`/api/deployments/${deployment.id}/status`, { status });
       assert.equal(response.status, 400, `status ${JSON.stringify(status)} should be rejected`);
       assert.deepEqual(response.body.error.details, [
-        'Deployment status must be one of: QUEUED, BUILDING, DEPLOYING, HEALTH_CHECK, SUCCESS, FAILED',
+        'Deployment status must be one of: QUEUED, BUILDING, DEPLOYING, HEALTH_CHECK, ROLLING_BACK, SUCCESS, FAILED',
       ]);
     }
 
