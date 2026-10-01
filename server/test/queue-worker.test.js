@@ -283,14 +283,14 @@ describe('retries and failures', () => {
       const current = await getDeploymentQueue().getJob(deployment.id);
       return (await current.getState()) === 'failed' ? current : null;
     });
-    // FAILED -> DEPLOYING is rejected, and the job ends without retries.
-    assert.equal(job.failedReason, 'Invalid deployment state transition: FAILED -> DEPLOYING');
+    // The worker's next stage change (DEPLOYING, or HEALTH_CHECK when the
+    // request landed after the build step ended) is rejected, and the job ends
+    // without retries.
+    assert.match(job.failedReason, /^Invalid deployment state transition: FAILED -> (DEPLOYING|HEALTH_CHECK)$/);
     assert.equal(job.attemptsMade, 1);
     assert.equal(await getStatus(deployment.id), 'FAILED');
     assert.ok(
-      (await logMessages(deployment.id)).includes(
-        'ERROR Attempt 1 of 3 failed: Invalid deployment state transition: FAILED -> DEPLOYING',
-      ),
+      (await logMessages(deployment.id)).includes(`ERROR Attempt 1 of 3 failed: ${job.failedReason}`),
     );
   });
 });
