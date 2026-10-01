@@ -92,8 +92,9 @@ export async function createProject(user, data) {
   }
 }
 
+// Returns { before, after }: the project as it was and as it is now.
 export async function updateProject(user, projectId, changes) {
-  await getProject(user, projectId);
+  const before = await getProject(user, projectId);
   const columns = UPDATABLE_COLUMNS.filter((column) => column in changes);
   const assignments = columns.map((column, index) => `${column} = $${index + 2}`);
   const values = columns.map((column) => changes[column]);
@@ -108,7 +109,7 @@ export async function updateProject(user, projectId, changes) {
     if (rows.length === 0) {
       throw ApiError.notFound('Project not found');
     }
-    return rows[0];
+    return { before, after: rows[0] };
   } catch (err) {
     rethrowConflict(err, changes);
   }

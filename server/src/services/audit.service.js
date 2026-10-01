@@ -4,7 +4,8 @@ import { logger } from '../lib/logger.js';
 // Audit log of security-sensitive actions (table audit_logs).
 //
 // Actions are "<area>.<verb>": auth.login, auth.login_failed, auth.logout,
-// auth.register, project.created, project.updated, project.deleted,
+// auth.register, project.created, project.updated, project.github_changed,
+// project.aws_changed, project.deleted,
 // deployment.created, deployment.status_changed, deployment.log_added,
 // webhook.push, access.denied. `details` is a small object of non-secret
 // facts (changed field names and values, the trigger, a reason); callers

@@ -136,6 +136,37 @@ describe('audit log', () => {
     assert.ok(denied.rows.some((row) => row.details.path === `/api/projects/${aliceProject.id}` && row.details.method === 'DELETE'));
   });
 
+  test('GitHub and AWS configuration changes are audited on their own, with old and new values', async () => {
+    const project = (await alice.post('/api/projects', projectPayload({ github_repo: 'https://github.com/alice/one' }))).body.data;
+    await alice.put(`/api/projects/${project.id}`, { description: 'only the description' });
+    await alice.put(`/api/projects/${project.id}`, { github_repo: 'https://github.com/alice/two', github_branch: 'release' });
+    await alice.put(`/api/projects/${project.id}`, {
+      deployment_target: 'AWS_ECS',
+      aws_ecs_service: 'alice-two',
+      aws_service_url: 'https://two.example.com',
+    });
+    // Sending the same values again is not a change.
+    await alice.put(`/api/projects/${project.id}`, { github_branch: 'release' });
+
+    const { rows } = await pool.query(
+      `SELECT action, details FROM audit_logs WHERE target_id = $1 AND action <> 'project.created' ORDER BY id`,
+      [project.id],
+    );
+    assert.deepEqual(
+      rows.map((row) => row.action),
+      ['project.updated', 'project.updated', 'project.github_changed', 'project.updated', 'project.aws_changed', 'project.updated'],
+    );
+    assert.deepEqual(rows[2].details, {
+      github_repo: { from: 'https://github.com/alice/one', to: 'https://github.com/alice/two' },
+      github_branch: { from: 'main', to: 'release' },
+    });
+    assert.deepEqual(rows[4].details, {
+      deployment_target: { from: 'LOCAL', to: 'AWS_ECS' },
+      aws_ecs_service: { from: null, to: 'alice-two' },
+      aws_service_url: { from: null, to: 'https://two.example.com' },
+    });
+  });
+
   test('GET /api/audit-logs: a USER reads its own entries, ADMIN every entry, newest first', async () => {
     const own = await bob.get('/api/audit-logs?limit=200');
     assert.equal(own.status, 200);
