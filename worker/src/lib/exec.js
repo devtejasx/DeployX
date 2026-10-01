@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { activeJobSignal } from './jobContext.js';
 
 // Variables a child process (git, docker) may inherit. Everything else -
 // DATABASE_URL, REDIS_URL and any other secret in the worker's environment -
@@ -58,15 +59,20 @@ export class CommandError extends Error {
 // `input` is written to the program's stdin: the way to hand it a secret
 // (e.g. `docker login --password-stdin`) without putting it in its arguments,
 // where other processes on the machine could read it.
+//
+// Inside a deployment job, the command is also killed when the deployment
+// exceeds DEPLOYMENT_TIMEOUT_MS (see lib/jobContext.js); commands started
+// after that (cleanup) are not affected.
 export function runCommand(
   command,
   args,
-  { cwd, env = childEnv(), timeoutMs = 60000, onLine, tailSize = 50, input } = {},
+  { cwd, env = childEnv(), timeoutMs = 60000, onLine, tailSize = 50, input, signal = activeJobSignal() } = {},
 ) {
   return new Promise((resolve, reject) => {
     const tail = [];
     const stdoutChunks = [];
     let timedOut = false;
+    let aborted = false;
 
     const child = spawn(command, args, {
       cwd,
@@ -110,14 +116,30 @@ export function runCommand(
       timedOut = true;
       child.kill('SIGKILL');
     }, timeoutMs);
+    const onAbort = () => {
+      aborted = true;
+      child.kill('SIGKILL');
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       reject(new CommandError(`Could not run ${command}: ${err.message}`, { tail }));
     });
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      if (aborted) {
+        reject(
+          new CommandError(`${command} ${args[0] ?? ''} was stopped: the deployment timed out`, {
+            timedOut: true,
+            tail,
+          }),
+        );
+        return;
+      }
       if (timedOut) {
         reject(
           new CommandError(`${command} ${args[0] ?? ''} timed out after ${Math.round(timeoutMs / 1000)}s`, {

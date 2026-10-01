@@ -5,6 +5,7 @@ import { logger } from './lib/logger.js';
 import { runCommand } from './lib/exec.js';
 import { startMonitoringServer } from './monitoringServer.js';
 import { startHeartbeat } from './services/heartbeat.js';
+import { createRecoveryService } from './services/recoveryService.js';
 import { sweepStaleWorkspaces } from './services/workspace.js';
 import { createDeploymentWorker } from './worker.js';
 
@@ -15,6 +16,7 @@ const heartbeat = startHeartbeat({ connection, getActiveJobs: activeJobs });
 // Job changes are reported at once, not only at the next interval.
 for (const event of ['active', 'completed', 'failed']) worker.on(event, () => heartbeat.beat());
 const monitoring = startMonitoringServer({ worker, connection, isStopping: () => shuttingDown });
+const recovery = createRecoveryService({ connection });
 
 // Graceful shutdown: stop taking new jobs (the heartbeat says "stopping"),
 // let running jobs finish, then close Redis and PostgreSQL. If running jobs
@@ -37,6 +39,7 @@ async function shutdown(signal) {
 
   try {
     await heartbeat.markStopping();
+    await recovery.stop();
     await close();
     await heartbeat.stop();
     await monitoring?.close();
@@ -93,6 +96,9 @@ logger.info('integrations', {
       : 'not configured (AWS_REGION, AWS_ECR_REPOSITORY, AWS_ECS_CLUSTER)',
   githubApp: github.appId && github.privateKey ? { appId: github.appId } : 'not configured: public repositories only',
 });
+
+// Deployments whose job was lost are ended, now and every RECOVERY_INTERVAL_MS.
+recovery.start();
 
 const swept = await sweepStaleWorkspaces().catch(() => 0);
 logger.info('workspaces', { root: config.workspace.root, removedStale: swept });

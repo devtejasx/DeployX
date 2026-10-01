@@ -3,6 +3,7 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import config from '../config/index.js';
+import { activeJobSignal } from '../lib/jobContext.js';
 import { healthCheckFailures } from '../lib/metrics.js';
 
 // Upper bound on attempts, whatever the configuration says.
@@ -316,6 +317,10 @@ export async function waitForHealthy({
   sleep = defaultSleep,
 }) {
   const maxAttempts = maxHealthCheckAttempts(retries);
+  // Stops early when the deployment times out while it waits (a health check
+  // started afterwards, e.g. of the restored stable version, runs in full).
+  const signal = activeJobSignal();
+  const timedOut = () => signal?.aborted;
 
   if (startupGracePeriod > 0) {
     await onLog('INFO', `Waiting ${startupGracePeriod / 1000}s for the application to start`);
@@ -324,6 +329,10 @@ export async function waitForHealthy({
 
   let result = { healthy: false, error: 'Health check did not run' };
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (timedOut()) {
+      await onLog('WARN', 'Health check stopped: the deployment timed out');
+      return { ...result, healthy: false, error: 'Deployment timed out during the health check', attempts: attempt - 1 };
+    }
     try {
       result = await check(baseUrl ? { baseUrl, path, timeout } : { host, port, path, timeout });
     } catch (err) {

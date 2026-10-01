@@ -104,9 +104,12 @@ export function buildImage({ contextDir, dockerfile, image, extraTags = [], labe
 // - not privileged, reduced capabilities, no-new-privileges
 // - memory, CPU and process limits, bounded log files
 // - only the app network, container port published on 127.0.0.1 only
+// - --pull never: only images this worker built (or restored by ID) run;
+//   nothing is ever fetched from a registry by name
 export async function runContainer({ image, name, containerPort, labels }) {
   const args = [
     'run', '--detach',
+    '--pull', 'never',
     '--name', name,
     '--network', config.docker.appNetwork,
     '--publish', `127.0.0.1::${containerPort}`,

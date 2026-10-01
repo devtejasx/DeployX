@@ -51,6 +51,25 @@ const config = {
     token: process.env.METRICS_TOKEN || '',
   },
 
+  // Upper bound for one attempt of a deployment, whatever it is doing. Each
+  // step has its own limit as well (git, build, push, ECS rollout, health
+  // checks); this one catches anything they do not. A deployment over it is
+  // stopped and FAILED without a retry.
+  deploymentTimeoutMs: positiveInt(process.env.DEPLOYMENT_TIMEOUT_MS, 30 * 60 * 1000),
+
+  // Unfinished deployments whose BullMQ job is gone (Redis data lost, job
+  // removed, failure not recorded while PostgreSQL was down) would stay
+  // QUEUED/BUILDING/... forever. Every RECOVERY_INTERVAL_MS one worker looks
+  // for deployments unchanged for STUCK_DEPLOYMENT_AFTER_MS and ends those
+  // without a live job (services/recoveryService.js).
+  recovery: {
+    intervalMs: positiveInt(process.env.RECOVERY_INTERVAL_MS, 60 * 1000),
+    staleAfterMs: positiveInt(process.env.STUCK_DEPLOYMENT_AFTER_MS, 10 * 60 * 1000),
+  },
+
+  // PostgreSQL: no single statement may run longer than this.
+  databaseStatementTimeoutMs: positiveInt(process.env.DATABASE_STATEMENT_TIMEOUT_MS, 30000),
+
   // How long a graceful shutdown waits for running jobs before forcing it.
   shutdownTimeoutMs: positiveInt(process.env.WORKER_SHUTDOWN_TIMEOUT_MS, 25000),
 
@@ -87,6 +106,9 @@ const config = {
     // How long an ECS rollout may take before it counts as failed, and how
     // often its progress is checked.
     deployTimeoutMs: positiveInt(process.env.AWS_ECS_DEPLOY_TIMEOUT_MS, 10 * 60 * 1000),
+    // Every AWS API call: time to connect, and to get the response.
+    connectionTimeoutMs: positiveInt(process.env.AWS_CONNECTION_TIMEOUT_MS, 5000),
+    requestTimeoutMs: positiveInt(process.env.AWS_REQUEST_TIMEOUT_MS, 30000),
     pollIntervalMs: positiveInt(process.env.AWS_ECS_POLL_INTERVAL_MS, 10 * 1000),
   },
 

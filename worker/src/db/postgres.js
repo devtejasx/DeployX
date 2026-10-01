@@ -10,6 +10,9 @@ const pool = new pg.Pool({
   max: Math.max(5, config.concurrency * 2 + 1),
   connectionTimeoutMillis: 5000,
   idleTimeoutMillis: 30000,
+  // A query that hangs (lock wait, overloaded server) fails instead of
+  // holding a job forever.
+  statement_timeout: config.databaseStatementTimeoutMs,
 });
 
 pool.on('error', (err) => {
@@ -30,7 +33,11 @@ export async function withProjectLock(projectId, fn) {
   const key = `deployx:project:${projectId}`;
   const client = await pool.connect();
   try {
+    // Waiting for the lock is waiting for another deployment of the project,
+    // which is bounded by its own timeouts: not limited by statement_timeout.
+    await client.query("SELECT set_config('statement_timeout', '0', false)");
     await client.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [key]);
+    await client.query('RESET statement_timeout');
   } catch (err) {
     client.release(true);
     throw err;

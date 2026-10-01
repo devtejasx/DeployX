@@ -39,7 +39,10 @@ services:
     # reach it inject or alter deployment jobs.
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-deployx-dev-redis}
-    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\""]
+    # appendonly: queued jobs survive a Redis restart. noeviction: Redis never
+    # drops queue keys to free memory (BullMQ requires it); it refuses writes
+    # instead, which the API reports.
+    command: ["sh", "-c", "exec redis-server --requirepass \"$REDIS_PASSWORD\" --appendonly yes --maxmemory-policy noeviction"]
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
@@ -55,6 +58,8 @@ services:
     build: ./server
     command: ["node", "src/db/migrate.js", "up"]
     restart: "no"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-deployx}:${POSTGRES_PASSWORD:-deployx}@postgres:5432/${POSTGRES_DB:-deployx}
     depends_on:
@@ -64,6 +69,10 @@ services:
   server:
     build: ./server
     restart: unless-stopped
+    # DeployX's own services need no Linux capabilities and never gain
+    # privileges (they run as the unprivileged "node" user).
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
     environment:
       NODE_ENV: ${NODE_ENV:-development}
       PORT: 5000
@@ -112,6 +121,8 @@ services:
   client:
     build: ./client
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
     environment:
       API_PROXY_TARGET: http://server:5000
     ports:
@@ -123,6 +134,8 @@ services:
   worker:
     build: ./worker
     restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
     environment:
       NODE_ENV: ${NODE_ENV:-development}
       DATABASE_URL: postgresql://${POSTGRES_USER:-deployx}:${POSTGRES_PASSWORD:-deployx}@postgres:5432/${POSTGRES_DB:-deployx}
@@ -140,6 +153,10 @@ services:
       DEPLOYX_APP_NETWORK: ${DEPLOYX_APP_NETWORK:-deployx-apps}
       DOCKER_BUILD_TIMEOUT_MS: ${DOCKER_BUILD_TIMEOUT_MS:-600000}
       CONTAINER_STARTUP_GRACE_MS: ${CONTAINER_STARTUP_GRACE_MS:-3000}
+      DEPLOYMENT_TIMEOUT_MS: ${DEPLOYMENT_TIMEOUT_MS:-1800000}
+      RECOVERY_INTERVAL_MS: ${RECOVERY_INTERVAL_MS:-60000}
+      STUCK_DEPLOYMENT_AFTER_MS: ${STUCK_DEPLOYMENT_AFTER_MS:-600000}
+      DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-30000}
       APP_MEMORY_LIMIT: ${APP_MEMORY_LIMIT:-512m}
       APP_CPU_LIMIT: ${APP_CPU_LIMIT:-1}
       # Health checks go to the app's port published on the Docker host, which

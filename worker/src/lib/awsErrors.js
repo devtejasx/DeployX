@@ -1,4 +1,20 @@
 import { UnrecoverableError } from 'bullmq';
+import config from '../config/index.js';
+
+// Options of every AWS SDK client of the worker: bounded connection and
+// request times (the SDK has none by default) and the SDK's own retries for
+// throttling and transient errors. Credentials come from the default chain
+// (an IAM role preferably), never from here.
+export function awsClientOptions() {
+  return {
+    region: config.aws.region,
+    maxAttempts: 3,
+    requestHandler: {
+      connectionTimeout: config.aws.connectionTimeoutMs,
+      requestTimeout: config.aws.requestTimeoutMs,
+    },
+  };
+}
 
 // AWS errors that another attempt cannot fix: missing or wrong credentials,
 // missing permissions, resources that do not exist, invalid requests. The

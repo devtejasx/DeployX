@@ -9,6 +9,8 @@ const pool = new pg.Pool({
   max: 10,
   connectionTimeoutMillis: 3000,
   idleTimeoutMillis: 30000,
+  // No API query may hang a request: it fails after this long instead.
+  statement_timeout: config.databaseStatementTimeoutMs,
 });
 
 // An idle client losing its connection must not crash the process.

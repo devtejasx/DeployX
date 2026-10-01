@@ -60,6 +60,8 @@ const config = {
   trustProxy: trustProxySetting(process.env.TRUST_PROXY),
   databaseUrl: process.env.DATABASE_URL || 'postgresql://deployx:deployx@localhost:5432/deployx',
   redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
+  // PostgreSQL: no single statement may run longer than this.
+  databaseStatementTimeoutMs: positiveInt(process.env.DATABASE_STATEMENT_TIMEOUT_MS, 15000),
   // BullMQ deployment queue. The worker must use the same prefix.
   queue: {
     prefix: process.env.QUEUE_PREFIX || 'deployx',

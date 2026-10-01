@@ -1,7 +1,7 @@
 import { DescribeImagesCommand, DescribeRepositoriesCommand, ECRClient, GetAuthorizationTokenCommand } from '@aws-sdk/client-ecr';
 import { UnrecoverableError } from 'bullmq';
 import config from '../config/index.js';
-import { awsError } from '../lib/awsErrors.js';
+import { awsClientOptions, awsError } from '../lib/awsErrors.js';
 import * as dockerService from './dockerService.js';
 
 // Amazon ECR: where AWS_ECS deployments' images are stored.
@@ -18,7 +18,7 @@ import * as dockerService from './dockerService.js';
 // service that tags, logs in and pushes.
 export function createEcrService({ client, docker = dockerService, repository = config.aws.ecrRepository } = {}) {
   let ecr = client;
-  const ecrClient = () => (ecr ??= new ECRClient({ region: config.aws.region }));
+  const ecrClient = () => (ecr ??= new ECRClient(awsClientOptions()));
 
   async function send(operation, command) {
     try {

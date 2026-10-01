@@ -7,7 +7,8 @@ import {
 } from '@aws-sdk/client-ecs';
 import { UnrecoverableError } from 'bullmq';
 import config from '../config/index.js';
-import { awsError } from '../lib/awsErrors.js';
+import { awsClientOptions, awsError } from '../lib/awsErrors.js';
+import { activeJobSignal } from '../lib/jobContext.js';
 
 // Amazon ECS (Fargate or EC2): runs AWS_ECS deployments.
 //
@@ -84,7 +85,7 @@ export function createAwsDeploymentService({
   now = Date.now,
 } = {}) {
   let ecs = client;
-  const ecsClient = () => (ecs ??= new ECSClient({ region: config.aws.region }));
+  const ecsClient = () => (ecs ??= new ECSClient(awsClientOptions()));
 
   async function send(operation, command) {
     try {
@@ -142,8 +143,12 @@ export function createAwsDeploymentService({
   // through `onLog` whenever it changes.
   async function waitForRollout({ service, deploymentId, onLog }) {
     const started = now();
+    const signal = activeJobSignal();
     let reported = null;
     for (;;) {
+      if (signal?.aborted) {
+        throw new EcsRolloutError(`ECS rollout of service ${service} stopped: the deployment timed out`);
+      }
       const current = await describeService(service);
       const deployment = current.deployments?.find((candidate) => candidate.id === deploymentId);
       if (!deployment) {

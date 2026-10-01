@@ -1,6 +1,8 @@
 import { UnrecoverableError } from 'bullmq';
 import config from '../config/index.js';
 import { RecordedFailureError } from '../lib/errors.js';
+import { runWithJobContext } from '../lib/jobContext.js';
+import { deploymentTimeouts } from '../lib/metrics.js';
 import { runDockerDeployment } from '../pipeline/dockerDeployment.js';
 import {
   TERMINAL_STATUSES,
@@ -28,7 +30,23 @@ function nextRetryDelayMs(job, attempt) {
 // job: loading the deployment, idempotency, attempt logging and failure
 // bookkeeping for BullMQ's retries. The pipeline itself does the work
 // (pipeline/dockerDeployment.js); tests can pass a fake one.
-export function createDeploymentProcessor({ pipeline = runDockerDeployment } = {}) {
+// How long a timed-out pipeline gets to stop and clean up (its running command
+// is killed at once; cleanup commands have their own limits) before the job
+// gives up waiting for it.
+const TIMEOUT_GRACE_MS = 2 * 60 * 1000;
+
+// 400 -> "0.4s", 90000 -> "1.5 minutes".
+function formatDuration(ms) {
+  if (ms < 60000) return `${Math.round(ms / 100) / 10}s`;
+  const minutes = Math.round((ms / 60000) * 10) / 10;
+  return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+}
+
+export function createDeploymentProcessor({
+  pipeline = runDockerDeployment,
+  timeoutMs = config.deploymentTimeoutMs,
+  timeoutGraceMs = TIMEOUT_GRACE_MS,
+} = {}) {
   return async function processDeployment(job) {
     if (job.name !== config.queue.jobName) {
       throw new UnrecoverableError(`Unknown job type "${job.name}"`);
@@ -91,10 +109,35 @@ export function createDeploymentProcessor({ pipeline = runDockerDeployment } = {
       },
     };
 
+    // DEPLOYMENT_TIMEOUT_MS: the whole attempt, whatever it is doing.
+    const controller = new AbortController();
+    const timeoutMessage = `Deployment timed out after ${formatDuration(timeoutMs)}`;
+    let graceTimer;
+    const timer = setTimeout(() => {
+      controller.abort();
+      deploymentTimeouts.inc();
+      logger.warn('deployment_timeout', { deploymentId, jobId: job.id, timeoutMs });
+      addLog(deploymentId, 'ERROR', `${timeoutMessage} (DEPLOYMENT_TIMEOUT_MS); stopping it`).catch(() => {});
+    }, timeoutMs);
+    // If the pipeline does not wind down after the abort, the job ends anyway.
+    const abandoned = new Promise((_, reject) => {
+      controller.signal.addEventListener('abort', () => {
+        graceTimer = setTimeout(() => reject(new Error(`${timeoutMessage}; it did not stop within ${formatDuration(timeoutGraceMs)}`)), timeoutGraceMs);
+      });
+    });
+
     try {
       await addLog(deploymentId, 'INFO', `Deployment job started (attempt ${attempt} of ${maxAttempts})`);
-      return await pipeline(context);
-    } catch (err) {
+      const running = runWithJobContext({ signal: controller.signal }, () => pipeline(context));
+      running.catch(() => {}); // settled below, or abandoned after the grace period
+      return await Promise.race([running, abandoned]);
+    } catch (caught) {
+      let err = caught;
+      // A timed-out attempt is final: another one would time out the same way.
+      if (controller.signal.aborted && !(err instanceof RecordedFailureError)) {
+        const message = caught.message.startsWith(timeoutMessage) ? caught.message : `${timeoutMessage}: ${caught.message}`;
+        err = new UnrecoverableError(message);
+      }
       // An unhealthy deployment: the pipeline already recorded the failure
       // and the rollback. The job just ends as failed, without a retry.
       if (err instanceof RecordedFailureError) throw err;
@@ -107,6 +150,9 @@ export function createDeploymentProcessor({ pipeline = runDockerDeployment } = {
         logger.error('failure_bookkeeping_failed', { jobId: job.id, deploymentId, err: bookkeepingError });
       }
       throw err;
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
     }
   };
 }
