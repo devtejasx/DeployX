@@ -89,6 +89,17 @@ const config = {
   },
   // Graceful shutdown: how long running requests get before the process exits.
   shutdownTimeoutMs: positiveInt(process.env.API_SHUTDOWN_TIMEOUT_MS, 10000),
+  // Alert thresholds of the monitoring overview (services/monitoring.service.js);
+  // monitoring/alert-rules.yml uses the same values for Prometheus.
+  alerts: {
+    queueBacklog: positiveInt(process.env.ALERT_QUEUE_BACKLOG, 10),
+    failureRate: Math.min(Number(process.env.ALERT_FAILURE_RATE) || 0.5, 1),
+    failureRateMinDeployments: positiveInt(process.env.ALERT_FAILURE_RATE_MIN_DEPLOYMENTS, 5),
+    repeatedRollbacks: positiveInt(process.env.ALERT_REPEATED_ROLLBACKS, 3),
+    healthCheckFailures: positiveInt(process.env.ALERT_HEALTH_CHECK_FAILURES, 3),
+    awsFailures: positiveInt(process.env.ALERT_AWS_FAILURES, 3),
+    stuckAfterMinutes: positiveInt(process.env.ALERT_STUCK_AFTER_MINUTES, 15),
+  },
   // Requests allowed per window (middleware/rateLimit.js).
   rateLimit: {
     apiPerMinute: positiveInt(process.env.RATE_LIMIT_API_PER_MINUTE, 300),

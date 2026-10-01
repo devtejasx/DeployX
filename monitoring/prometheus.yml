@@ -1,0 +1,37 @@
+# Prometheus scrape configuration for DeployX (example).
+#
+# The API serves /metrics on its own port; every worker serves /metrics on
+# WORKER_METRICS_PORT (9464). Both require "Authorization: Bearer
+# <METRICS_TOKEN>" when METRICS_TOKEN is set (always, in production). Put the
+# token in a file Prometheus can read, never in this file.
+#
+# Validate with:  promtool check config prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - alert-rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: deployx-api
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/deployx-metrics-token
+    static_configs:
+      - targets: ["server:5000"]
+
+  - job_name: deployx-worker
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/deployx-metrics-token
+    static_configs:
+      # One entry per worker (or service discovery, e.g. ecs_sd / dns_sd).
+      - targets: ["worker:9464"]

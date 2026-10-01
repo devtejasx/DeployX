@@ -9,6 +9,7 @@ import systemRoutes from './system.routes.js';
 import projectRoutes from './project.routes.js';
 import deploymentRoutes, { projectDeploymentRoutes } from './deployment.routes.js';
 import logRoutes from './log.routes.js';
+import monitoringRoutes from './monitoring.routes.js';
 
 const router = Router();
 
@@ -26,11 +27,12 @@ router.use('/auth', authRoutes);
 
 // Resource routes require a signed-in user. Which projects and deployments
 // that user may reach is decided by the services (see services/access.js).
-router.use(['/projects', '/deployments', '/audit-logs'], requireAuth);
+router.use(['/projects', '/deployments', '/audit-logs', '/monitoring'], requireAuth);
 router.use('/projects', projectRoutes);
 router.use('/projects/:projectId/deployments', projectDeploymentRoutes);
 router.use('/deployments', deploymentRoutes);
 router.use('/deployments/:deploymentId/logs', logRoutes);
 router.use('/audit-logs', auditRoutes);
+router.use('/monitoring', monitoringRoutes);
 
 export default router;

@@ -1,0 +1,126 @@
+# DeployX alert rules for Prometheus. The thresholds match the alerts the
+# dashboard shows (server/src/services/monitoring.service.js, ALERT_* settings).
+# Severity "critical" pages someone; "warning" goes to a chat channel (see
+# alertmanager.example.yml).
+#
+# Validate with:  promtool check rules alert-rules.yml
+groups:
+  - name: deployx-availability
+    rules:
+      - alert: DeployXApiDown
+        expr: up{job="deployx-api"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "DeployX API {{ $labels.instance }} cannot be scraped"
+          description: "The API has not answered /metrics for 2 minutes."
+
+      - alert: DeployXPostgresUnavailable
+        expr: max(deployx_dependency_up{dependency="postgres"}) == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "PostgreSQL is unreachable from the DeployX API"
+          description: "Deployments cannot be created or recorded. PostgreSQL is the source of truth: restore it first (README, backup and recovery)."
+
+      - alert: DeployXRedisUnavailable
+        expr: max(deployx_dependency_up{dependency="redis"}) == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Redis is unreachable from the DeployX API"
+          description: "No deployment can be queued or run; live logs fall back to polling."
+
+      - alert: DeployXWorkerUnavailable
+        expr: max(deployx_workers{status="running"}) == 0 or absent(deployx_workers{status="running"})
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "No DeployX worker is running"
+          description: "No worker heartbeat for 2 minutes: queued deployments will not start."
+
+  - name: deployx-deployments
+    rules:
+      - alert: DeployXQueueBacklog
+        expr: max(deployx_queue_depth) >= 10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} deployments are waiting for a worker"
+          description: "The queue has not drained for 10 minutes: add workers or raise WORKER_CONCURRENCY."
+
+      - alert: DeployXHighFailureRate
+        expr: |
+          (
+            sum(increase(deployx_deployments_failed_total[1h]))
+            / clamp_min(sum(increase(deployx_deployments_failed_total[1h])) + sum(increase(deployx_deployments_success_total[1h])), 1)
+          ) >= 0.5
+          and
+          (sum(increase(deployx_deployments_failed_total[1h])) + sum(increase(deployx_deployments_success_total[1h]))) >= 5
+        labels: { severity: warning }
+        annotations:
+          summary: "Half or more of the deployments in the last hour failed"
+
+      - alert: DeployXRollbackFailed
+        expr: sum(increase(deployx_deployments_failed_total{status="ROLLBACK_FAILED"}[15m])) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "A deployment could not be rolled back"
+          description: "A project may be serving an unhealthy version, or nothing. Check the deployment logs."
+
+      - alert: DeployXRepeatedRollbacks
+        expr: sum(increase(deployx_deployments_rollback_total{outcome=~"COMPLETED|FAILED"}[24h])) >= 3
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} automatic rollbacks in the last 24 hours"
+          description: "The dashboard monitoring panel names the projects."
+
+      - alert: DeployXHealthCheckFailures
+        expr: sum(increase(deployx_health_check_failures_total[1h])) >= 15
+        labels: { severity: warning }
+        annotations:
+          summary: "Many failed health-check attempts in the last hour"
+
+      - alert: DeployXAwsDeploymentFailures
+        expr: sum(increase(deployx_deployments_failed_total{target="AWS_ECS"}[1h])) >= 3
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} AWS deployments failed in the last hour"
+          description: "Check IAM permissions, the ECS service events and ECR (README, Phase 8 troubleshooting)."
+
+      - alert: DeployXStuckDeployments
+        expr: max(deployx_deployments_stuck) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} deployments have not progressed for 15 minutes"
+          description: "The worker recovery check ends deployments whose job was lost; anything left needs a look."
+
+      - alert: DeployXDeploymentTimeouts
+        expr: sum(increase(deployx_deployment_timeouts_total[1h])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Deployments hit DEPLOYMENT_TIMEOUT_MS"
+
+  - name: deployx-security
+    rules:
+      - alert: DeployXLoginFailures
+        expr: sum(increase(deployx_login_failures_total[15m])) >= 50
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} failed sign-ins in 15 minutes"
+          description: "Possible password guessing; rate limits are holding it back. Check the audit log (auth.login_failed)."
+
+      - alert: DeployXWebhookSignatureFailures
+        expr: sum(increase(deployx_webhook_deliveries_total{outcome="rejected_signature"}[1h])) >= 10
+        labels: { severity: warning }
+        annotations:
+          summary: "Webhook deliveries with invalid signatures"
+          description: "Someone is sending unsigned or forged GitHub deliveries, or the secret was rotated on one side only."
+
+      - alert: DeployXApiErrors
+        expr: sum(rate(deployx_http_request_errors_total[5m])) > 0.1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "The DeployX API answers with 5xx errors"
