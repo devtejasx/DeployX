@@ -9,6 +9,7 @@ Small apps used to test the Docker deployment pipeline (Phase 4) and health chec
 | [crash-app](crash-app) | `examples/crash-app/Dockerfile` | `3000` | image builds, container exits, so `FAILED` |
 | [broken-dockerfile](broken-dockerfile) | `examples/broken-dockerfile/Dockerfile` | `3000` | `docker build` fails, so `FAILED` |
 | (none) | `examples/does-not-exist/Dockerfile` | `3000` | `Dockerfile not found`, so `FAILED` |
+| [validation-app](validation-app) | `examples/validation-app/Dockerfile` | `3000` | chosen by its committed `version.json`: `healthy`, `unhealthy` (`/health` 503), `hang` (`/health` never answers), `crash` (exits on start) or `build-fail` (the build fails). Used for the [Phase 9 validation](../docs/PHASE9_VALIDATION.md): push a changed `version.json` to test each case through a real GitHub webhook |
 
 Each Dockerfile has a `Dockerfile.dockerignore` next to it, so the build context sent to Docker contains only the files that app needs, not the whole repository.
 
