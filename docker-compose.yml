@@ -119,7 +119,11 @@ services:
       retries: 5
 
   client:
-    build: ./client
+    # The Vite dev server. For production use the image target "production"
+    # (nginx with a strict CSP), see client/Dockerfile and README Phase 8.
+    build:
+      context: ./client
+      target: development
     restart: unless-stopped
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]

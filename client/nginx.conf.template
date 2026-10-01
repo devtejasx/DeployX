@@ -1,0 +1,40 @@
+# nginx for the production dashboard image (client/Dockerfile, target
+# "production"). Serves the built files and proxies /api to the DeployX API
+# (API_UPSTREAM, substituted when the container starts). Put it behind your
+# HTTPS load balancer; set the API's CLIENT_URL to the public origin and
+# TRUST_PROXY to the number of proxies in front of it.
+
+server {
+    listen 8080;
+    server_tokens off;
+    root /usr/share/nginx/html;
+    client_max_body_size 1m;
+
+    # The API answers JSON and Server-Sent Events (live logs): no buffering,
+    # long reads for the streams.
+    location /api/ {
+        proxy_pass ${API_UPSTREAM};
+        proxy_http_version 1.1;
+        # Host with its port: the API compares it with the browser Origin.
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+    }
+
+    # Hashed bundles never change.
+    location /assets/ {
+        include /etc/nginx/snippets/security-headers.conf;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files $uri =404;
+    }
+
+    # The single-page app: always the current index.html.
+    location / {
+        include /etc/nginx/snippets/security-headers.conf;
+        add_header Cache-Control "no-cache" always;
+        try_files $uri /index.html;
+    }
+}
