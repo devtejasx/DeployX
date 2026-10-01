@@ -13,8 +13,18 @@ function formatIssues(issues) {
 // Validates req.params and/or req.body against zod schemas. The parsed body
 // (trimmed, defaults applied, unknown fields rejected) replaces req.body, so
 // controllers only ever see validated data.
-export function validate({ params, body }) {
+// Query strings are validated into req.validatedQuery (req.query is a
+// getter in Express 5 and cannot be replaced).
+export function validate({ params, query, body }) {
   return (req, res, next) => {
+    if (query) {
+      const result = query.safeParse({ ...req.query });
+      if (!result.success) {
+        throw ApiError.badRequest('Validation failed', formatIssues(result.error.issues));
+      }
+      req.validatedQuery = result.data;
+    }
+
     if (params) {
       const result = params.safeParse(req.params);
       if (!result.success) {

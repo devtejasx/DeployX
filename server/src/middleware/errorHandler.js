@@ -1,3 +1,4 @@
+import { recordAudit } from '../services/audit.service.js';
 import { ApiError } from '../utils/ApiError.js';
 
 // PostgreSQL error codes that indicate bad input rather than a server fault.
@@ -41,6 +42,11 @@ export function errorHandler(err, req, res, next) {
   // are raised; only unexpected failures need a stack trace here.
   if (statusCode >= 500 && !(err instanceof ApiError)) {
     console.error(`[api] ${req.method} ${req.originalUrl} failed:`, err);
+  }
+
+  // A signed-in user reaching for something that is not theirs.
+  if (statusCode === 403 && req.user) {
+    recordAudit({ req, action: 'access.denied', details: { method: req.method, path: req.originalUrl.slice(0, 300), reason: message } });
   }
 
   const error = { message, ...extra };

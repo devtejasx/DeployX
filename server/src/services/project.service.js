@@ -1,5 +1,6 @@
 import { query } from '../db/postgres.js';
 import { ApiError } from '../utils/ApiError.js';
+import { assertAccess, isAdmin } from './access.js';
 import { AWS_ECS_CONFIG_ERROR } from '../validators/project.validators.js';
 
 const PROJECT_COLUMNS = `id, user_id, name, description, github_repo, github_branch,
@@ -39,26 +40,30 @@ function rethrowConflict(err, data) {
   throw err;
 }
 
-export async function listProjects(userId) {
+// A USER's own projects; every project for an ADMIN.
+export async function listProjects(user) {
   const { rows } = await query(
-    `SELECT ${PROJECT_COLUMNS} FROM projects WHERE user_id = $1 ORDER BY created_at DESC, id`,
-    [userId],
+    `SELECT ${PROJECT_COLUMNS} FROM projects WHERE $2::boolean OR user_id = $1 ORDER BY created_at DESC, id`,
+    [user.id, isAdmin(user)],
   );
   return rows;
 }
 
-export async function getProject(userId, projectId) {
-  const { rows } = await query(
-    `SELECT ${PROJECT_COLUMNS} FROM projects WHERE id = $1 AND user_id = $2`,
-    [projectId, userId],
-  );
+// The project, if `user` may reach it: 404 when it does not exist, 403 when
+// it belongs to someone else (see access.js).
+export async function getProject(user, projectId) {
+  const { rows } = await query(`SELECT ${PROJECT_COLUMNS} FROM projects WHERE id = $1`, [projectId]);
   if (rows.length === 0) {
     throw ApiError.notFound('Project not found');
   }
+  assertAccess(user, rows[0].user_id, 'project');
   return rows[0];
 }
 
-export async function createProject(userId, data) {
+// The owner is always the signed-in user: user_id is never read from the
+// request body (the schema rejects it).
+export async function createProject(user, data) {
+  const userId = user.id;
   try {
     const { rows } = await query(
       `INSERT INTO projects
@@ -87,17 +92,18 @@ export async function createProject(userId, data) {
   }
 }
 
-export async function updateProject(userId, projectId, changes) {
+export async function updateProject(user, projectId, changes) {
+  await getProject(user, projectId);
   const columns = UPDATABLE_COLUMNS.filter((column) => column in changes);
-  const assignments = columns.map((column, index) => `${column} = $${index + 3}`);
+  const assignments = columns.map((column, index) => `${column} = $${index + 2}`);
   const values = columns.map((column) => changes[column]);
 
   try {
     const { rows } = await query(
       `UPDATE projects SET ${assignments.join(', ')}
-       WHERE id = $1 AND user_id = $2
+       WHERE id = $1
        RETURNING ${PROJECT_COLUMNS}`,
-      [projectId, userId, ...values],
+      [projectId, ...values],
     );
     if (rows.length === 0) {
       throw ApiError.notFound('Project not found');
@@ -122,11 +128,9 @@ export async function findProjectsByRepository(repoUrl) {
 
 // Deployments and their logs are removed by ON DELETE CASCADE in the same
 // statement, so no orphan rows can remain.
-export async function deleteProject(userId, projectId) {
-  const { rows } = await query(
-    `DELETE FROM projects WHERE id = $1 AND user_id = $2 RETURNING ${PROJECT_COLUMNS}`,
-    [projectId, userId],
-  );
+export async function deleteProject(user, projectId) {
+  await getProject(user, projectId);
+  const { rows } = await query(`DELETE FROM projects WHERE id = $1 RETURNING ${PROJECT_COLUMNS}`, [projectId]);
   if (rows.length === 0) {
     throw ApiError.notFound('Project not found');
   }

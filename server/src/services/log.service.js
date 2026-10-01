@@ -8,16 +8,16 @@ const LOG_COLUMNS = 'id, deployment_id, level, message, created_at';
 // Most lines read per query by live streams.
 export const LOG_BATCH_SIZE = 500;
 
-// Inserts only if the deployment exists and belongs to the user, in one
-// statement, then publishes the line to live log streams.
-export async function addLog(userId, deploymentId, { level, message }) {
+// ADMIN only (routes/log.routes.js): the platform writes deployment logs
+// itself; this endpoint is an operator tool. Inserts only if the deployment
+// still exists, then publishes the line to live log streams.
+export async function addLog(user, deploymentId, { level, message }) {
+  await getDeployment(user, deploymentId);
   const { rows } = await query(
     `INSERT INTO deployment_logs (deployment_id, level, message)
-     SELECT d.id, $3, $4
-     FROM deployments d JOIN projects p ON p.id = d.project_id
-     WHERE d.id = $1 AND p.user_id = $2
+     SELECT id, $2, $3 FROM deployments WHERE id = $1
      RETURNING ${LOG_COLUMNS}`,
-    [deploymentId, userId, level, message],
+    [deploymentId, level, message],
   );
   if (rows.length === 0) {
     throw ApiError.notFound('Deployment not found');
@@ -42,8 +42,8 @@ export async function listLogsAfter(deploymentId, afterId) {
 
 // Chronological order. The identity id breaks ties between log lines written
 // within the same timestamp.
-export async function listLogs(userId, deploymentId) {
-  await getDeployment(userId, deploymentId);
+export async function listLogs(user, deploymentId) {
+  await getDeployment(user, deploymentId);
 
   const { rows } = await query(
     `SELECT ${LOG_COLUMNS} FROM deployment_logs WHERE deployment_id = $1 ORDER BY id`,

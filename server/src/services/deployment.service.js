@@ -2,6 +2,7 @@ import { query } from '../db/postgres.js';
 import { publishLog, publishStatus } from '../events/deploymentEvents.js';
 import { enqueueDeployment } from '../queues/deploymentQueue.js';
 import { ApiError } from '../utils/ApiError.js';
+import { assertAccess } from './access.js';
 import { transitionDeploymentStatus } from './deploymentStateMachine.js';
 import { getProject } from './project.service.js';
 
@@ -89,8 +90,8 @@ export async function queueDeployment(project, { commitSha = null, branch, trigg
 
 // A manual deployment, requested through the API. The API returns as soon as
 // the job is stored in Redis; the worker does the actual processing.
-export async function createDeployment(userId, projectId, data) {
-  const project = await getProject(userId, projectId);
+export async function createDeployment(user, projectId, data) {
+  const project = await getProject(user, projectId);
 
   if (project.status !== 'ACTIVE') {
     throw ApiError.conflict('Project is inactive; set its status to ACTIVE before deploying');
@@ -105,8 +106,8 @@ export async function createDeployment(userId, projectId, data) {
 }
 
 // Newest first.
-export async function listProjectDeployments(userId, projectId) {
-  await getProject(userId, projectId);
+export async function listProjectDeployments(user, projectId) {
+  await getProject(user, projectId);
 
   const { rows } = await query(
     `SELECT ${DEPLOYMENT_COLUMNS} FROM deployments d
@@ -117,26 +118,31 @@ export async function listProjectDeployments(userId, projectId) {
   return rows;
 }
 
-export async function getDeployment(userId, deploymentId) {
+// The deployment, if `user` may reach its project: 404 when it does not
+// exist, 403 when the project belongs to someone else.
+export async function getDeployment(user, deploymentId) {
   const { rows } = await query(
-    `SELECT ${DEPLOYMENT_DETAIL_COLUMNS}
+    `SELECT ${DEPLOYMENT_DETAIL_COLUMNS}, p.user_id AS owner_id
      FROM deployments d JOIN projects p ON p.id = d.project_id
-     WHERE d.id = $1 AND p.user_id = $2`,
-    [deploymentId, userId],
+     WHERE d.id = $1`,
+    [deploymentId],
   );
   if (rows.length === 0) {
     throw ApiError.notFound('Deployment not found');
   }
-  return rows[0];
+  const { owner_id: ownerId, ...deployment } = rows[0];
+  assertAccess(user, ownerId, 'deployment');
+  return deployment;
 }
 
 // Manual status change through the state machine: only transitions listed
 // in deployment_status_transitions are accepted (409 otherwise), and the
 // timestamps follow the database rules. The worker drives the status while
 // it processes a job; this override is not coordinated with a running job.
-export async function updateDeploymentStatus(userId, deploymentId, status) {
-  const before = await getDeployment(userId, deploymentId); // 404 unless it exists and is the user's
+// ADMIN only (routes/deployment.routes.js). Returns { before, after }.
+export async function updateDeploymentStatus(user, deploymentId, status) {
+  const before = await getDeployment(user, deploymentId);
   await transitionDeploymentStatus(deploymentId, status);
   if (before.status !== status) await publishStatus(deploymentId, status);
-  return getDeployment(userId, deploymentId);
+  return { before, after: await getDeployment(user, deploymentId) };
 }

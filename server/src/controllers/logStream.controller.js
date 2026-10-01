@@ -37,11 +37,12 @@ function parseLogId(value) {
 //    ROLLBACK_FAILED.
 // 4. On disconnect everything is released: timers and the Redis listener.
 export async function streamLogs(req, res) {
-  const userId = req.user.id;
+  const { user } = req;
   const { deploymentId } = req.params;
 
-  // Checked before streaming, so unknown deployments get a normal JSON 404.
-  await deploymentService.getDeployment(userId, deploymentId);
+  // Checked before streaming, so unknown deployments get a normal JSON 404
+  // (and other users' deployments a 403). Every later read checks again.
+  await deploymentService.getDeployment(user, deploymentId);
 
   let lastLogId = parseLogId(req.get('Last-Event-ID') ?? req.query.lastEventId);
   let lastDeploymentSent = null;
@@ -98,7 +99,7 @@ export async function streamLogs(req, res) {
   async function sync() {
     await sendNewLogs();
 
-    const deployment = await deploymentService.getDeployment(userId, deploymentId);
+    const deployment = await deploymentService.getDeployment(user, deploymentId);
     const final = TERMINAL_STATUSES.includes(deployment.status);
     // The worker commits a final status together with the deployment's last
     // log line. If that commit landed between the two reads above, the line
