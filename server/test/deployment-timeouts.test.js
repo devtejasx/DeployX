@@ -234,4 +234,20 @@ describe('recovery of deployments without a job', () => {
       await redis.quit();
     }
   });
+
+  // Found in the Phase 9 Redis outage: BullMQ prints errors of a queue without
+  // an 'error' listener raw with console.error, outside the JSON logs.
+  test('Redis errors of the recovery queue go through the structured logger', async () => {
+    const { EventEmitter } = await import('node:events');
+    const queue = Object.assign(new EventEmitter(), { close: async () => {} });
+    const service = recovery.createRecoveryService({ queue });
+    const warnings = console.warn.mock.calls.length;
+
+    // Throws if nothing listens for 'error'.
+    queue.emit('error', new Error('getaddrinfo ENOTFOUND redis'));
+
+    const logged = console.warn.mock.calls.slice(warnings).map((call) => String(call.arguments[0]));
+    assert.ok(logged.some((line) => line.includes('recovery_queue_error') && line.includes('ENOTFOUND')));
+    await service.stop();
+  });
 });

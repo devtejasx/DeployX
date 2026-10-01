@@ -33,6 +33,10 @@ export function createRecoveryService({
   staleAfterMs = config.recovery.staleAfterMs,
   queue = new Queue(config.queue.name, { connection, prefix: config.queue.prefix }),
 } = {}) {
+  // Without a listener, BullMQ prints Redis errors (e.g. during a Redis
+  // outage) raw with console.error instead of through the JSON logger.
+  queue.on('error', (err) => logger.warn('recovery_queue_error', { err }));
+
   async function jobState(deploymentId) {
     const job = await queue.getJob(deploymentId);
     return job ? job.getState() : 'missing';
