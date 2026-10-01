@@ -206,7 +206,9 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9464/health"]
+      # 127.0.0.1, not localhost: in the Alpine image localhost resolves to ::1
+      # only, and the monitoring server listens on IPv4 (WORKER_METRICS_HOST).
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9464/health"]
       interval: 15s
       timeout: 3s
       retries: 3
