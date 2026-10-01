@@ -13,6 +13,7 @@
     "migrate:down": "npm --prefix server run migrate:down",
     "test": "npm --prefix server test",
     "test:docker": "npm --prefix server run test:docker",
+    "test:client": "npm --prefix client test",
     "infra:up": "docker compose up -d postgres redis",
     "infra:down": "docker compose down",
     "docker:up": "docker compose up --build",

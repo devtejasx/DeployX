@@ -32,6 +32,12 @@ export default defineConfig({
       '/api': { target: apiTarget, changeOrigin: true },
     },
   },
+  // Frontend tests (npm test): components and API helpers in a simulated DOM.
+  test: {
+    environment: 'jsdom',
+    include: ['test/**/*.test.{js,jsx}'],
+    restoreMocks: true,
+  },
   preview: {
     port: 3000,
     headers: SECURITY_HEADERS,
