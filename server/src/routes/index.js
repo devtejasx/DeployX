@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticate, requireAuth } from '../middleware/auth.js';
+import { apiLimiter } from '../middleware/rateLimit.js';
 import auditRoutes from './audit.routes.js';
 import authRoutes from './auth.routes.js';
 import healthRoutes from './health.routes.js';
@@ -13,7 +14,9 @@ const router = Router();
 // Liveness: answers without touching PostgreSQL or Redis.
 router.use('/health', healthRoutes);
 
-// Everything below knows who is signed in (req.user, or null).
+// Everything below is rate-limited per client address, and knows who is
+// signed in (req.user, or null).
+router.use(apiLimiter);
 router.use(authenticate);
 router.use('/system', systemRoutes);
 router.use('/auth', authRoutes);

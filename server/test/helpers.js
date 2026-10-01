@@ -35,10 +35,23 @@ process.env.DEPLOYMENT_JOB_BACKOFF_MS = '200';
 // Cheap password hashes (2^12 instead of 2^17): tests create many accounts.
 process.env.PASSWORD_HASH_COST ||= '12';
 process.env.ALLOW_REGISTRATION ||= 'true';
+// Rate limits out of the way, except where a test file sets its own
+// (rate-limit.test.js).
+for (const name of [
+  'RATE_LIMIT_API_PER_MINUTE',
+  'RATE_LIMIT_LOGIN_PER_15_MINUTES',
+  'RATE_LIMIT_LOGIN_PER_EMAIL',
+  'RATE_LIMIT_REGISTER_PER_HOUR',
+  'RATE_LIMIT_WEBHOOKS_PER_MINUTE',
+  'RATE_LIMIT_DEPLOYMENTS_PER_MINUTE',
+  'RATE_LIMIT_PROJECTS_PER_HOUR',
+]) {
+  process.env[name] ||= '100000';
+}
 
 const { default: app } = await import('../src/app.js');
 const { default: pool, closePostgres } = await import('../src/db/postgres.js');
-const { connectRedis, closeRedis } = await import('../src/db/redis.js');
+const { default: redisConnection, connectRedis, closeRedis } = await import('../src/db/redis.js');
 const { runMigrations } = await import('../src/db/migrate.js');
 const { getDeploymentQueue, closeDeploymentQueue } = await import('../src/queues/deploymentQueue.js');
 const { closeSubscriber } = await import('../src/events/deploymentSubscriber.js');
@@ -102,6 +115,9 @@ export async function setupTestServer() {
 
   connectRedis();
   await getDeploymentQueue().obliterate({ force: true });
+  // Rate-limit counters of earlier runs.
+  const counters = await redisConnection.keys(`${process.env.QUEUE_PREFIX}:ratelimit:*`);
+  if (counters.length > 0) await redisConnection.del(...counters);
 
   const server = await new Promise((resolve) => {
     const listening = app.listen(0, '127.0.0.1', () => resolve(listening));

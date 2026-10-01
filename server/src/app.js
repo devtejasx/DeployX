@@ -3,6 +3,7 @@ import config from './config/index.js';
 import apiRoutes from './routes/index.js';
 import webhookRoutes from './routes/webhook.routes.js';
 import { notFound } from './middleware/notFound.js';
+import { webhookLimiter } from './middleware/rateLimit.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import {
   JSON_BODY_LIMIT,
@@ -23,7 +24,7 @@ app.use(noStore);
 
 // Webhooks read their raw body (signature verification), so they come before
 // the JSON parser. They carry no cookies and are authenticated by signature.
-app.use('/api/webhooks', webhookRoutes);
+app.use('/api/webhooks', webhookLimiter, webhookRoutes);
 
 app.use('/api', requireTrustedOrigin, requireJsonBody, express.json({ limit: JSON_BODY_LIMIT, strict: true }));
 app.use('/api', apiRoutes);

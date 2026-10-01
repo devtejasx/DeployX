@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import * as deploymentController from '../controllers/deployment.controller.js';
 import { requireRole } from '../middleware/auth.js';
+import { deploymentLimiter } from '../middleware/rateLimit.js';
 import { uuidParams, validate } from '../middleware/validation.js';
 import { createDeploymentSchema, updateDeploymentStatusSchema } from '../validators/deployment.validators.js';
 
@@ -10,6 +11,7 @@ const projectIdParams = uuidParams({ projectId: 'project' });
 
 projectDeploymentRoutes.post(
   '/',
+  deploymentLimiter,
   validate({ params: projectIdParams, body: createDeploymentSchema }),
   deploymentController.createDeployment,
 );

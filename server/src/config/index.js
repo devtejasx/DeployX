@@ -80,6 +80,16 @@ const config = {
   github: {
     webhookSecret: process.env.GITHUB_WEBHOOK_SECRET || '',
   },
+  // Requests allowed per window (middleware/rateLimit.js).
+  rateLimit: {
+    apiPerMinute: positiveInt(process.env.RATE_LIMIT_API_PER_MINUTE, 300),
+    loginPer15Minutes: positiveInt(process.env.RATE_LIMIT_LOGIN_PER_15_MINUTES, 10),
+    loginPerEmail: positiveInt(process.env.RATE_LIMIT_LOGIN_PER_EMAIL, 5),
+    registerPerHour: positiveInt(process.env.RATE_LIMIT_REGISTER_PER_HOUR, 5),
+    webhooksPerMinute: positiveInt(process.env.RATE_LIMIT_WEBHOOKS_PER_MINUTE, 120),
+    deploymentsPerMinute: positiveInt(process.env.RATE_LIMIT_DEPLOYMENTS_PER_MINUTE, 20),
+    projectsPerHour: positiveInt(process.env.RATE_LIMIT_PROJECTS_PER_HOUR, 30),
+  },
   // Sign-in (services/session.service.js, services/password.js).
   auth: {
     // Absolute lifetime of a session, and how long it survives without a request.
