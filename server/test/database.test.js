@@ -19,7 +19,7 @@ describe('schema', () => {
     );
     assert.deepEqual(
       rows.map((row) => row.table_name),
-      ['deployment_logs', 'deployment_status_transitions', 'deployments', 'projects', 'users'],
+      ['audit_logs', 'deployment_logs', 'deployment_status_transitions', 'deployments', 'projects', 'sessions', 'users'],
     );
   });
 
@@ -35,6 +35,12 @@ describe('schema', () => {
       'deployments_github_push_commit_key',
       'projects_github_repo_lower_idx',
       'projects_aws_ecs_service_key',
+      'sessions_user_id_idx',
+      'sessions_expires_at_idx',
+      'audit_logs_created_at_idx',
+      'audit_logs_user_id_created_at_idx',
+      'deployments_unfinished_idx',
+      'deployments_finished_at_idx',
     ]) {
       assert.ok(names.includes(index), `missing index ${index}`);
     }
@@ -216,7 +222,7 @@ describe('schema', () => {
     await pool.query(`UPDATE projects SET aws_ecs_service = 'my-app_1' WHERE id = $1`, [other.id]);
   });
 
-  test('the Phase 7 migration can be reverted and re-applied without losing rows', async () => {
+  test('the Phase 7 migration (and Phase 8 above it) can be reverted and re-applied without losing rows', async () => {
     const { runMigrations } = await import('../src/db/migrate.js');
     const { testDatabaseUrl } = await import('./helpers.js');
     const project = (await api.post('/api/projects', projectPayload())).body.data;
@@ -229,7 +235,7 @@ describe('schema', () => {
         )
       ).rows.map((row) => row.column_name);
 
-    await runMigrations({ direction: 'down', count: 1, databaseUrl: testDatabaseUrl, log: () => {} });
+    await runMigrations({ direction: 'down', count: 2, databaseUrl: testDatabaseUrl, log: () => {} });
     try {
       assert.ok(!(await columns('deployments')).includes('trigger'));
       assert.ok(!(await columns('projects')).includes('deployment_target'));
@@ -273,5 +279,98 @@ describe('database errors', () => {
     assert.equal(status, 500);
     assert.deepEqual(body, { success: false, error: { message: 'Internal server error' } });
     assert.ok(!JSON.stringify(body).includes('deployx'));
+  });
+});
+
+describe('Phase 8 schema: users, sessions and audit log', () => {
+  const HASH = `scrypt$12$8$1$${'a'.repeat(22)}$${'b'.repeat(43)}`;
+
+  async function insertUser(email, extra = {}) {
+    const { rows } = await pool.query(
+      'INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING *',
+      ['Schema user', email, extra.password_hash ?? null, extra.role ?? 'USER'],
+    );
+    return rows[0];
+  }
+
+  test('users get a role (USER by default) and only scrypt password hashes', async () => {
+    const user = await insertUser('schema-1@example.com');
+    assert.equal(user.role, 'USER');
+    assert.equal(user.password_hash, null);
+    await insertUser('schema-2@example.com', { role: 'ADMIN', password_hash: HASH });
+
+    await assert.rejects(insertUser('schema-3@example.com', { role: 'ROOT' }), { code: '23514' });
+    for (const hash of ['plaintext-password', '$2b$12$abcdefghijklmnopqrstuv', 'scrypt$12$8$1$salt with space$hash']) {
+      await assert.rejects(insertUser(`schema-${hash.length}@example.com`, { password_hash: hash }), { code: '23514' }, hash);
+    }
+  });
+
+  test('sessions store a 32-byte token hash, are unique and end with their user', async () => {
+    const user = await insertUser('schema-sessions@example.com');
+    const insert = (hash) =>
+      pool.query(`INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '1 hour')`, [
+        user.id,
+        hash,
+      ]);
+    const tokenHash = Buffer.alloc(32, 7);
+    await insert(tokenHash);
+    await assert.rejects(insert(tokenHash), { code: '23505' });
+    await assert.rejects(insert(Buffer.alloc(16, 1)), { code: '23514' });
+    await assert.rejects(
+      pool.query(`INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, now() - interval '1 hour')`, [
+        user.id,
+        Buffer.alloc(32, 9),
+      ]),
+      { code: '23514' },
+    );
+
+    await pool.query('DELETE FROM users WHERE id = $1', [user.id]);
+    const { rows } = await pool.query('SELECT count(*)::int AS n FROM sessions WHERE user_id = $1', [user.id]);
+    assert.equal(rows[0].n, 0);
+  });
+
+  test('audit entries need a dotted action and an object, and outlive their user', async () => {
+    const user = await insertUser('schema-audit@example.com');
+    const { rows } = await pool.query(
+      `INSERT INTO audit_logs (user_id, action, target_type, target_id, details)
+       VALUES ($1, 'project.created', 'project', 'x', '{"name": "a"}') RETURNING id`,
+      [user.id],
+    );
+    for (const [action, details] of [
+      ['Project Created', '{}'],
+      ['project', '{}'],
+      ['project.created', '[]'],
+    ]) {
+      await assert.rejects(
+        pool.query('INSERT INTO audit_logs (action, details) VALUES ($1, $2::jsonb)', [action, details]),
+        { code: '23514' },
+      );
+    }
+    await pool.query('DELETE FROM users WHERE id = $1', [user.id]);
+    const kept = await pool.query('SELECT user_id, action FROM audit_logs WHERE id = $1', [rows[0].id]);
+    assert.deepEqual(kept.rows[0], { user_id: null, action: 'project.created' });
+  });
+
+  test('the Phase 8 migration reverts and re-applies, keeping users and projects', async () => {
+    const { runMigrations } = await import('../src/db/migrate.js');
+    const { testDatabaseUrl } = await import('./helpers.js');
+    const project = (await api.post('/api/projects', projectPayload())).body.data;
+    const tables = async () =>
+      (await pool.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'`)).rows.map(
+        (row) => row.table_name,
+      );
+
+    await runMigrations({ direction: 'down', count: 1, databaseUrl: testDatabaseUrl, log: () => {} });
+    try {
+      assert.ok(!(await tables()).includes('sessions'));
+      assert.ok(!(await tables()).includes('audit_logs'));
+    } finally {
+      await runMigrations({ databaseUrl: testDatabaseUrl, log: () => {} });
+    }
+    assert.ok((await tables()).includes('sessions'));
+    const { rows } = await pool.query('SELECT u.role FROM projects p JOIN users u ON u.id = p.user_id WHERE p.id = $1', [
+      project.id,
+    ]);
+    assert.equal(rows.length, 1);
   });
 });
