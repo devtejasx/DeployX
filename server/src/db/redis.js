@@ -1,5 +1,6 @@
 import IORedis from 'ioredis';
 import config from '../config/index.js';
+import { logger } from '../lib/logger.js';
 
 // The API's single Redis connection. It serves the system status check and
 // the BullMQ deployment queue (see queues/deploymentQueue.js), so the API
@@ -20,14 +21,14 @@ let lastErrorMessage = null;
 redisConnection.on('error', (err) => {
   const message = err.message || err.code || String(err);
   if (message !== lastErrorMessage) {
-    console.error('[redis] connection error:', message);
+    logger.error('redis_connection_error', { msg: message });
     lastErrorMessage = message;
   }
 });
 
 redisConnection.on('ready', () => {
   lastErrorMessage = null;
-  console.log('[redis] connected');
+  logger.info('redis_connected');
 });
 
 // Start connecting in the background. The client keeps retrying on its own,
@@ -35,7 +36,7 @@ redisConnection.on('ready', () => {
 export function connectRedis() {
   if (redisConnection.status !== 'wait') return;
   redisConnection.connect().catch((err) => {
-    console.error('[redis] initial connection failed:', err.message || err.code);
+    logger.error('redis_initial_connection_failed', { err });
   });
 }
 

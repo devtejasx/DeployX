@@ -80,6 +80,13 @@ const config = {
   github: {
     webhookSecret: process.env.GITHUB_WEBHOOK_SECRET || '',
   },
+  // GET /metrics: scrapers send "Authorization: Bearer <METRICS_TOKEN>".
+  // Without a token the endpoint is open in development, off in production.
+  metrics: {
+    token: process.env.METRICS_TOKEN || '',
+  },
+  // Graceful shutdown: how long running requests get before the process exits.
+  shutdownTimeoutMs: positiveInt(process.env.API_SHUTDOWN_TIMEOUT_MS, 10000),
   // Requests allowed per window (middleware/rateLimit.js).
   rateLimit: {
     apiPerMinute: positiveInt(process.env.RATE_LIMIT_API_PER_MINUTE, 300),

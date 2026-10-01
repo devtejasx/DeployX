@@ -1,3 +1,4 @@
+import { webhookDeliveries } from '../lib/metrics.js';
 import { recordAudit } from '../services/audit.service.js';
 import * as githubWebhookService from '../services/githubWebhook.service.js';
 import { sendSuccess } from '../utils/response.js';
@@ -19,12 +20,14 @@ export async function receiveGitHubWebhook(req, res) {
       body: req.body,
     });
   } catch (err) {
+    webhookDeliveries.inc({ outcome: err.statusCode === 401 ? 'rejected_signature' : 'invalid' });
     if (err.statusCode === 401) {
       await recordAudit({ req, action: 'webhook.rejected', details: { reason: err.message } });
     }
     throw err;
   }
 
+  webhookDeliveries.inc({ outcome: 'accepted' });
   const { statusCode, data } = result;
   if (data.repository && data.commit_sha) {
     await recordAudit({

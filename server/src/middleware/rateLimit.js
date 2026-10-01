@@ -1,7 +1,9 @@
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
 import config from '../config/index.js';
 import redisConnection from '../db/redis.js';
+import { rateLimited } from '../lib/metrics.js';
 import { ApiError } from '../utils/ApiError.js';
+import { logger } from '../lib/logger.js';
 
 // Rate limits (express-rate-limit), counted in Redis so every API instance
 // shares them. Each limit is a fixed window per key (client IP, signed-in
@@ -70,7 +72,7 @@ export class RedisFallbackStore {
   warnFallback(err) {
     if (Date.now() - lastFallbackWarning > 60000) {
       lastFallbackWarning = Date.now();
-      console.warn('[ratelimit] Redis unavailable, counting rate limits in memory:', err?.message ?? 'not connected');
+      logger.warn('rate_limit_memory_fallback', { msg: 'Redis unavailable, counting rate limits in memory', err });
     }
   }
 
@@ -112,6 +114,8 @@ export class RedisFallbackStore {
 }
 
 function tooManyRequests(req, res, next, options) {
+  rateLimited.inc({ limiter: options.store.prefix.split(':ratelimit:')[1]?.replace(/:$/, '') ?? 'unknown' });
+  logger.warn('rate_limited', { requestId: req.id, ip: req.ip, userId: req.user?.id, path: req.originalUrl.split('?')[0] });
   const resetTime = req.rateLimit?.resetTime;
   const seconds = resetTime ? Math.max(Math.ceil((resetTime.getTime() - Date.now()) / 1000), 1) : Math.ceil(options.windowMs / 1000);
   next(new ApiError(429, `Too many requests; try again in ${seconds} seconds`));

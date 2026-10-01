@@ -1,5 +1,6 @@
 import redisConnection from '../db/redis.js';
 import { deploymentChannel } from './deploymentEvents.js';
+import { logger } from '../lib/logger.js';
 
 // Receives deployment events for live log streams (SSE).
 //
@@ -22,7 +23,7 @@ function getSubscriber() {
     subscriber.on('error', (err) => {
       const message = err.message || err.code || String(err);
       if (message !== lastError) {
-        console.error('[events] subscriber connection error:', message);
+        logger.error('event_subscriber_connection_error', { msg: message });
         lastError = message;
       }
     });
@@ -73,7 +74,7 @@ export async function subscribeToDeployment(deploymentId, listener) {
       await withTimeout(getSubscriber().subscribe(channel), 2000);
     } catch (err) {
       live = false;
-      console.warn(`[events] live events unavailable for deployment ${deploymentId}:`, err.message || err);
+      logger.warn('live_events_unavailable', { deploymentId, err });
     }
   }
 

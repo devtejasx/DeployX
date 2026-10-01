@@ -1,5 +1,6 @@
 import config from '../config/index.js';
 import redisConnection from '../db/redis.js';
+import { logger } from '../lib/logger.js';
 
 // Real-time deployment events over Redis Pub/Sub.
 //
@@ -27,7 +28,7 @@ async function publish(deploymentId, event) {
     // At most one warning a minute while Redis is down.
     if (Date.now() - lastWarning > 60000) {
       lastWarning = Date.now();
-      console.warn('[events] could not publish deployment event:', err.message || err);
+      logger.warn('deployment_event_publish_failed', { deploymentId, err });
     }
   }
 }

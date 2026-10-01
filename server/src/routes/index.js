@@ -3,6 +3,7 @@ import { authenticate, requireAuth } from '../middleware/auth.js';
 import { apiLimiter } from '../middleware/rateLimit.js';
 import auditRoutes from './audit.routes.js';
 import authRoutes from './auth.routes.js';
+import { getReadiness } from '../controllers/health.controller.js';
 import healthRoutes from './health.routes.js';
 import systemRoutes from './system.routes.js';
 import projectRoutes from './project.routes.js';
@@ -13,6 +14,8 @@ const router = Router();
 
 // Liveness: answers without touching PostgreSQL or Redis.
 router.use('/health', healthRoutes);
+// Readiness: PostgreSQL and Redis reachable, not shutting down.
+router.get('/ready', getReadiness);
 
 // Everything below is rate-limited per client address, and knows who is
 // signed in (req.user, or null).

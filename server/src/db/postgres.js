@@ -1,5 +1,6 @@
 import pg from 'pg';
 import config from '../config/index.js';
+import { logger } from '../lib/logger.js';
 
 // A single shared pool for the whole API. The schema itself is managed by
 // migrations in ./migrations (npm run migrate).
@@ -12,7 +13,7 @@ const pool = new pg.Pool({
 
 // An idle client losing its connection must not crash the process.
 pool.on('error', (err) => {
-  console.error('[postgres] idle client error:', err.message);
+  logger.error('postgres_idle_client_error', { err });
 });
 
 // Runs a parameterized query. User input must only ever be passed through

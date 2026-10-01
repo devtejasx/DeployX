@@ -6,6 +6,7 @@ import { parseGitHubRepo } from '../utils/github.js';
 import { branchField } from '../validators/common.js';
 import { queueDeployment } from './deployment.service.js';
 import { findProjectsByRepository } from './project.service.js';
+import { logger } from '../lib/logger.js';
 
 // GitHub push webhooks -> deployments.
 //
@@ -156,11 +157,15 @@ export async function handleGitHubDelivery({ event, deliveryId, signature, conte
   }
 
   const queued = deployments.filter((deployment) => !deployment.duplicate).length;
-  console.log(
-    `[webhook] push to ${summary.repository}@${branch} ${push.after.slice(0, 7)}` +
-      `${delivery ? ` (delivery ${delivery})` : ''}: ${queued} queued, ` +
-      `${deployments.length - queued} duplicate, ${ignored.length} ignored`,
-  );
+  logger.info('webhook_push', {
+    repository: summary.repository,
+    branch,
+    commitSha: push.after,
+    delivery,
+    queued,
+    duplicates: deployments.length - queued,
+    ignored: ignored.length,
+  });
 
   const message =
     deployments.length === 0

@@ -1,9 +1,11 @@
 import config from '../config/index.js';
+import { loginFailures } from '../lib/metrics.js';
 import { ApiError } from '../utils/ApiError.js';
 import { recordAudit } from './audit.service.js';
 import { hashPassword, needsRehash, verifyPassword } from './password.js';
 import { createSession, deleteExpiredSessions, deleteSession } from './session.service.js';
 import { findUserForSignIn, publicUser, recordSignIn, registerUser, updatePasswordHash } from './user.service.js';
+import { logger } from '../lib/logger.js';
 
 // One message for every failed sign-in, whether the email is unknown, the
 // account has no password or the password is wrong.
@@ -20,6 +22,8 @@ export async function login(req, { email, password }) {
   // response time does not tell whether the email is registered.
   const valid = await verifyPassword(password, account?.password_hash ?? null);
   if (!account || !valid) {
+    loginFailures.inc();
+    logger.warn('login_failed', { requestId: req.id, ip: req.ip, userId: account?.id });
     await recordAudit({ req, userId: account?.id ?? null, action: 'auth.login_failed', details: { email } });
     throw new ApiError(401, INVALID_CREDENTIALS);
   }

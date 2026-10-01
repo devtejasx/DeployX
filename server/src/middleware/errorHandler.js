@@ -1,5 +1,6 @@
 import { recordAudit } from '../services/audit.service.js';
 import { ApiError, defaultErrorCode } from '../utils/ApiError.js';
+import { logger } from '../lib/logger.js';
 
 // PostgreSQL error codes that indicate bad input rather than a server fault.
 // Validation should catch these first; this is the safety net.
@@ -47,7 +48,7 @@ export function errorHandler(err, req, res, next) {
   // Deliberate ApiErrors (e.g. 503 queue unavailable) are logged where they
   // are raised; only unexpected failures need a stack trace here.
   if (statusCode >= 500 && !(err instanceof ApiError)) {
-    console.error(`[api] ${req.method} ${req.originalUrl} failed:`, err);
+    logger.error('request_failed', { requestId: req.id, method: req.method, path: req.originalUrl.split('?')[0], err });
   }
 
   // A signed-in user reaching for something that is not theirs.

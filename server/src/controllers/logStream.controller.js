@@ -2,6 +2,7 @@ import config from '../config/index.js';
 import { subscribeToDeployment } from '../events/deploymentSubscriber.js';
 import * as deploymentService from '../services/deployment.service.js';
 import * as logService from '../services/log.service.js';
+import { logger } from '../lib/logger.js';
 
 const TERMINAL_STATUSES = ['SUCCESS', 'FAILED', 'ROLLBACK_FAILED'];
 // Browsers wait this long before reconnecting a dropped stream.
@@ -135,7 +136,7 @@ export async function streamLogs(req, res) {
         // E.g. the database is unavailable, or the project was deleted. End
         // the stream; the browser reconnects and resumes from Last-Event-ID.
         if (!closed) {
-          console.error(`[api] log stream for deployment ${deploymentId} failed:`, err.message || err);
+          logger.warn('log_stream_failed', { deploymentId, err });
           send('stream-error', { message: 'Log stream interrupted; reconnecting' });
           close();
         }

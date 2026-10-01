@@ -1,4 +1,5 @@
 import { query } from '../db/postgres.js';
+import { logger } from '../lib/logger.js';
 
 // Audit log of security-sensitive actions (table audit_logs).
 //
@@ -31,7 +32,7 @@ export async function recordAudit({ req = null, userId = req?.user?.id ?? null, 
       [userId, action, targetType, targetId === null ? null : String(targetId), ip, requestId, json],
     );
   } catch (err) {
-    console.error(`[audit] could not record ${action}:`, err.message || err);
+    logger.error('audit_record_failed', { action, err });
   }
 }
 

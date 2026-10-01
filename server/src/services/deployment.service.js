@@ -1,10 +1,12 @@
 import { query } from '../db/postgres.js';
 import { publishLog, publishStatus } from '../events/deploymentEvents.js';
 import { enqueueDeployment } from '../queues/deploymentQueue.js';
+import { deploymentsCreated } from '../lib/metrics.js';
 import { ApiError } from '../utils/ApiError.js';
 import { assertAccess } from './access.js';
 import { transitionDeploymentStatus } from './deploymentStateMachine.js';
 import { getProject } from './project.service.js';
+import { logger } from '../lib/logger.js';
 
 // is_stable: this is the project's last stable deployment, i.e. its most
 // recently finished SUCCESS deployment (stable_deployment_id() in PostgreSQL,
@@ -78,13 +80,23 @@ export async function queueDeployment(project, { commitSha = null, branch, trigg
   } catch (err) {
     // Without a job nothing would ever pick the deployment up, so record the
     // failure instead of leaving it QUEUED forever.
-    console.error(`[api] Could not queue deployment ${deployment.id}:`, err.message || err);
+    logger.error('deployment_queue_failed', { deploymentId: deployment.id, projectId: project.id, err });
     await transitionDeploymentStatus(deployment.id, 'FAILED', { errorMessage: 'Deployment queue is unavailable' });
     await appendLog(deployment.id, 'ERROR', 'Could not add the deployment job to the queue (Redis unavailable)');
     await publishStatus(deployment.id, 'FAILED');
     throw new ApiError(503, 'Deployment queue is unavailable; the deployment was marked as FAILED');
   }
 
+  deploymentsCreated.inc({ trigger, target: project.deployment_target });
+  logger.info('deployment_queued', {
+    deploymentId: deployment.id,
+    projectId: project.id,
+    jobId: job.id,
+    trigger,
+    target: project.deployment_target,
+    branch,
+    commitSha,
+  });
   return { deployment, jobId: job.id, duplicate: false };
 }
 

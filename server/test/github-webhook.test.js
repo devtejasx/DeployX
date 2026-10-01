@@ -133,7 +133,10 @@ describe('webhook security', () => {
     ];
 
     const everything = JSON.stringify(responses) + lines.join('\n');
-    assert.ok(lines.some((line) => line.startsWith('[webhook] push to octo-org/')), lines.join('\n'));
+    assert.ok(
+      lines.some((line) => line.includes('"event":"webhook_push"') && line.includes('"repository":"octo-org/')),
+      lines.join('\n'),
+    );
     assert.ok(!everything.includes(WEBHOOK_SECRET));
     assert.ok(!everything.includes(signature.slice('sha256='.length)));
     const logs = await logMessages(responses[0].body.data.deployments[0].deployment_id);

@@ -1,6 +1,7 @@
 import { Queue } from 'bullmq';
 import config from '../config/index.js';
 import redisConnection from '../db/redis.js';
+import { logger } from '../lib/logger.js';
 
 // Shared with the worker (worker/src/config/index.js): both sides must agree
 // on the queue name, job name and key prefix.
@@ -27,7 +28,7 @@ export function getDeploymentQueue() {
       },
     });
     queue.on('error', (err) => {
-      console.error('[queue] deployments queue error:', err.message || err);
+      logger.error('queue_error', { err });
     });
   }
   return queue;
