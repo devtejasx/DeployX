@@ -77,13 +77,16 @@ export function createFakeDocker() {
       return {
         Id: container.id,
         Name: `/${container.name}`,
-        State: { Running: container.running, ExitCode: container.running ? 0 : 1 },
+        State: { Running: container.running, Paused: Boolean(container.paused), ExitCode: container.running ? 0 : 1 },
+        // Like Docker, a paused container reports no published ports.
         NetworkSettings: {
-          Ports: {
-            [`${container.containerPort}/tcp`]: container.running
-              ? [{ HostIp: '127.0.0.1', HostPort: String(container.hostPort) }]
-              : null,
-          },
+          Ports: container.paused
+            ? {}
+            : {
+                [`${container.containerPort}/tcp`]: container.running
+                  ? [{ HostIp: '127.0.0.1', HostPort: String(container.hostPort) }]
+                  : null,
+              },
         },
       };
     },
@@ -126,6 +129,10 @@ export function createFakeDocker() {
     // A container that died: it still exists, but no longer runs.
     async crash(nameOrId) {
       await stopServer(find(nameOrId));
+    },
+    // "docker pause": still running, but frozen.
+    pause(nameOrId) {
+      find(nameOrId).paused = true;
     },
     async removeAll() {
       for (const container of containers.values()) await stopServer(container);

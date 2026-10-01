@@ -523,6 +523,26 @@ describe('automatic rollback', () => {
     assert.equal((await history(project)).length, 2);
   });
 
+  // Found in the Phase 9 real-environment test: Docker reports no ports for a
+  // paused container, and the reason used to say "no published port".
+  test('the rollback fails, with the right reason, when the stable container is paused', async () => {
+    const project = await createProject();
+    const a = await deployAndWait(project, healthy());
+    assert.equal(a.status, 'SUCCESS', a.error_message);
+    const aBefore = await row(a.id);
+
+    docker.pause(a.container_id);
+    const b = await deployAndWait(project, unhealthy(500));
+
+    assert.equal(b.status, 'ROLLBACK_FAILED');
+    assert.equal(b.rollback_status, 'FAILED');
+    assert.match(b.error_message, new RegExp(`Rollback to deployment ${a.id} failed: the stable container is paused$`));
+    const lines = await logLines(b.id);
+    assert.ok(lines.includes('ERROR Rollback failed: the stable container is paused'));
+    assert.ok(!lines.some((line) => /no published port|Rollback completed/.test(line)));
+    assert.deepEqual(await row(a.id), aBefore);
+  });
+
   test('the rollback fails when the stable image is no longer available', async () => {
     const project = await createProject();
     const a = await deployAndWait(project, healthy());

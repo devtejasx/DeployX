@@ -59,6 +59,9 @@ export function createLocalDockerTarget({ docker = dockerService } = {}) {
     if (!stable.container_id) return null;
     const inspection = await docker.inspectContainer(stable.container_id);
     if (!inspection?.State?.Running) return null;
+    // Docker reports no published ports for a paused container, which would
+    // otherwise be reported as "no published port" below.
+    if (inspection.State.Paused) throw new Error('the stable container is paused');
 
     const hostPort = firstPublishedHostPort(inspection);
     if (!hostPort) throw new Error('the stable container has no published port');
