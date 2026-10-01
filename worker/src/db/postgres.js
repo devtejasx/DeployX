@@ -1,5 +1,6 @@
 import pg from 'pg';
 import config from '../config/index.js';
+import { logger } from '../lib/logger.js';
 
 // The schema is owned by the API's migrations (server/src/db/migrations);
 // the worker only reads and updates deployments and appends logs.
@@ -12,7 +13,7 @@ const pool = new pg.Pool({
 });
 
 pool.on('error', (err) => {
-  console.error('[worker] postgres idle client error:', err.message);
+  logger.error('postgres_idle_client_error', { err });
 });
 
 // Parameterized queries only: user data goes in `params`, never in `text`.

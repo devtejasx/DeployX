@@ -36,6 +36,21 @@ const config = {
   // How many deployment jobs this worker process runs at the same time.
   concurrency: positiveInt(process.env.WORKER_CONCURRENCY, 2),
 
+  // Liveness in Redis (services/heartbeat.js): how often the worker reports.
+  heartbeat: {
+    intervalMs: positiveInt(process.env.HEARTBEAT_INTERVAL_MS, 10000),
+  },
+
+  // GET /health, /ready and /metrics of the worker (monitoringServer.js).
+  // WORKER_METRICS_PORT=off disables it. METRICS_TOKEN is shared with the API.
+  monitoring: {
+    port: ['off', 'false'].includes(process.env.WORKER_METRICS_PORT)
+      ? null
+      : nonNegativeInt(process.env.WORKER_METRICS_PORT, 9464),
+    host: process.env.WORKER_METRICS_HOST || '127.0.0.1',
+    token: process.env.METRICS_TOKEN || '',
+  },
+
   // How long a graceful shutdown waits for running jobs before forcing it.
   shutdownTimeoutMs: positiveInt(process.env.WORKER_SHUTDOWN_TIMEOUT_MS, 25000),
 

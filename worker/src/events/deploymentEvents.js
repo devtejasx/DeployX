@@ -1,4 +1,5 @@
 import config from '../config/index.js';
+import { logger } from '../lib/logger.js';
 
 // Publishes real-time deployment events to Redis Pub/Sub, in the same format
 // and on the same per-deployment channels as the API
@@ -31,7 +32,7 @@ async function publish(deploymentId, event) {
   } catch (err) {
     if (Date.now() - lastWarning > 60000) {
       lastWarning = Date.now();
-      console.warn('[worker] could not publish deployment event:', err.message || err);
+      logger.warn('deployment_event_publish_failed', { deploymentId, err });
     }
   }
 }

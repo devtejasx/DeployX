@@ -130,6 +130,13 @@ services:
       QUEUE_PREFIX: ${QUEUE_PREFIX:-deployx}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
       WORKER_SHUTDOWN_TIMEOUT_MS: ${WORKER_SHUTDOWN_TIMEOUT_MS:-25000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      HEARTBEAT_INTERVAL_MS: ${HEARTBEAT_INTERVAL_MS:-10000}
+      # /health, /ready and /metrics inside the Compose network only (not published).
+      WORKER_METRICS_PORT: 9464
+      WORKER_METRICS_HOST: 0.0.0.0
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       DEPLOYX_APP_NETWORK: ${DEPLOYX_APP_NETWORK:-deployx-apps}
       DOCKER_BUILD_TIMEOUT_MS: ${DOCKER_BUILD_TIMEOUT_MS:-600000}
       CONTAINER_STARTUP_GRACE_MS: ${CONTAINER_STARTUP_GRACE_MS:-3000}
@@ -176,6 +183,11 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9464/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
     # Give running jobs time to finish on `docker compose stop` (default is 10s).
     stop_grace_period: 30s
 

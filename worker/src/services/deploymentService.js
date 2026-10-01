@@ -1,6 +1,8 @@
 import { UnrecoverableError } from 'bullmq';
 import { query } from '../db/postgres.js';
 import { publishLog, publishStatus } from '../events/deploymentEvents.js';
+import { recordDeploymentOutcome, rollbacks } from '../lib/metrics.js';
+import { logger } from '../lib/logger.js';
 
 // Final statuses: a deployment in one of them is never changed again.
 export const TERMINAL_STATUSES = ['SUCCESS', 'FAILED', 'ROLLBACK_FAILED'];
@@ -75,6 +77,8 @@ export async function transitionDeploymentStatus(deploymentId, status, { message
     const { log, ...deployment } = rows[0];
     await publishLog(deploymentId, log);
     await publishStatus(deploymentId, deployment.status);
+    if (TERMINAL_STATUSES.includes(deployment.status)) recordDeploymentOutcome(deployment);
+    else logger.info('deployment_status_changed', { deploymentId, projectId: deployment.project_id, status: deployment.status });
     return deployment;
   } catch (err) {
     if (err.code === INVALID_TRANSITION) throw invalidTransition(err);
@@ -93,18 +97,21 @@ export async function markFailed(deploymentId, errorMessage, message, { status =
       `WITH current AS (
          SELECT id FROM deployments WHERE id = $1 AND status <> ALL($4::varchar[])
        ), updated AS (
-         SELECT t.id FROM current CROSS JOIN LATERAL transition_deployment_status(current.id, $5, $2) AS t
+         SELECT t.id, t.project_id, t.status, t.deployment_target, t.started_at, t.created_at, t.finished_at, t.error_message
+         FROM current CROSS JOIN LATERAL transition_deployment_status(current.id, $5, $2) AS t
        ), logged AS (
          INSERT INTO deployment_logs (deployment_id, level, message)
          SELECT id, 'ERROR', $3 FROM updated
          ${LOG_RETURNING}
        )
-       SELECT (SELECT row_to_json(logged) FROM logged) AS log FROM updated`,
+       SELECT updated.*, (SELECT row_to_json(logged) FROM logged) AS log FROM updated`,
       [deploymentId, clip(errorMessage, MAX_ERROR_LENGTH), clip(message, MAX_LOG_LENGTH), TERMINAL_STATUSES, status],
     );
     if (rows.length === 0) return false;
-    await publishLog(deploymentId, rows[0].log);
+    const { log, ...deployment } = rows[0];
+    await publishLog(deploymentId, log);
     await publishStatus(deploymentId, status);
+    recordDeploymentOutcome(deployment);
     return true;
   } catch (err) {
     // It reached a final state concurrently: nothing to mark.
@@ -206,6 +213,8 @@ export async function recordHealthCheck(deploymentId, details, { reset = false }
 // Outcome of the automatic rollback of an unhealthy deployment:
 // COMPLETED, FAILED or NOT_AVAILABLE, and the stable deployment it targeted.
 export async function recordRollback(deploymentId, { status, rollbackDeploymentId = null }) {
+  rollbacks.inc({ outcome: status });
+  logger.info('rollback_finished', { deploymentId, outcome: status, rollbackDeploymentId });
   await query('UPDATE deployments SET rollback_status = $2, rollback_deployment_id = $3 WHERE id = $1', [
     deploymentId,
     status,

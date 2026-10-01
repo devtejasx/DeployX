@@ -2,6 +2,8 @@ import { Worker } from 'bullmq';
 import config from './config/index.js';
 import { createRedisConnection } from './config/redis.js';
 import { clearEventPublisher, setEventPublisher } from './events/deploymentEvents.js';
+import { logger } from './lib/logger.js';
+import { jobsActive, jobsCompleted, jobsFailed } from './lib/metrics.js';
 import { createDeploymentProcessor } from './processors/deploymentProcessor.js';
 import { markFailed } from './services/deploymentService.js';
 
@@ -21,33 +23,59 @@ export function createDeploymentWorker({
     concurrency,
   });
 
+  // Jobs this worker runs right now (heartbeat, metrics).
+  const active = new Set();
+  const jobFields = (job) => ({ jobId: job?.id, deploymentId: job?.data?.deploymentId, projectId: job?.data?.projectId });
+
   worker.on('active', (job) => {
-    console.log(`[worker] job ${job.id} started (attempt ${job.attemptsMade + 1} of ${job.opts.attempts ?? 1})`);
+    active.add(job.id);
+    jobsActive.set(active.size);
+    logger.info('job_started', { ...jobFields(job), attempt: job.attemptsMade + 1, maxAttempts: job.opts.attempts ?? 1 });
   });
 
   worker.on('completed', (job, result) => {
-    const outcome = result?.skipped ? `skipped: ${result.reason}` : 'completed';
-    console.log(`[worker] job ${job.id} ${outcome}`);
+    active.delete(job.id);
+    jobsActive.set(active.size);
+    jobsCompleted.inc();
+    const durationMs = job.finishedOn && job.processedOn ? job.finishedOn - job.processedOn : undefined;
+    logger.info('job_completed', {
+      ...jobFields(job),
+      status: result?.status ?? (result?.skipped ? 'skipped' : 'completed'),
+      reason: result?.skipped ? result.reason : undefined,
+      durationMs,
+    });
   });
 
   worker.on('failed', async (job, err) => {
-    console.error(`[worker] job ${job?.id} failed (attempt ${job?.attemptsMade}): ${err.message}`);
-    if (!job) return;
+    if (job) active.delete(job.id);
+    jobsActive.set(active.size);
+    if (!job) {
+      jobsFailed.inc({ final: 'unknown' });
+      logger.error('job_failed', { err });
+      return;
+    }
 
     // Safety net for failures that happen outside the processor (e.g. a job
     // that stalled too often). The processor already marks normal final
     // failures; markFailed() is a no-op for deployments that are final.
     try {
-      if ((await job.getState()) !== 'failed') return; // a retry is scheduled
+      const final = (await job.getState()) === 'failed';
+      jobsFailed.inc({ final: String(final) });
+      logger.warn('job_failed', { ...jobFields(job), attempt: job.attemptsMade, final, err });
+      if (!final) return; // a retry is scheduled
       await markFailed(job.data.deploymentId, err.message, `Deployment failed: ${err.message}`);
     } catch (handlerError) {
-      console.error(`[worker] could not record final failure of job ${job.id}:`, handlerError.message);
+      logger.error('final_failure_bookkeeping_failed', { ...jobFields(job), err: handlerError });
     }
+  });
+
+  worker.on('stalled', (jobId) => {
+    logger.warn('job_stalled', { jobId, msg: 'A worker stopped while running this job; it is handed out again' });
   });
 
   // Connection problems and similar; BullMQ keeps retrying on its own.
   worker.on('error', (err) => {
-    console.error('[worker] error:', err.message || err);
+    logger.error('worker_error', { err });
   });
 
   // Stops taking new jobs, waits for the running ones (unless `force`), then
@@ -58,5 +86,5 @@ export function createDeploymentWorker({
     await connection.quit().catch(() => connection.disconnect());
   }
 
-  return { worker, close };
+  return { worker, connection, close, activeJobs: () => active.size };
 }

@@ -10,6 +10,7 @@ import {
   recordRollback,
   transitionDeploymentStatus,
 } from '../services/deploymentService.js';
+import { logger } from '../lib/logger.js';
 
 // Statuses only a running attempt leaves behind. A job that starts and finds
 // its deployment in one of them is picking up after an interrupted attempt.
@@ -103,7 +104,7 @@ export function createDeploymentProcessor({ pipeline = runDockerDeployment } = {
       try {
         await recordFailedAttempt(job, err, attempt, maxAttempts);
       } catch (bookkeepingError) {
-        console.error(`[worker] could not record failure of job ${job.id}:`, bookkeepingError.message);
+        logger.error('failure_bookkeeping_failed', { jobId: job.id, deploymentId, err: bookkeepingError });
       }
       throw err;
     }

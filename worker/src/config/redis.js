@@ -1,5 +1,6 @@
 import IORedis from 'ioredis';
 import config from './index.js';
+import { logger } from '../lib/logger.js';
 
 // The worker's Redis connection, from REDIS_URL. BullMQ uses it for queue
 // commands and duplicates it once for the blocking "wait for next job" call,
@@ -15,7 +16,7 @@ export function createRedisConnection() {
   connection.on('error', (err) => {
     const message = err.message || err.code || String(err);
     if (message !== lastErrorMessage) {
-      console.error('[worker] redis connection error:', message);
+      logger.error('redis_connection_error', { msg: message });
       lastErrorMessage = message;
     }
   });

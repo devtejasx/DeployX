@@ -7,6 +7,7 @@ import {
   recordContainerRemoved,
   unfinishedDeploymentIds,
 } from '../services/deploymentService.js';
+import { logger } from '../lib/logger.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -47,7 +48,7 @@ export function createLocalDockerTarget({ docker = dockerService } = {}) {
     } catch (err) {
       // The deployment itself succeeded. A container left behind is removed
       // by the project's next successful deployment.
-      console.error(`[worker] could not remove previous containers of project ${project.id}: ${err.message}`);
+      logger.error('previous_container_removal_failed', { projectId: project.id, deploymentId: deployment.id, err });
     }
   }
 

@@ -3,6 +3,7 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import config from '../config/index.js';
+import { healthCheckFailures } from '../lib/metrics.js';
 
 // Upper bound on attempts, whatever the configuration says.
 const MAX_ATTEMPTS = 50;
@@ -338,6 +339,7 @@ export async function waitForHealthy({
       return { ...result, attempts: attempt };
     }
 
+    healthCheckFailures.inc();
     await onLog('WARN', `Health check attempt ${attempt}/${maxAttempts} failed: ${result.error}`);
     if (attempt < maxAttempts) await sleep(interval);
   }
