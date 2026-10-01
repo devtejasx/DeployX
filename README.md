@@ -2,7 +2,7 @@
 
 A self-service deployment platform: connect a GitHub repository, build it into a Docker image, deploy it, watch it run and roll back automatically when a release goes bad.
 
-> **Status: Phase 7 of 8. GitHub integration and AWS deployment.** DeployX is being built one phase at a time. A deployment is queued from the dashboard or API, or **automatically by a signed GitHub push webhook**. The worker clones the repository at the exact commit (private repositories through a **GitHub App**), builds a Docker image, and runs it either as a local container or on **Amazon ECS** after pushing it to **Amazon ECR**. It then **checks the application's health over HTTP**: only a healthy deployment becomes `SUCCESS`, and an unhealthy one is **rolled back to the last stable version automatically**, on AWS by redeploying the stable image digest. Every status change goes through a database-enforced state machine, and the dashboard shows each application's deployment history with **live logs over Server-Sent Events**. Production-grade authentication, isolation and monitoring (Phase 8) come later. See [Security measures and limitations](#security-measures-and-limitations-development-setup) before deploying code you don't trust.
+> **Status: Phase 8 of 8. Production security and monitoring.** A deployment is queued from the dashboard or API, or **automatically by a signed GitHub push webhook**. The worker clones the repository at the exact commit (private repositories through a **GitHub App**), builds a Docker image, and runs it either as a local container or on **Amazon ECS** after pushing it to **Amazon ECR**. It then **checks the application's health over HTTP**: only a healthy deployment becomes `SUCCESS`, and an unhealthy one is **rolled back to the last stable version automatically**. Every status change goes through a database-enforced state machine, and the dashboard shows each application's deployment history with **live logs over Server-Sent Events**. Phase 8 adds **accounts and sessions, ADMIN/USER authorization, request hardening, rate limits, timeouts and recovery for every deployment, structured logs, Prometheus metrics, health probes, alerts and an audit log**. See [Phase 8 — Production Security & Monitoring](#phase-8--production-security--monitoring) and its [production checklist](#production-checklist) before running DeployX for others.
 
 ## Overview
 
@@ -67,6 +67,15 @@ A self-service deployment platform: connect a GitHub repository, build it into a
 - Deployment records name their **trigger** (`MANUAL` / `GITHUB_PUSH`), **target**, **image digest** and **ECS task definition**
 - Dashboard **Settings** for repository, branch and target; history shows trigger and target; details show commit link, image version, digest and task definition
 - See [Phase 7 — GitHub Integration & AWS Deployment](#phase-7--github-integration--aws-deployment)
+
+**Phase 8 (production security and monitoring)**
+
+- **Accounts and sessions**: scrypt-hashed passwords, server-side sessions in an HttpOnly, SameSite=Strict cookie; `npm run user:create` for administrators
+- **Authorization**: ADMIN and USER roles; another user's project, deployment, logs or settings answer **403**; operator endpoints are ADMIN-only
+- **Hardened API**: Helmet security headers, CORS allow-list, cross-site request checks, JSON-only bodies, stable error codes, request IDs, **rate limits** in Redis, a production configuration check
+- **Reliability**: a timeout for every deployment, recovery of deployments whose job was lost, statement and AWS call timeouts, graceful shutdown, `docker run --pull never`
+- **Observability**: structured JSON logs with secrets redacted, **Prometheus metrics** for the API and workers, `/health` and `/ready`, worker heartbeats, a **monitoring panel** with alerts, Prometheus alert rules, an **audit log**
+- See [Phase 8 — Production Security & Monitoring](#phase-8--production-security--monitoring)
 
 ## Architecture
 
@@ -573,8 +582,8 @@ Repository code and Dockerfiles are treated as **untrusted**. What this implemen
    - Phase 8 options: a rootless Docker/BuildKit daemon, a separate build host, or a sandboxed runtime such as gVisor or Kata.
 2. **Builds run with the daemon's normal privileges.** `RUN` steps can use the network. Resource limits apply to the running app, not to the build, which is bounded only by its timeout.
 3. **Docker Desktop's host IP.** On Docker Desktop, containers can reach the host's published ports through `host.docker.internal` / `192.168.65.254`, even when those ports are bound to 127.0.0.1. On plain Linux Docker, 127.0.0.1-bound ports are not reachable from containers.
-   - So on Docker Desktop, a deployed app can reach PostgreSQL (password-protected), Redis (password-protected) and **the API, which has no authentication yet**.
-   - Change the default passwords in `.env` if others can deploy on your machine. Authentication is Phase 8.
+   - So on Docker Desktop, a deployed app can reach PostgreSQL (password-protected), Redis (password-protected) and the API (which requires a signed-in session since Phase 8).
+   - Change the default passwords in `.env` if others can deploy on your machine. See [Phase 8](#phase-8--production-security--monitoring) for the production setup.
 4. **The API can't stop containers.** Deleting a project removes its database rows, but not its running container, because the API deliberately has no Docker access. Remove leftovers with:
    ```bash
    docker rm -f $(docker ps -aq --filter label=deployx.managed=true)
@@ -1393,6 +1402,430 @@ Deliberately left for Phase 8 or later: user authentication and OAuth sign-in (s
 
 **Known limitations.** On `ROLLBACK_FAILED` the ECS service may still run the unhealthy version (when the stable image was missing) or the unhealthy stable revision. The status exists to say that someone has to look. Several projects on one repository and branch are handled in one webhook request; if the queue fails midway, the ones already created stay queued and the response is `503`.
 
+## Phase 8 — Production Security & Monitoring
+
+Phase 8 makes DeployX safe to run for more than one person and observable in production. **The deployment pipeline is unchanged**: the same API, queue, worker, state machine, health checks, rollback, GitHub and AWS integration as in Phases 1–7. Phase 8 adds what sits around it: accounts and sessions, authorization, request hardening, rate limits, timeouts, recovery, structured logs, metrics, health probes, alerts and an audit log.
+
+```text
+                    GitHub (signed webhooks)        Browser (session cookie)
+                              │                               │
+                              ▼                               ▼
+              ┌──────────────────────────────────────────────────────────┐
+              │ DeployX API                                              │
+              │  security headers · CORS allow-list · CSRF origin check  │
+              │  rate limits (Redis) · request IDs · JSON-only bodies    │
+              │  authentication (sessions) · authorization (ADMIN/USER)  │
+              │  /health · /ready · /metrics · audit log                 │
+              └──────────────┬───────────────────────────┬───────────────┘
+                             │                           │
+                     ┌───────▼────────┐          ┌───────▼────────┐
+                     │ PostgreSQL     │◄─────────┤ Redis / BullMQ │
+                     │ source of truth│          │ queue, events, │
+                     │ users, sessions│          │ rate limits,   │
+                     │ audit log      │          │ heartbeats     │
+                     └───────▲────────┘          └───────┬────────┘
+                             │                           │
+                     ┌───────┴───────────────────────────▼───────┐
+                     │ Worker: timeouts · recovery check ·       │
+                     │ heartbeat · /health · /ready · /metrics   │
+                     └───────────────────┬───────────────────────┘
+                                         ▼
+                              Docker (LOCAL) / AWS ECR + ECS
+
+      Prometheus scrapes /metrics ──► alert rules ──► Alertmanager ──► Slack / email / PagerDuty
+      JSON logs on stdout ──► CloudWatch Logs / Loki / any log pipeline
+```
+
+### Audit: what existed and what Phase 8 changed
+
+| Area | Before Phase 8 | Phase 8 |
+| ---- | -------------- | ------- |
+| Authentication | none: every request was one development user (`devUser` middleware) | email + password (scrypt), server-side sessions in an HttpOnly, SameSite=Strict cookie; `devUser` removed |
+| Authorization | queries scoped by `user_id`; another user's project answered 404 | ADMIN / USER roles; another user's project or deployment answers **403**; operator endpoints ADMIN-only |
+| API security | zod validation, UUID params, parameterized SQL | + Helmet headers, CORS allow-list with credentials, cross-site request check, JSON-only bodies (415), 100 KB limit, stable error codes, request IDs, `TRUST_PROXY` |
+| Rate limiting | none | per IP / user / account, counted in Redis, memory fallback |
+| Secrets | `.env` ignored; webhook secret API-only, GitHub App key and AWS credentials worker-only; child env allow-list | + log redaction, startup check that refuses development defaults in production, `METRICS_TOKEN`, committed-secret scan in the tests |
+| Webhooks | HMAC-SHA256, constant time, verified before parsing | unchanged, plus rate limit, audit entry and metrics |
+| Docker | no shell, cap-drop ALL, no-new-privileges, limits, isolated network | + `docker run --pull never`; DeployX's own Compose services drop all capabilities |
+| AWS | least-privilege policy, default credential chain, permanent errors final | + connection/request timeouts and SDK retries on every call |
+| SSRF | health checks pinned to resolved, allowed addresses | re-audited: metadata, link-local, private, loopback and DNS-rebinding cases covered by the regression suite |
+| Database | parameterized queries, FKs, CHECKs, state-machine trigger | + users/sessions/audit tables, statement timeouts, two monitoring indexes |
+| Redis / BullMQ | password, 127.0.0.1, offline queue off on the API | + AOF persistence, `noeviction`, recovery of deployments whose job was lost |
+| Timeouts | per step (git, build, run, health, ECS) | + `DEPLOYMENT_TIMEOUT_MS` for a whole attempt, AWS SDK timeouts, PostgreSQL statement timeouts |
+| Monitoring | `/api/health`, `/api/system/status` | `/health`, `/ready`, Prometheus `/metrics` (API and worker), worker heartbeats, monitoring overview + dashboard panel, alert rules |
+| Logging | ad-hoc `console` lines | structured JSON with request, deployment, project and job IDs; secrets redacted |
+| Tests | 274 regular + 11 Docker | 374 regular + 11 Docker (security, reliability, monitoring suites added) |
+
+### Authentication
+
+- **Accounts** have a name, an email (stored lower-case) and a password hashed with **scrypt** (Node's built-in memory-hard KDF; N = 2^17, r = 8, p = 1, 128 MiB, the OWASP recommendation; `PASSWORD_HASH_COST`). Hashes carry their parameters, so the cost can be raised later; weaker hashes are re-hashed at the next sign-in. Passwords: 12–256 characters.
+- **Sessions** are server-side (`sessions` table). The browser gets a random 256-bit token in a cookie that is **HttpOnly** (JavaScript cannot read it), **SameSite=Strict** (other sites cannot send it), **Secure** and `__Host-` prefixed in production. PostgreSQL stores only the token's **SHA-256**. Sessions end after `SESSION_TTL_HOURS` (12), after `SESSION_IDLE_TIMEOUT_MINUTES` (60) without a request, on sign-out, or when the user is deleted.
+- Tokens are **never** in a URL, a response body, `localStorage` or a log. The dashboard does not see them at all.
+- **Sign-in errors are uniform**: an unknown email, an account without a password and a wrong password all answer `401 Invalid email or password`, after the same amount of hashing work.
+- **Registration** (`POST /api/auth/register`) is on in development and **off by default in production** (`ALLOW_REGISTRATION`). The first account created while no ADMIN exists becomes ADMIN (serialized by an advisory lock, so only one can); every later one is a USER. The role can never be chosen by the client.
+- **Command line accounts** (production bootstrap, password resets). The password is read from stdin or `DEPLOYX_USER_PASSWORD`, never from the command line:
+
+  ```bash
+  printf '%s\n' "$ADMIN_PASSWORD" | npm --prefix server run user:create -- --email admin@example.com --name "Admin" --role ADMIN
+  ```
+
+  **Upgrading from Phase 7:** the projects created so far belong to the development user `dev@deployx.local`, which has no password. Either give it one (`npm --prefix server run user:create -- --email dev@deployx.local --role ADMIN`), or register a new account: it becomes ADMIN and sees every project.
+
+| Endpoint | |
+| -------- | - |
+| `POST /api/auth/register` | `{ name, email, password }` → `201 { user }` and a session cookie; `403` when registration is disabled |
+| `POST /api/auth/login` | `{ email, password }` → `200 { user }` and a session cookie; `401` otherwise |
+| `POST /api/auth/logout` | ends the session on the server, clears the cookie |
+| `GET /api/auth/me` | `{ user: { id, name, email, role } }`, or `401` |
+
+With curl, keep the cookie in a file:
+
+```bash
+curl -s -c cookies.txt -X POST localhost:5000/api/auth/login -H "Content-Type: application/json" \
+  -d '{"email": "admin@example.com", "password": "<password>"}'
+curl -s -b cookies.txt localhost:5000/api/projects
+```
+
+Every `curl` example elsewhere in this README needs `-b cookies.txt` since Phase 8.
+
+### Authorization (RBAC)
+
+Enforced by the API on every request, in the services ([`access.js`](server/src/services/access.js)). The dashboard hides nothing for security; the API refuses.
+
+| | USER | ADMIN |
+| - | ---- | ----- |
+| Create projects (owned by the signed-in user; `user_id` is never accepted from the body) | ✓ | ✓ |
+| Read, change, delete, deploy **own** projects; read their deployments, logs and live stream | ✓ | ✓ |
+| The same for **other users'** projects | `403` | ✓ |
+| `PATCH /api/deployments/:id/status` (manual status override) | `403` | ✓ |
+| `POST /api/deployments/:id/logs` (raw log lines) | `403` | ✓ |
+| `GET /api/audit-logs` | own entries | all entries |
+| `GET /api/monitoring/overview` | own deployments + shared infrastructure | everything, incl. worker host names |
+| Database/Redis error details in `/api/system/status` | hidden | shown |
+
+A resource that does not exist is `404`; one that exists but is someone else's is `403` (IDs are random UUIDs, so this reveals nothing useful). GitHub and AWS settings are project fields, so they follow the project's rules. Every `403` for a signed-in user is written to the audit log (`access.denied`).
+
+### API security
+
+- **Validation:** every body is a zod `strictObject` (unknown or read-only fields are refused), every ID a UUID, every query string validated. Repository URLs, branches, commit SHAs, Dockerfile paths, ports, health-check paths, ECS service names and service URLs are checked by the API, by PostgreSQL `CHECK` constraints and again by the worker. `status` can only be set through the state machine.
+- **Bodies:** JSON only. A body with another content type (what a cross-site HTML form can send) is refused with `415` before it is read; the limit is 100 KB (`413`; webhooks 5 MB).
+- **Headers** (Helmet): `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; …` (the API serves only JSON), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy: same-origin`, `Strict-Transport-Security` in production, `Cache-Control: no-store`, no `X-Powered-By`.
+- **CORS:** only the origins in `CLIENT_URL` (comma-separated) get CORS headers, with credentials. The `Origin` header is compared with that list, never echoed; `*` is never accepted.
+- **Cross-site request forgery:** besides the SameSite=Strict cookie, a state-changing request from a browser must come from the API's own origin or a `CLIENT_URL` origin (`Origin` / `Sec-Fetch-Site` checked), else `403 CROSS_ORIGIN_REQUEST`.
+- **Errors** have the same shape in development and production, with a stable code: `{ "success": false, "error": { "code": "NOT_FOUND", "message": "Project not found" } }`. Codes: `VALIDATION_FAILED`, `BAD_REQUEST`, `UNAUTHORIZED`, `FORBIDDEN`, `CROSS_ORIGIN_REQUEST`, `NOT_FOUND`, `CONFLICT`, `INVALID_STATE_TRANSITION`, `PAYLOAD_TOO_LARGE`, `UNSUPPORTED_MEDIA_TYPE`, `RATE_LIMITED`, `SERVICE_UNAVAILABLE`, `INTERNAL_ERROR`. Stack traces, SQL, connection strings and file paths only go to the server log, tagged with the request ID that is also returned in `X-Request-Id`.
+- **Production configuration check:** with `NODE_ENV=production` the API **refuses to start** when `DATABASE_URL` or `REDIS_URL` use a missing or development password, `CLIENT_URL` is missing, `*` or not HTTPS, the session cookie is not Secure, `PASSWORD_HASH_COST` is below 15, or `GITHUB_WEBHOOK_SECRET` is shorter than 20 characters.
+
+### Rate limiting
+
+Fixed windows counted in **Redis** ([`rateLimit.js`](server/src/middleware/rateLimit.js), express-rate-limit), so all API instances share them. If Redis is unreachable, the limits are counted **in memory** per instance: never "no limit", and never an outage of the API. Over a limit: `429 RATE_LIMITED` with `Retry-After` and `RateLimit` headers.
+
+| Limit | Default | Key |
+| ----- | ------- | --- |
+| Every `/api` request (except probes and webhooks) | 300 / minute | client IP |
+| Failed sign-ins | 10 / 15 minutes | client IP (correct sign-ins do not count) |
+| Failed sign-ins per account | 5 / 15 minutes | email, from any IP |
+| Registrations | 5 / hour | client IP |
+| Webhook deliveries | 120 / minute | client IP |
+| New deployments | 20 / minute | signed-in user |
+| New projects | 30 / hour | signed-in user |
+
+All are configurable (`RATE_LIMIT_*`). Behind a load balancer set `TRUST_PROXY` (e.g. `1`) so the client IP is the real one.
+
+### Secrets
+
+- **Nothing secret is committed.** `.env` is git-ignored; `.env.example` holds only local development defaults. The test suite scans every tracked file for private keys, AWS keys and GitHub/Slack/Stripe tokens and fails if it finds one; the git history was scanned when Phase 8 started (clean).
+- **Where each secret lives:** `GITHUB_WEBHOOK_SECRET` and the session table only in the API; `GITHUB_APP_PRIVATE_KEY` and AWS credentials only in the worker (preferably an **IAM role**, so there are no AWS keys at all); `METRICS_TOKEN` in both; passwords nowhere (hashes only).
+- **Never in logs:** the logger redacts values under sensitive keys (password, token, secret, authorization, cookie, private key, access key, credentials, signature) and scrubs every string of credentials in URLs, bearer tokens, GitHub tokens (`ghp_`/`ghs_`/`github_pat_`), AWS access keys and PEM private keys. Request logs never contain headers, cookies or bodies. Build output is scrubbed as before. Child processes (`git`, `docker`) still inherit only an allow-list of variables.
+- **Never in the browser:** the dashboard uses no `VITE_*` variables (anything named so is public in the bundle), and the API never returns a secret, a password hash or a session token.
+- In production, inject secrets from a secret store (AWS Secrets Manager / SSM Parameter Store into the ECS task definition, Docker/Kubernetes secrets), not from files in the image.
+
+### GitHub webhooks and the GitHub App
+
+Re-audited; nothing weakened. Signatures are still verified (HMAC-SHA256, constant time) **before** the body is parsed, and without a secret every delivery is refused (`503`). New: deliveries are rate-limited, every accepted push and every refused signature is audited (`webhook.push`, `webhook.rejected`), and `deployx_webhook_deliveries_total{outcome}` counts them. The App's private key never leaves the worker; installation tokens are created per deployment, scoped to **one repository** with **`contents: read`**, expire within an hour, are passed to git in its environment (never its arguments, `.git/config` or output) and are never stored or logged. The repository is checked against the canonical `https://github.com/<owner>/<repo>` form by the API, the database and the worker.
+
+### AWS security (least privilege)
+
+The worker calls exactly these AWS APIs: ECR `GetAuthorizationToken`, `DescribeRepositories`, `DescribeImages` and the layer-upload actions used by `docker push`; ECS `DescribeServices`, `UpdateService`, `DescribeTaskDefinition`, `RegisterTaskDefinition` (and `TagResource` to keep task definition tags). It does **not** call CloudWatch, IAM (other than `PassRole` for the task's existing roles), EC2 or anything that creates or deletes infrastructure. The [Phase 7 policy](#aws-deployment-architecture) is therefore the complete worker policy; attach it to an **IAM role** (the ECS task role of the worker, or the EC2 instance profile) rather than creating access keys. Never use `AdministratorAccess`.
+
+Your application tasks' *execution role* (not the worker) needs the usual `AmazonECSTaskExecutionRolePolicy` (ECR pull, CloudWatch Logs `CreateLogStream`/`PutLogEvents` for the `awslogs` driver).
+
+Every AWS SDK client has a 5 s connection timeout, a 30 s request timeout (`AWS_CONNECTION_TIMEOUT_MS`, `AWS_REQUEST_TIMEOUT_MS`) and 3 SDK attempts for throttling and transient errors. Permission errors (`AccessDeniedException`, invalid credentials, missing resources) fail the deployment at once without retries, with AWS's message (never credentials) in the log.
+
+### Docker security
+
+Re-audited against injection through repository URL, image name, container name, environment, ports, volumes and commands:
+
+- **No shell anywhere**: `git` and `docker` run through `spawn` with argument arrays; user values come after `--`; the regression suite passes `; rm -rf /`, `$(id)`, backticks and option-looking strings through and checks they arrive verbatim.
+- **Names are DeployX's**: image and container names are built from a sanitized slug and UUIDs; projects cannot choose them. Ports are integers. There are no user-supplied environment variables, volumes, commands or networks.
+- **Containers**: not privileged, `--cap-drop ALL` plus 8 common capabilities, `no-new-privileges`, memory/CPU/PID limits, bounded log files, no volumes or bind mounts, no Docker socket, no DeployX variables, an isolated network with inter-container traffic disabled, ports published on 127.0.0.1 only, and now **`--pull never`**: only images the worker built (or restores by ID) ever run.
+- **DeployX's own Compose services** (API, worker, client, migrate) run as non-root with `cap_drop: [ALL]` and `no-new-privileges`. The production dashboard image is unprivileged nginx (uid 101).
+- **Remaining limitation:** the worker still drives the host's Docker daemon through its socket (root-equivalent on that host), and builds run with the daemon's privileges. For untrusted code in production, run the worker on a **dedicated build host or VM** with nothing else on it, or use rootless Docker/BuildKit, or a sandboxed runtime (gVisor, Kata); AWS deployments can build with CodeBuild instead. This was not changed in Phase 8 because it requires infrastructure, not code.
+
+### SSRF protection (re-audited)
+
+Health checks of local containers go only to `HEALTH_CHECK_HOST` / loopback on the container's published port, with a validated path. Health checks of AWS services resolve the host **once**, check **every** address it resolves to, and send the request to exactly that checked address (no second lookup, so **DNS rebinding cannot redirect it**); redirects are never followed. Always refused: link-local and metadata addresses (`169.254.0.0/16` incl. `169.254.169.254` and `169.254.170.2`, `fe80::/10`, `fd00:ec2::254`, IPv4-mapped forms), unspecified, multicast and reserved ranges. Private and loopback addresses are refused unless `HEALTH_CHECK_ALLOW_PRIVATE_URLS=true`. The API also refuses service URLs that are not plain http(s) origins. Covered by [`security-regression.test.js`](server/test/security-regression.test.js).
+
+### Database security
+
+- All SQL is parameterized; the only dynamic SQL fragments are column names taken from fixed allow-lists. Migrations are tracked in `pgmigrations` and every one has a down migration (tested).
+- Foreign keys, `CHECK` constraints and the state-machine trigger still reject invalid rows for every writer. New tables: `sessions` (token hashes only, cascade with their user) and `audit_logs` (append-only, survive their user).
+- **Statement timeouts**: 15 s for the API, 30 s for the worker (`DATABASE_STATEMENT_TIMEOUT_MS`); waiting for a project lock is exempt (it waits for another, bounded deployment).
+- **Indexes** were added only for queries that run continually: `deployments_unfinished_idx` (partial, unfinished deployments: the recovery check every minute and the dashboard's overview every 5 s) and `deployments_finished_at_idx` (the overview's 24-hour outcomes); `sessions` by token hash (unique), user and expiry; `audit_logs` by time and user. Existing indexes already cover project and deployment lookups.
+- Use a dedicated database user with rights only on the DeployX database, TLS (`?sslmode=require`) to a managed PostgreSQL in production, and never expose port 5432 publicly.
+
+### Redis and BullMQ
+
+- Password required, bound to 127.0.0.1 in Compose; in production use a private network and TLS (`rediss://` URLs work as-is).
+- Compose now runs Redis with `--appendonly yes` (queued jobs survive a restart) and `--maxmemory-policy noeviction` (BullMQ's requirement: Redis refuses writes instead of silently dropping queue keys).
+- Redis holds only identifiers (job payloads are deployment/project IDs, branch and commit), rate-limit counters, worker heartbeats and Pub/Sub notifications: **no secrets and nothing that PostgreSQL does not already know**.
+- **Redis unavailable:** the API stays alive (`/health` 200), reports not ready (`/ready` 503), refuses new deployments with `503` and records them as `FAILED` (never left `QUEUED` without a job), counts rate limits in memory, and live logs fall back to polling PostgreSQL. Workers keep reconnecting and continue with their jobs when Redis returns (tested by killing their connections mid-deployment).
+
+### Queue reliability, timeouts and recovery
+
+| Situation | What happens |
+| --------- | ------------ |
+| Worker crash / killed | its job's lock expires; BullMQ hands the job to the next worker, which sees the deployment in `BUILDING`/`DEPLOYING`/`HEALTH_CHECK`, logs *Previous attempt was interrupted…* and starts the attempt again; an interrupted rollback ends `ROLLBACK_FAILED` (Phase 6) |
+| Redis restart | API and workers reconnect by themselves; with AOF the queue survives |
+| Redis data lost | the **recovery check** (below) ends affected deployments as `FAILED` |
+| PostgreSQL restart | the attempt fails and is retried with backoff; nothing is reported `SUCCESS` that was not recorded |
+| Job retry | 3 attempts, exponential backoff; final `FAILED` with the reason |
+| Duplicate job | job ID = deployment ID; a finished deployment is never processed again |
+| Long-running / stuck job | **`DEPLOYMENT_TIMEOUT_MS`** (30 min) bounds a whole attempt: the running command is killed, the deployment ends `FAILED` without retry, cleanup and rollback still run; a pipeline that does not stop within 2 min more is abandoned |
+| Job lost | **recovery check** every `RECOVERY_INTERVAL_MS` (60 s, one worker at a time via an advisory lock): unfinished deployments unchanged for `STUCK_DEPLOYMENT_AFTER_MS` (10 min) whose job is missing or already over are ended `FAILED` (`ROLLBACK_FAILED` if they were rolling back) with the reason logged. Deployments whose job is waiting or running are left alone |
+
+Bounded timeouts for every long-running operation:
+
+| Operation | Limit |
+| --------- | ----- |
+| Git clone / checkout | `GIT_TIMEOUT_MS` 2 min per command |
+| Docker build, ECR push | `DOCKER_BUILD_TIMEOUT_MS` 10 min |
+| Docker run, inspect, rm, tag, login | `DOCKER_COMMAND_TIMEOUT_MS` 60 s |
+| Health check | `HEALTH_CHECK_TIMEOUT_MS` per request × at most `HEALTH_CHECK_RETRIES` (capped at 50) + intervals + grace |
+| ECS rollout | `AWS_ECS_DEPLOY_TIMEOUT_MS` 10 min |
+| Each AWS / GitHub API call | 30 s / 10 s |
+| Rollback | the same per-step limits (restore + health check) |
+| Whole attempt | `DEPLOYMENT_TIMEOUT_MS` 30 min |
+| SQL statement | 15 s (API) / 30 s (worker) |
+
+A timeout always ends in a final state (`FAILED`, or `ROLLBACK_FAILED`) with a log line saying which limit was hit.
+
+### Observability: structured logs
+
+API and worker write **one JSON object per line** to stdout/stderr ([`logger.js`](server/src/lib/logger.js)): `timestamp`, `level`, `service` (`deployx-api` / `deployx-worker`), `event`, and the IDs that apply: `requestId`, `deploymentId`, `projectId`, `jobId`, `userId`, plus `status`, `durationMs`, `route`, `msg` and a serialized `err`. Examples:
+
+```json
+{"timestamp":"2026-10-01T10:06:23.512Z","level":"info","service":"deployx-worker","event":"deployment_completed","deploymentId":"ad07221f-…","projectId":"eb76f08a-…","status":"SUCCESS","target":"LOCAL","durationMs":14012}
+{"timestamp":"2026-10-01T10:06:09.101Z","level":"info","service":"deployx-api","event":"http_request","requestId":"6c1e…","method":"POST","route":"/api/projects/:id/deployments","status":201,"durationMs":38,"userId":"…","ip":"127.0.0.1"}
+```
+
+`LOG_LEVEL` (`debug`, `info`, `warn`, `error`, `silent`) and `LOG_FORMAT=pretty` (one readable line, for development). Probes are logged at `debug`. Ship stdout to CloudWatch Logs (the `awslogs` driver on ECS), Loki or any collector. Deployment logs shown in the dashboard remain in PostgreSQL as before.
+
+### Metrics
+
+Prometheus text format ([prom-client](https://github.com/siimon/prom-client)). The API serves `GET /metrics`; every worker serves `GET /metrics` on `WORKER_METRICS_PORT` (9464). With `METRICS_TOKEN` set, scrapers must send `Authorization: Bearer <token>`; without one the endpoints are open in development and the API's is **disabled in production**.
+
+| Metric | Source | Meaning |
+| ------ | ------ | ------- |
+| `deployx_deployments_total{trigger,target}` | API | deployments created |
+| `deployx_deployments_success_total{target}` | worker | ended `SUCCESS` |
+| `deployx_deployments_failed_total{status,target}` | worker | ended `FAILED` / `ROLLBACK_FAILED` |
+| `deployx_deployments_rollback_total{outcome}` | worker | automatic rollbacks: `COMPLETED`, `FAILED`, `NOT_AVAILABLE` |
+| `deployx_deployment_duration_seconds{status,target}` | worker | histogram, first start → final status |
+| `deployx_health_check_failures_total` | worker | failed health-check attempts |
+| `deployx_deployment_timeouts_total`, `deployx_stuck_deployments_recovered_total{status}` | worker | timeouts and recoveries |
+| `deployx_worker_jobs_active`, `deployx_worker_jobs_completed_total`, `deployx_worker_jobs_failed_total{final}` | worker | job activity |
+| `deployx_worker_last_heartbeat_timestamp_seconds` | worker | last heartbeat written |
+| `deployx_queue_depth`, `deployx_queue_jobs{state}` | API (from Redis) | jobs waiting / per state |
+| `deployx_workers{status}` | API (from heartbeats) | live workers: `running`, `stopping` |
+| `deployx_deployments_in_progress{status}`, `deployx_deployments_stuck` | API (from PostgreSQL) | unfinished deployments; unchanged for 15 min |
+| `deployx_dependency_up{dependency}` | API | PostgreSQL / Redis reachable |
+| `deployx_http_request_duration_seconds{method,route,status_code}`, `deployx_http_request_errors_total` | API | latency per route pattern (never concrete IDs), 5xx count |
+| `deployx_login_failures_total`, `deployx_rate_limited_total{limiter}`, `deployx_webhook_deliveries_total{outcome}` | API | security signals |
+| `deployx_api_*`, `deployx_worker_*` process metrics | both | CPU, memory, event loop, GC |
+
+Counters are counted where things happen, in the process that did them; system-wide gauges are read from Redis and PostgreSQL at scrape time, so every API instance reports the same real values. [`monitoring/prometheus.yml`](monitoring/prometheus.yml) is a ready scrape configuration.
+
+### Health endpoints
+
+| Endpoint | Kind | Answers |
+| -------- | ---- | ------- |
+| `GET /health`, `GET /api/health` | API liveness | `200` while the process runs; never touches PostgreSQL or Redis, so an outage does not get the API restarted |
+| `GET /ready`, `GET /api/ready` | API readiness | `200` when PostgreSQL and Redis answer and no shutdown is in progress, else `503` with `{ checks: { postgres, redis, shutdown } }` (which check failed, never why) |
+| `GET /api/system/status` | dashboard | per-service status (error details for ADMIN only) |
+| worker `GET /health` | liveness | `200` |
+| worker `GET /ready` | readiness | `200` when Redis and PostgreSQL answer and the worker is consuming jobs; `503` while draining |
+
+Use `/health` for container restarts (Compose healthchecks now do) and `/ready` for load-balancer target health.
+
+### Worker health
+
+Every worker writes a **heartbeat** to Redis every `HEARTBEAT_INTERVAL_MS` (10 s) and whenever a job starts or ends: `<QUEUE_PREFIX>:workers:<id>` = `{ id, hostname, pid, status, startedAt, lastHeartbeat, activeJobs, concurrency }`, with a TTL of three intervals. A worker that is killed, hangs or loses Redis disappears by itself; a graceful shutdown marks it `stopping` while it drains, then removes the key. The API reads these keys: nothing about workers is assumed or invented, and "Redis unavailable" is shown as unknown, not as zero workers.
+
+### Deployment monitoring (dashboard)
+
+`GET /api/monitoring/overview` and the dashboard's **Monitoring** panel (refreshed every 5 s) show, from real data only:
+
+- active **alerts** (below), or "No active alerts"
+- applications by state: **deploying, rolling back, rollback failed, failed, rolled back (previous version live), healthy**
+- **workers** (running/stopping, busy job slots, last heartbeat), the **queue** (waiting, running, retry pending, failed), PostgreSQL/Redis state
+- the last 24 hours: succeeded, failed, rollback failed, rollbacks
+- deployments **in progress** and **recent failures**, linked to their details and live logs
+
+Deployment data is scoped like the rest of the API (a USER sees its own projects).
+
+### Alerting
+
+The same conditions are evaluated in two places: by the API for the dashboard (thresholds `ALERT_*`), and as Prometheus rules for paging ([`monitoring/alert-rules.yml`](monitoring/alert-rules.yml), validated with `promtool check rules`).
+
+| Alert | Severity | Condition (defaults) |
+| ----- | -------- | -------------------- |
+| PostgreSQL unavailable | critical | the API cannot reach it |
+| Redis unavailable | critical | the API cannot reach it |
+| Worker unavailable | critical | no running worker heartbeat (Prometheus: for 2 min) |
+| Rollback failed | critical | any `ROLLBACK_FAILED` (dashboard: last 24 h; Prometheus: last 15 min) |
+| Queue backlog | warning | ≥ 10 jobs waiting (Prometheus: for 10 min) |
+| High failure rate | warning | ≥ 50 % of ≥ 5 deployments in the last hour failed |
+| Repeated rollback | warning | a project rolled back ≥ 3 times in 24 h |
+| Health-check failures | warning | ≥ 3 deployments failed their health check in the last hour (Prometheus: ≥ 15 failed attempts) |
+| AWS deployment failures | warning | ≥ 3 `AWS_ECS` deployments failed in the last hour |
+| Stuck deployments | warning | unfinished deployments unchanged for 15 min |
+| Prometheus only | warning | deployment timeouts, ≥ 50 failed sign-ins in 15 min, invalid webhook signatures, API 5xx rate, API not scrapable |
+
+**Delivery.** [`monitoring/alertmanager.example.yml`](monitoring/alertmanager.example.yml) routes `critical` to **PagerDuty** and **Slack**, `warning` to **Slack** and a daily **email** digest; receiver secrets are read from files. On AWS without Prometheus, the same conditions map onto **CloudWatch**: ship the JSON logs to CloudWatch Logs, create metric filters (e.g. `{ $.event = "deployment_failed" }`, `{ $.event = "stuck_deployment_recovered" }`), alarms on them and on the ECS service's running task count for the worker, and an SNS topic subscribed by email, Slack (AWS Chatbot) or PagerDuty. Amazon Managed Service for Prometheus can also scrape `/metrics` and use the rules file as-is.
+
+### Audit log
+
+Security-sensitive actions are written to `audit_logs` (who, what, target, IP, request ID, a few non-secret details) and readable through `GET /api/audit-logs?limit=50&before=<id>` (USER: own entries; ADMIN: all):
+
+`auth.register`, `auth.login`, `auth.login_failed`, `auth.logout`, `project.created`, `project.updated` (the fields sent and their new values, which covers GitHub repository/branch and AWS target changes), `project.deleted`, `deployment.created`, `deployment.status_changed`, `deployment.log_added`, `webhook.push`, `webhook.rejected`, `access.denied`.
+
+What happens *inside* a deployment (build, health check, rollback triggered and its outcome, timeouts, recovery) is not duplicated: it is already in `deployments` (`rollback_status`, `rollback_deployment_id`, `error_message`, timestamps) and `deployment_logs`. Deployments cannot be cancelled in DeployX, so there is no cancel event. Passwords, tokens and signatures are never passed to the audit log.
+
+### Graceful shutdown
+
+- **API** (`SIGTERM`/`SIGINT`): readiness turns `503` → the server stops accepting connections and closes idle keep-alive ones → live log streams end (browsers reconnect elsewhere) → running requests finish → queue, Redis and PostgreSQL close → exit. Forced after `API_SHUTDOWN_TIMEOUT_MS` (10 s). The API holds no deployment state of its own.
+- **Worker**: heartbeat `stopping` and readiness `503` → no new jobs → running jobs finish (up to `WORKER_SHUTDOWN_TIMEOUT_MS`) → recovery check, heartbeat, metrics server, Redis and PostgreSQL close → exit. A job still running when the timeout hits is resumed by the next worker (see the table above); nothing is left in a state that cannot be recovered.
+- Both log `unhandledRejection`; an `uncaughtException` is logged and the process exits for the orchestrator to restart it.
+
+### Backup and recovery
+
+**PostgreSQL is the source of truth** for users, projects, deployments, logs, sessions and the audit log. Redis holds only a work queue and short-lived data: it is never the record of what was deployed.
+
+- **Database backup:** on AWS use RDS/Aurora automated backups with point-in-time recovery (7–35 days) plus a daily snapshot copied to another region/account. Self-hosted: a nightly logical dump and WAL archiving for point-in-time recovery, encrypted and stored off-host; test a restore regularly.
+
+  ```bash
+  pg_dump --format=custom --no-owner "$DATABASE_URL" > deployx-$(date +%F).dump
+  ```
+
+- **Database restore:** stop the API and workers, restore, run migrations, start again.
+
+  ```bash
+  pg_restore --clean --if-exists --no-owner --dbname "$DATABASE_URL" deployx-2026-10-01.dump
+  npm run migrate
+  ```
+
+  Sessions in the backup are as old as the backup; users simply sign in again if theirs expired.
+- **Migration recovery:** migrations run in a transaction each and take an advisory lock; a failed one leaves the schema unchanged. Fix it and run `npm run migrate` again, or revert the last one with `npm run migrate:down` (every migration has a tested down step). Take a backup before migrating production.
+- **Redis recovery:** with AOF the queue survives restarts. If Redis data is lost, start Redis empty: the API and workers reconnect, and within `STUCK_DEPLOYMENT_AFTER_MS` the recovery check ends the deployments whose jobs vanished as `FAILED`, with the reason. Deploy them again. Rate-limit counters and heartbeats rebuild themselves.
+- **Deployment recovery:** deployments always end in a final state (timeouts, recovery check). The last **stable** deployment of each project is derived from the history, so after any incident redeploy it, or push again. A `ROLLBACK_FAILED` deployment needs a person: check its logs, then redeploy a known-good commit.
+- **AWS recovery:** images are in ECR by digest and every deployment records its task definition revision. To restore a version by hand, update the ECS service to the recorded `aws_task_definition_arn` (or redeploy it in DeployX). Keep ECR lifecycle rules from deleting images younger than your rollback window, and enable the ECS deployment circuit breaker.
+
+### Production configuration
+
+`NODE_ENV=production` changes the defaults that matter: Secure session cookies, registration off, HSTS on, `/metrics` closed without a token, and the startup configuration check. Development and test use their own databases and queue prefixes (the tests use `<db>_test` and `deployx-test`), so they cannot touch production data. Every variable is in [`.env.example`](.env.example); the Phase 8 additions:
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `ALLOW_REGISTRATION` | `true`, `false` in production | self-service sign-up |
+| `SESSION_TTL_HOURS` / `SESSION_IDLE_TIMEOUT_MINUTES` | `12` / `60` | session lifetime / idle timeout |
+| `SESSION_COOKIE_SECURE` | `true` in production | HTTPS-only cookie |
+| `PASSWORD_HASH_COST` | `17` | log2 of scrypt's N |
+| `CLIENT_URL` | `http://localhost:3000` | dashboard origin(s), comma-separated: CORS and cross-site checks |
+| `TRUST_PROXY` | off | proxy hops in front of the API |
+| `RATE_LIMIT_*` | see [Rate limiting](#rate-limiting) | |
+| `LOG_LEVEL` / `LOG_FORMAT` | `info` / `json` | |
+| `METRICS_TOKEN` | *(empty)* | bearer token for `/metrics` (API and worker) |
+| `API_SHUTDOWN_TIMEOUT_MS` | `10000` | |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `15000` API, `30000` worker | |
+| `DEPLOYMENT_TIMEOUT_MS` | `1800000` | one deployment attempt |
+| `RECOVERY_INTERVAL_MS` / `STUCK_DEPLOYMENT_AFTER_MS` | `60000` / `600000` | recovery check |
+| `HEARTBEAT_INTERVAL_MS` | `10000` | worker heartbeat |
+| `WORKER_METRICS_PORT` / `WORKER_METRICS_HOST` | `9464` / `127.0.0.1` | worker `/health`, `/ready`, `/metrics` (`off` disables) |
+| `AWS_CONNECTION_TIMEOUT_MS` / `AWS_REQUEST_TIMEOUT_MS` | `5000` / `30000` | every AWS call |
+| `ALERT_*` | see [Alerting](#alerting) | dashboard alert thresholds |
+
+**Production deployment.** Docker Compose in this repository is a development stack (Vite dev server, local PostgreSQL/Redis, the Docker socket). For production:
+
+1. Managed PostgreSQL (RDS) and Redis (ElastiCache with auth + TLS) on private subnets.
+2. The API as a container (`server/Dockerfile`, non-root) behind an HTTPS load balancer; health check `/health`, target readiness `/ready`; `TRUST_PROXY=1`.
+3. The dashboard from `client/Dockerfile` target **`production`**: unprivileged nginx serving the built files with a strict CSP (`default-src 'self'`, no inline scripts or styles, `frame-ancestors 'none'`, HSTS) and proxying `/api` (including SSE, unbuffered) to `API_UPSTREAM`:
+
+   ```bash
+   docker build --target production -t deployx-client ./client
+   docker run -p 8080:8080 -e API_UPSTREAM=http://deployx-api:5000 deployx-client
+   ```
+
+4. Workers on a dedicated build host/VM (see [Docker security](#docker-security)), with the IAM role and `METRICS_TOKEN`.
+5. Migrations as a one-off task before each release: `node src/db/migrate.js up`.
+6. The first administrator with `npm run user:create`, then `ALLOW_REGISTRATION=false`.
+7. Prometheus + Alertmanager (or CloudWatch) from [`monitoring/`](monitoring).
+
+### Frontend security
+
+- The dashboard never renders HTML from data (no `dangerouslySetInnerHTML`); React escapes everything. Links come from validated values only (`https://github.com/…` repositories, http(s) service origins).
+- Authentication state comes from `GET /api/auth/me`; any `401` returns the dashboard to the sign-in form. No token is stored in the browser (`document.cookie` and `localStorage` stay empty).
+- The production build has no inline scripts or styles and runs under a CSP that allows only its own origin. Verified in a browser: sign-in, monitoring, the deployment history and live SSE logs work with no CSP violations.
+- No `VITE_*` variables are used; the bundle contains no configuration or secret.
+
+### Dependency security
+
+`npm audit` reports **0 vulnerabilities** for the API, the worker and the dashboard. Phase 8 added only established, maintained packages: `helmet`, `express-rate-limit` and `prom-client` (API) and `prom-client` (worker). Password hashing, sessions and logging use Node's standard library. Nothing was upgraded blindly; run `npm audit` in `server/`, `worker/` and `client/` as part of every release.
+
+### Performance notes
+
+Measured against the actual query patterns rather than tuned blindly: the only queries that run continually are the dashboard overview (every 5 s per open dashboard), the `/metrics` gauges (every scrape), the recovery check (every minute) and session lookups (every request, by unique hash). The two new deployment indexes cover the first three; everything else already had an index. Memory stays bounded: SSE streams read logs in batches of 500 and hold no backlog, log lines are capped at 10,000 characters, stored build output at 150 lines per attempt, one shared Redis subscriber serves all streams, BullMQ keeps completed jobs for 24 h / 1,000 and failed jobs for 7 days, metric labels use route patterns (never IDs), and the in-memory rate-limit fallback sweeps expired windows.
+
+### Troubleshooting (Phase 8)
+
+| Symptom | Cause / fix |
+| ------- | ----------- |
+| Dashboard shows the sign-in form after an upgrade | expected: sign in, or give the old development user a password with `user:create` |
+| `403 Registration is disabled` | production default; create accounts with `npm run user:create` |
+| `403 CROSS_ORIGIN_REQUEST` | the dashboard's origin is not in `CLIENT_URL` (behind a proxy, also check the `Host` header it forwards) |
+| `429 RATE_LIMITED` in development | raise the `RATE_LIMIT_*` values; failed sign-ins lock the address for 15 minutes |
+| API exits at start with `unsafe_configuration` | `NODE_ENV=production` with development settings: the log lists each one |
+| `/ready` is `503` | the response says which: `postgres`, `redis` or `shutdown` |
+| Monitoring says "No worker is running" | no heartbeat in Redis: the worker is down, cannot reach Redis, or uses a different `QUEUE_PREFIX` |
+| `/metrics` returns `404` in production | set `METRICS_TOKEN` and send it as a bearer token |
+| A deployment ended *Deployment timed out after …* | it exceeded `DEPLOYMENT_TIMEOUT_MS` (or a step's own limit); the log says where |
+| *Deployment marked FAILED by the recovery check* | its job disappeared from Redis (data loss, manual removal); deploy again |
+| AWS deployment fails with `AccessDeniedException` | the worker's IAM role lacks one of the [listed actions](#aws-security-least-privilege); it is not retried |
+
+### Production checklist
+
+- [ ] `NODE_ENV=production` on the API and the worker; the API starts (configuration check passes)
+- [ ] Strong, unique `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `GITHUB_WEBHOOK_SECRET` (≥ 20 random characters), `METRICS_TOKEN`, all from a secret store
+- [ ] PostgreSQL and Redis on private networks, TLS on, never published publicly
+- [ ] API and dashboard only behind HTTPS; `CLIENT_URL` = the public HTTPS origin; `TRUST_PROXY` set
+- [ ] Dashboard served from the `production` image (CSP, HSTS)
+- [ ] First ADMIN created with `user:create`; `ALLOW_REGISTRATION=false`
+- [ ] Worker on a dedicated build host; AWS access through an IAM role with the least-privilege policy; no access keys
+- [ ] GitHub App key only on the worker; App permissions: Contents read-only
+- [ ] Migrations run before each release; database backups and point-in-time recovery enabled; a restore tested
+- [ ] Redis with AOF and `noeviction`
+- [ ] Prometheus scraping the API and every worker; alert rules loaded; Alertmanager (or CloudWatch alarms) delivering to a real channel; a test alert received
+- [ ] Logs shipped and retained; nothing secret in them
+- [ ] `npm audit` clean; the full test suite and the Docker tests pass
+
+### Known limitations
+
+- **Real AWS deployment is still not verified against an AWS account**: the AWS path is tested end to end against fakes of ECR and ECS (as in Phase 7), and the SDK clients and IAM policy are reviewed, but no real ECR/ECS run has been done.
+- The worker's Docker socket access (see [Docker security](#docker-security)) is unchanged; isolate the worker host.
+- Rate limits fall back to per-instance memory while Redis is down (each API instance then allows the full limit).
+- Sign-in is email and password only: no OAuth/SSO, MFA, password reset by email, or user management UI (use `user:create`). There is one ADMIN/USER role pair and no per-project sharing.
+- The Docker Compose file is a development stack; see [Production configuration](#production-configuration).
+
+
 ## Dashboard (Phase 5)
 
 `http://localhost:3000` has three parts under the system status card:
@@ -1433,17 +1866,19 @@ DeployX/
 ├── client/                         # React dashboard (Vite)
 │   ├── public/
 │   ├── src/
-│   │   ├── api/                    # http.js (envelope), systemApi.js, deploymentsApi.js
-│   │   ├── components/             # SystemStatus, ProjectList, ProjectSettings, DeploymentHistory,
+│   │   ├── api/                    # http.js (envelope), systemApi.js, deploymentsApi.js, authApi.js, monitoringApi.js
+│   │   ├── components/             # SignIn, Monitoring, SystemStatus, ProjectList, ProjectSettings, DeploymentHistory,
 │   │   │                           # DeploymentDetails, HealthCheckSummary, RollbackSummary, LogViewer,
 │   │   │                           # StatusSteps, StatusBadge, StatusRow
-│   │   ├── hooks/                  # useDeploymentStream (SSE), usePolling, useHashRoute, useSystemStatus
+│   │   ├── hooks/                  # useAuth, useDeploymentStream (SSE), usePolling, useHashRoute, useSystemStatus
 │   │   ├── utils/format.js         # dates, durations, short ids
 │   │   ├── App.jsx
 │   │   ├── index.css
 │   │   └── main.jsx
-│   ├── vite.config.js              # dev server on :3000, /api proxy
-│   └── Dockerfile
+│   ├── vite.config.js              # dev server on :3000, /api proxy; preview with the security headers
+│   ├── nginx.conf.template         # production image: static files + /api proxy
+│   ├── security-headers.conf       # production CSP and headers
+│   └── Dockerfile                  # targets: development (Vite) and production (nginx)
 │
 ├── server/                         # Express API
 │   ├── src/
@@ -1452,10 +1887,17 @@ DeployX/
 │   │   ├── routes/                 # one router per resource + index.js; webhook.routes.js (raw body)
 │   │   ├── services/               # business logic + SQL (project, deployment, log, user, systemStatus);
 │   │   │                           # githubWebhook.service.js: signature, push parsing, queueDeployment()
+│   │   │                           # password.js (scrypt), session.service.js, auth.service.js, access.js (RBAC),
+│   │   │                           # audit.service.js, monitoring.service.js (overview + alerts), metricsCollectors.js
+│   │   ├── lib/                    # logger.js (JSON, redaction), metrics.js (prom-client), lifecycle.js
+│   │   ├── scripts/createUser.js   # npm run user:create
 │   │   ├── validators/             # zod schemas for request bodies
 │   │   ├── middleware/
-│   │   │   ├── validation.js       # validate({ params, body })
-│   │   │   ├── devUser.js          # TEMPORARY current-user stand-in
+│   │   │   ├── validation.js       # validate({ params, query, body })
+│   │   │   ├── auth.js             # authenticate (session cookie), requireAuth, requireRole
+│   │   │   ├── security.js         # Helmet, CORS allow-list, cross-site check, JSON-only bodies
+│   │   │   ├── rateLimit.js        # rate limits in Redis, memory fallback
+│   │   │   ├── requestContext.js   # request IDs, request logs and metrics
 │   │   │   ├── notFound.js
 │   │   │   └── errorHandler.js     # single error format, DB error mapping
 │   │   ├── utils/                  # ApiError, sendSuccess, github.js (repository URL parsing)
@@ -1494,12 +1936,18 @@ DeployX/
 │   │   │   ├── dockerService.js        # image/container naming, build, restricted run, tag/push/login
 │   │   │   ├── ecrService.js           # Amazon ECR: login, push by tag, digest lookup
 │   │   │   ├── awsDeploymentService.js # Amazon ECS: task definition revision, UpdateService, rollout wait
-│   │   │   └── workspace.js            # per-deployment workspace, path + Dockerfile checks
+│   │   │   ├── workspace.js            # per-deployment workspace, path + Dockerfile checks
+│   │   │   ├── heartbeat.js            # worker heartbeat in Redis
+│   │   │   └── recoveryService.js      # ends deployments whose job was lost
 │   │   ├── lib/
 │   │   │   ├── exec.js                 # spawn without a shell, env allowlist, timeouts, stdin for secrets
 │   │   │   ├── buildLog.js             # build output filtering and limits
 │   │   │   ├── awsErrors.js            # AWS SDK errors → retryable or final, readable messages
-│   │   │   └── errors.js               # RecordedFailureError: failed for good, already recorded
+│   │   │   ├── errors.js               # RecordedFailureError: failed for good, already recorded
+│   │   │   ├── jobContext.js           # the running job's timeout signal (AsyncLocalStorage)
+│   │   │   ├── logger.js               # JSON logs with redaction (same as the API's)
+│   │   │   └── metrics.js              # worker Prometheus metrics
+│   │   ├── monitoringServer.js         # worker /health, /ready, /metrics
 │   │   ├── config/
 │   │   │   ├── index.js            # environment configuration
 │   │   │   └── redis.js            # ioredis connection factory
@@ -1507,6 +1955,7 @@ DeployX/
 │   └── Dockerfile                  # adds git + Docker CLI (buildx)
 │
 ├── examples/                       # test apps for deployments (hello-app, unhealthy-app, crash-app, broken-dockerfile)
+├── monitoring/                     # prometheus.yml, alert-rules.yml, alertmanager.example.yml
 ├── docker-compose.yml
 ├── .env.example
 └── package.json                    # convenience scripts for the whole repo
@@ -1530,7 +1979,7 @@ cp .env.example .env
 | ------------------- | ------------------------------------------------------ | -------------------------- |
 | `NODE_ENV`          | `development`                                          | server, worker             |
 | `PORT`              | `5000`                                                 | server (also host port)    |
-| `CLIENT_URL`        | `http://localhost:3000`                                | server (CORS origin)       |
+| `CLIENT_URL`        | `http://localhost:3000`                                | server: dashboard origin(s), comma-separated (CORS, cross-site checks) |
 | `DATABASE_URL`      | `postgresql://deployx:deployx@localhost:5432/deployx`  | server, worker, migrations (local) |
 | `REDIS_URL`         | `redis://:deployx-dev-redis@localhost:6379`             | server, worker (local)     |
 | `QUEUE_PREFIX`      | `deployx`                                              | server + worker (must match) |
@@ -1561,8 +2010,7 @@ cp .env.example .env
 | `DOCKER_SOCKET_GID` | `0`                                                 | Compose: group owning the Docker socket |
 | `LOG_STREAM_POLL_MS` | `2000`                                              | server: live streams re-check the database this often (safety net for missed events) |
 | `LOG_STREAM_HEARTBEAT_MS` | `15000`                                        | server: keep-alive comment interval on live streams |
-| `DEV_USER_EMAIL`    | `dev@deployx.local`                                    | temporary current user     |
-| `DEV_USER_NAME`     | `DeployX Developer`                                    | temporary current user     |
+| Phase 8: `ALLOW_REGISTRATION`, `SESSION_*`, `PASSWORD_HASH_COST`, `TRUST_PROXY`, `RATE_LIMIT_*`, `LOG_LEVEL`, `LOG_FORMAT`, `METRICS_TOKEN`, `*_SHUTDOWN_TIMEOUT_MS`, `DATABASE_STATEMENT_TIMEOUT_MS`, `DEPLOYMENT_TIMEOUT_MS`, `RECOVERY_INTERVAL_MS`, `STUCK_DEPLOYMENT_AFTER_MS`, `HEARTBEAT_INTERVAL_MS`, `WORKER_METRICS_*`, `AWS_*_TIMEOUT_MS`, `ALERT_*` | | see [Production configuration](#production-configuration) |
 | `POSTGRES_USER`     | `deployx`                                              | postgres container         |
 | `POSTGRES_PASSWORD` | `deployx`                                              | postgres container         |
 | `POSTGRES_DB`       | `deployx`                                              | postgres container         |
@@ -1573,9 +2021,9 @@ cp .env.example .env
 
 Inside Docker Compose the API, the worker and the migrate job get `DATABASE_URL` and `REDIS_URL` pointing at the `postgres` and `redis` containers automatically.
 
-### Temporary user (no authentication yet)
+### Accounts
 
-Authentication is a later phase. Until then, **every API request acts as a single development user**, identified by `DEV_USER_EMAIL`. The [`devUser`](server/src/middleware/devUser.js) middleware creates that user on first use and attaches it as `req.user`. Services already scope every query by `req.user.id`, so real authentication can replace this one middleware without changing them. Don't expose this API publicly in this state.
+Since Phase 8 every API request (except the probes, `/api/system/status` and webhooks) needs a signed-in session. In development, open the dashboard and **create an account**: the first one becomes ADMIN. Projects created before Phase 8 belong to `dev@deployx.local`; give that user a password with `npm --prefix server run user:create -- --email dev@deployx.local --role ADMIN` to keep using them, or sign in as the new ADMIN, who sees every project. See [Authentication](#authentication).
 
 ## Local Development
 
@@ -1591,6 +2039,8 @@ npm run dev:client        # dashboard on http://localhost:3000
 npm run dev:worker        # processes deployment jobs
 ```
 
+Then open http://localhost:3000 and create an account (the first one is ADMIN).
+
 ## Running with Docker Compose
 
 ```bash
@@ -1604,7 +2054,7 @@ docker compose up --build
 | `redis`    | `redis:7-alpine`     | 127.0.0.1:6379 | `redis-data` volume, healthcheck, **password required** |
 | `migrate`  | `./server`           | -              | applies migrations, then exits with code 0 |
 | `server`   | `./server`           | 127.0.0.1:5000 | starts after `migrate` succeeds and the DBs are healthy; the only service with `GITHUB_WEBHOOK_SECRET` |
-| `client`   | `./client`           | 127.0.0.1:3000 | Vite dev server, proxies `/api` to `server` |
+| `client`   | `./client` (target `development`) | 127.0.0.1:3000 | Vite dev server, proxies `/api` to `server`; production image: target `production` |
 | `worker`   | `./worker`           | -              | runs deployments; **the only service with the Docker socket**, the GitHub App key and AWS credentials (passed through from your environment, empty by default); health-checks apps through `host.docker.internal`; 30 s stop grace period |
 
 Deployed apps are **not** Compose services. The worker starts them on the `deployx-apps` network, so `docker compose down` leaves them running. Remove them with `docker rm -f $(docker ps -aq --filter label=deployx.managed=true)`.
@@ -1630,8 +2080,10 @@ Every endpoint returns the same envelope.
 ```
 
 ```json
-{ "success": false, "error": { "message": "Project not found" } }
+{ "success": false, "error": { "code": "NOT_FOUND", "message": "Project not found" } }
 ```
+
+Every error carries a stable `code` (Phase 8, see [API security](#api-security)) and every response an `X-Request-Id` header.
 
 Validation failures add `details`, with one readable message per problem:
 
@@ -1639,6 +2091,7 @@ Validation failures add `details`, with one readable message per problem:
 {
   "success": false,
   "error": {
+    "code": "VALIDATION_FAILED",
     "message": "Validation failed",
     "details": ["Project name is required", "GitHub repository URL is required"]
   }
@@ -1651,16 +2104,19 @@ Validation failures add `details`, with one readable message per problem:
 | 201 | resource created |
 | 202 | GitHub webhook: deployments were queued |
 | 400 | validation failed, malformed ID, or malformed JSON |
-| 401 | GitHub webhook: signature missing or invalid |
+| 401 | not signed in, or the session expired; failed sign-in; GitHub webhook: signature missing or invalid |
+| 403 | another user's project or deployment; an ADMIN-only endpoint; a cross-site request; registration disabled |
+| 429 | rate limit exceeded (`Retry-After` says when to try again) |
 | 404 | resource or route not found |
 | 413 | request body too large (webhooks: over 5 MB) |
-| 415 | GitHub webhook: not `application/json` |
+| 415 | a request body that is not JSON; GitHub webhook: not `application/json` |
 | 409 | conflict: duplicate project name, deploying an inactive project, or an invalid deployment state transition (response includes `from` and `to`) |
 | 500 | unexpected error; the response says `Internal server error`, and details go only to the server log |
 | 503 | `/api/system/status`: PostgreSQL or Redis unreachable; creating a deployment: job queue unavailable; GitHub webhook: `GITHUB_WEBHOOK_SECRET` not configured |
 
 Rules that apply to every endpoint:
 
+- Every endpoint except the probes, `/metrics`, `/api/system/status`, `/api/auth/*` and the webhook requires a session cookie (`401` otherwise); a USER reaches only its own projects (`403` otherwise). With curl: `curl -c cookies.txt` on `/api/auth/login`, then `-b cookies.txt` on every request.
 - IDs in the URL must be UUIDs. A malformed ID returns 400, and a well-formed ID that doesn't exist returns 404.
 - Request bodies must be JSON objects. Unknown or read-only fields (`id`, `user_id`, `created_at`, `updated_at`, and so on) are rejected.
 - All SQL is parameterized. User input is never concatenated into queries.
@@ -1669,8 +2125,14 @@ Rules that apply to every endpoint:
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
-| GET | `/api/health` | API liveness |
-| GET | `/api/system/status` | live PostgreSQL + Redis check |
+| GET | `/health`, `/api/health` | API liveness (no session) |
+| GET | `/ready`, `/api/ready` | API readiness: PostgreSQL + Redis (no session) |
+| GET | `/metrics` | Prometheus metrics (`METRICS_TOKEN`) |
+| GET | `/api/system/status` | live PostgreSQL + Redis check (no session) |
+| POST | `/api/auth/register`, `/api/auth/login`, `/api/auth/logout` | accounts and sessions ([details](#authentication)) |
+| GET | `/api/auth/me` | the signed-in user |
+| GET | `/api/monitoring/overview` | workers, queue, deployments, alerts ([details](#deployment-monitoring-dashboard)) |
+| GET | `/api/audit-logs` | audit log ([details](#audit-log)) |
 | POST | `/api/projects` | create a project |
 | GET | `/api/projects` | list projects (newest first) |
 | GET | `/api/projects/:id` | get one project |
@@ -1679,8 +2141,8 @@ Rules that apply to every endpoint:
 | POST | `/api/projects/:projectId/deployments` | create a deployment record (`QUEUED`) |
 | GET | `/api/projects/:projectId/deployments` | list a project's deployments (newest first) |
 | GET | `/api/deployments/:deploymentId` | get one deployment, including a project summary |
-| PATCH | `/api/deployments/:deploymentId/status` | update deployment status |
-| POST | `/api/deployments/:deploymentId/logs` | add a log line |
+| PATCH | `/api/deployments/:deploymentId/status` | update deployment status (**ADMIN**) |
+| POST | `/api/deployments/:deploymentId/logs` | add a log line (**ADMIN**) |
 | GET | `/api/deployments/:deploymentId/logs` | list log lines (chronological) |
 | GET | `/api/deployments/:deploymentId/logs/stream` | live logs and status as Server-Sent Events ([details](#real-time-deployment-logs-phase-5)) |
 | POST | `/api/webhooks/github` | GitHub push webhook, signature required ([details](#webhook-security)) |
@@ -1899,7 +2361,7 @@ npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The default suite (274 tests, about 60 s, no Docker, AWS or network needed) covers:
+The default suite (374 tests, about 80 s, no Docker, AWS or network needed) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
@@ -1942,6 +2404,12 @@ The default suite (274 tests, about 60 s, no Docker, AWS or network needed) cove
   - a manual deployment to AWS through the same pipeline
   - first deployment unhealthy (`NOT_AVAILABLE`, service back to its previous task definition); tasks that never start (reverted, retried, `FAILED`, no health check); rollout timeout; ECR push retried; ECR access denied (final); stable image deleted from ECR and stable version unhealthy (`ROLLBACK_FAILED`, no false recovery); AWS settings missing
   - **isolation:** three projects pushed at once, each on its own service with its own images, jobs and event channels; two pushes to one project deployed one after the other; switching a project from `LOCAL` to `AWS_ECS` (no cross-target rollback, local container retired)
+- **Phase 8, authentication** ([`auth.test.js`](server/test/auth.test.js)): scrypt hashes (salted, rehashed when weaker), registration (first account ADMIN exactly once under concurrency, roles never chosen by the client, disabled in production), sign-in with uniform errors, HttpOnly/SameSite cookies, tokens stored hashed and never in bodies or URLs, sign-out, expired and idle sessions, every resource route `401` without a session, `user:create`
+- **Phase 8, authorization** ([`authorization.test.js`](server/test/authorization.test.js)): another user's project, deployments, logs and live stream `403`; lists scoped; ADMIN sees all; operator endpoints ADMIN-only; audit entries and `GET /api/audit-logs`
+- **Phase 8, HTTP hardening and rate limits** ([`http-security.test.js`](server/test/http-security.test.js), [`rate-limit.test.js`](server/test/rate-limit.test.js)): security headers, CORS allow-list, cross-site requests refused, `415`/`413`, error codes without internals, the production configuration check; sign-in, registration, webhook, deployment, project and API limits, shared through Redis, memory fallback when Redis is down or hangs
+- **Phase 8, observability** ([`observability.test.js`](server/test/observability.test.js), [`worker-monitoring.test.js`](server/test/worker-monitoring.test.js), [`monitoring.test.js`](server/test/monitoring.test.js)): request IDs, JSON logs with IDs and without secrets, redaction, liveness vs readiness (database down, shutdown), API and worker metrics from real events, metrics token, heartbeats, the monitoring overview and every alert, scoping per user
+- **Phase 8, reliability** ([`deployment-timeouts.test.js`](server/test/deployment-timeouts.test.js), [`reliability.test.js`](server/test/reliability.test.js)): deployment timeout kills the running command and fails without retry, cleanup still runs, health checks stop early; AWS and SQL timeouts; recovery of deployments whose job was lost (one worker at a time); Redis outage and recovery for the API; Redis connections killed under a running worker; PostgreSQL failing when a job starts; a worker dying mid-deployment
+- **Phase 8, security regression** ([`security-regression.test.js`](server/test/security-regression.test.js)): webhook signature bypasses, cross-user access and deployment, SSRF to private and metadata addresses (incl. DNS rebinding), Docker and repository-URL injection, secrets in logs and child environments, invalid state transitions, password/session storage, committed secrets and `VITE_*` variables
 - **live stream race** ([`log-stream.test.js`](server/test/log-stream.test.js)): the last log line, committed together with the final status between the stream's two reads, is still sent before `end` (found by the AWS end-to-end test and fixed in the SSE controller)
 
 ### Docker end-to-end tests
@@ -2114,6 +2582,23 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 - [x] No secrets committed; no credentials in the database, Redis payloads, logs or the browser
 - [x] No Phase 8 work: no authentication/OAuth sign-in, monitoring, Kubernetes, autoscaling or multi-region
 
+**Phase 8: production security and monitoring**
+
+- [x] Authentication: scrypt-hashed passwords, server-side sessions in HttpOnly/SameSite=Strict cookies, no tokens in URLs or browser storage
+- [x] Authorization enforced server-side: ADMIN/USER, `403` for other users' projects, deployments, logs and settings
+- [x] API input validated; rate limits on sign-in, registration, webhooks, deployments, projects and the whole API
+- [x] Security headers (API and dashboard CSP), CORS allow-list, cross-site request checks
+- [x] No secrets committed (scanned in the tests) or logged (redaction); production configuration check
+- [x] GitHub webhook and App tokens protected as before; AWS least privilege, IAM role, SDK timeouts
+- [x] Docker execution hardened (`--pull never`, Compose services without capabilities); SSRF protection re-verified
+- [x] PostgreSQL: parameterized queries, statement timeouts, justified indexes; Redis: password, AOF, `noeviction`
+- [x] Worker failures handled; every deployment operation bounded; lost jobs recovered
+- [x] `/health` and `/ready` for the API and the worker; worker heartbeats
+- [x] Structured logs; Prometheus metrics; deployment failures and rollbacks observable; dashboard monitoring panel and alerts; Prometheus alert rules
+- [x] Audit log; graceful shutdown; backup and recovery procedure; production configuration and checklist
+- [x] 374 regular tests (incl. security regression) and 11 Docker tests pass; client build passes
+- [ ] Real AWS deployment verified against an AWS account (still only against fakes)
+
 ## Future Phases
 
 DeployX is developed incrementally across **8 phases**:
@@ -2126,5 +2611,5 @@ DeployX is developed incrementally across **8 phases**:
 | 4     | Build & run: git clone, Docker build, container deployment ✅         |
 | 5     | Deployment history, state machine, real-time logs (SSE) ✅            |
 | 6     | Health checks for deployed apps, automatic rollback, stable versions ✅ |
-| **7** | **GitHub webhooks and App, AWS deployment: ECR + ECS/Fargate (this phase)** ✅ |
-| 8     | Production auth, security hardening, monitoring, CI/CD                |
+| 7     | GitHub webhooks and App, AWS deployment: ECR + ECS/Fargate ✅ |
+| **8** | **Production security, authentication, monitoring and hardening (this phase)** ✅ |
