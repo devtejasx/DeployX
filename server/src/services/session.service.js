@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import config from '../config/index.js';
 import { query } from '../db/postgres.js';
+import { logger } from '../lib/logger.js';
 
 // Server-side sessions (table `sessions`).
 //
@@ -90,4 +91,21 @@ export async function deleteExpiredSessions() {
     [config.auth.idleTimeoutMinutes],
   );
   return rowCount;
+}
+
+// Runs deleteExpiredSessions() every `intervalMs` (and once now), so the
+// table stays small even for users who never sign in again. Returns { stop }.
+export function startSessionCleanup(intervalMs = config.auth.sessionCleanupIntervalMs) {
+  async function run() {
+    try {
+      const removed = await deleteExpiredSessions();
+      if (removed > 0) logger.info('sessions_cleaned', { removed });
+    } catch (err) {
+      logger.warn('session_cleanup_failed', { err });
+    }
+  }
+  const timer = setInterval(run, intervalMs);
+  timer.unref();
+  run();
+  return { stop: () => clearInterval(timer), run };
 }

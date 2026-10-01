@@ -115,6 +115,8 @@ const config = {
     // Absolute lifetime of a session, and how long it survives without a request.
     sessionTtlHours: positiveInt(process.env.SESSION_TTL_HOURS, 12),
     idleTimeoutMinutes: positiveInt(process.env.SESSION_IDLE_TIMEOUT_MINUTES, 60),
+    // How often expired and idle sessions are deleted.
+    sessionCleanupIntervalMs: positiveInt(process.env.SESSION_CLEANUP_INTERVAL_MS, 60 * 60 * 1000),
     // Secure (HTTPS-only) session cookie; on by default in production.
     cookieSecure: booleanSetting(process.env.SESSION_COOKIE_SECURE, env === 'production'),
     // Self-service sign-up; off by default in production, where accounts are
