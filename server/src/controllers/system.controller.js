@@ -2,8 +2,11 @@ import { getSystemStatus } from '../services/systemStatus.service.js';
 
 // 200 when every dependency is reachable, 503 when any of them is down.
 // Both carry the per-service result in `data` so the dashboard can show it.
+// Connection error messages (which can name hosts and users) are only
+// included for signed-in administrators.
 export async function getStatus(req, res) {
   const { healthy, status } = await getSystemStatus();
+  if (req.user?.role !== 'ADMIN') delete status.errors;
 
   if (healthy) {
     res.status(200).json({ success: true, data: status });

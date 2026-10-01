@@ -32,6 +32,9 @@ process.env.NODE_ENV = 'test';
 process.env.QUEUE_PREFIX = process.env.TEST_QUEUE_PREFIX || 'deployx-test';
 // Short retry backoff (200ms, 400ms) so retry tests finish quickly.
 process.env.DEPLOYMENT_JOB_BACKOFF_MS = '200';
+// Cheap password hashes (2^12 instead of 2^17): tests create many accounts.
+process.env.PASSWORD_HASH_COST ||= '12';
+process.env.ALLOW_REGISTRATION ||= 'true';
 
 const { default: app } = await import('../src/app.js');
 const { default: pool, closePostgres } = await import('../src/db/postgres.js');
@@ -40,6 +43,7 @@ const { runMigrations } = await import('../src/db/migrate.js');
 const { getDeploymentQueue, closeDeploymentQueue } = await import('../src/queues/deploymentQueue.js');
 const { closeSubscriber } = await import('../src/events/deploymentSubscriber.js');
 const { closeAllLogStreams } = await import('../src/controllers/logStream.controller.js');
+const { upsertUser } = await import('../src/services/user.service.js');
 
 export { pool, getDeploymentQueue };
 
@@ -64,8 +68,33 @@ async function ensureTestDatabase() {
   }
 }
 
+// Every test signs in. The default client is an ADMIN (as the first account
+// of an installation is); clientFor() adds other accounts.
+export const TEST_PASSWORD = 'correct horse battery staple';
+export const DEFAULT_USER = { name: 'Test Admin', email: 'admin@deployx.test', role: 'ADMIN' };
+
+// Cookie of the default client, used by openLogStream() unless told otherwise.
+let defaultCookie = null;
+
+function sessionCookieFrom(response) {
+  const header = response.headers.getSetCookie().find((cookie) => /deployx_session=/.test(cookie));
+  return header ? header.split(';')[0] : null;
+}
+
+// Signs in through the API; returns the "name=value" session cookie.
+export async function signIn(baseUrl, email, password = TEST_PASSWORD) {
+  const response = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  if (response.status !== 200) throw new Error(`Sign-in as ${email} failed with HTTP ${response.status}`);
+  return sessionCookieFrom(response);
+}
+
 // Creates + migrates the test database, empties it and the test queue, and
-// starts the API on a random port. Returns a small fetch-based client.
+// starts the API on a random port. Returns a small fetch-based client, signed
+// in as DEFAULT_USER.
 export async function setupTestServer() {
   await ensureTestDatabase();
   await runMigrations({ databaseUrl: testDatabaseUrl, log: () => {} });
@@ -79,18 +108,59 @@ export async function setupTestServer() {
   });
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
 
-  async function request(method, urlPath, body, { rawBody } = {}) {
-    const init = { method, headers: {} };
-    if (rawBody !== undefined) {
-      init.headers['content-type'] = 'application/json';
-      init.body = rawBody;
-    } else if (body !== undefined) {
-      init.headers['content-type'] = 'application/json';
-      init.body = JSON.stringify(body);
+  // A client sending `cookie` (null: signed out) with every request.
+  function makeClient(session) {
+    async function request(method, urlPath, body, { rawBody, headers = {} } = {}) {
+      const init = { method, headers: { ...headers } };
+      if (session.cookie) init.headers.cookie = session.cookie;
+      if (rawBody !== undefined) {
+        init.headers['content-type'] ??= 'application/json';
+        init.body = rawBody;
+      } else if (body !== undefined) {
+        init.headers['content-type'] ??= 'application/json';
+        init.body = JSON.stringify(body);
+      }
+      const response = await fetch(`${baseUrl}${urlPath}`, init);
+      const text = await response.text();
+      let parsed = null;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        parsed = text;
+      }
+      return { status: response.status, body: parsed, headers: response.headers };
     }
-    const response = await fetch(`${baseUrl}${urlPath}`, init);
-    return { status: response.status, body: await response.json() };
+    return {
+      baseUrl,
+      get cookie() {
+        return session.cookie;
+      },
+      request,
+      get: (urlPath, options) => request('GET', urlPath, undefined, options),
+      post: (urlPath, body, options) => request('POST', urlPath, body, options),
+      put: (urlPath, body, options) => request('PUT', urlPath, body, options),
+      patch: (urlPath, body, options) => request('PATCH', urlPath, body, options),
+      delete: (urlPath, options) => request('DELETE', urlPath, undefined, options),
+    };
   }
+
+  // Creates (or resets) an account with TEST_PASSWORD and signs it in.
+  async function clientFor({ name = 'Test User', email, role = 'USER' }) {
+    const { user } = await upsertUser({ name, email, password: TEST_PASSWORD, role });
+    const client = makeClient({ cookie: await signIn(baseUrl, email) });
+    client.user = user;
+    return client;
+  }
+
+  const main = { cookie: null };
+  // (Re-)creates the default account and signs in again, e.g. after a test
+  // reverted the migration that holds sessions.
+  async function relogin() {
+    await upsertUser({ ...DEFAULT_USER, password: TEST_PASSWORD });
+    main.cookie = await signIn(baseUrl, DEFAULT_USER.email);
+    defaultCookie = main.cookie;
+  }
+  await relogin();
 
   async function close() {
     closeAllLogStreams();
@@ -101,12 +171,10 @@ export async function setupTestServer() {
   }
 
   return {
-    baseUrl,
-    get: (urlPath) => request('GET', urlPath),
-    post: (urlPath, body, options) => request('POST', urlPath, body, options),
-    put: (urlPath, body) => request('PUT', urlPath, body),
-    patch: (urlPath, body) => request('PATCH', urlPath, body),
-    delete: (urlPath) => request('DELETE', urlPath),
+    ...makeClient(main),
+    anonymous: makeClient({ cookie: null }),
+    clientFor,
+    relogin,
     close,
   };
 }
@@ -142,9 +210,10 @@ export async function waitFor(check, { timeout = 5000, interval = 20 } = {}) {
 
 // Opens the SSE log stream of a deployment and parses its events:
 // [{ event, id, data }].
-export async function openLogStream(baseUrl, deploymentId, { lastEventId } = {}) {
+export async function openLogStream(baseUrl, deploymentId, { lastEventId, cookie = defaultCookie } = {}) {
   const controller = new AbortController();
   const headers = lastEventId ? { 'Last-Event-ID': lastEventId } : {};
+  if (cookie) headers.cookie = cookie;
   const response = await fetch(`${baseUrl}/api/deployments/${deploymentId}/logs/stream`, {
     headers,
     signal: controller.signal,

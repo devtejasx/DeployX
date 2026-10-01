@@ -48,11 +48,13 @@ describe('opening a stream', () => {
   });
 
   test('unknown and malformed deployment IDs get normal JSON errors, not a stream', async () => {
-    const missing = await fetch(`${api.baseUrl}/api/deployments/${MISSING_ID}/logs/stream`);
+    const missing = await fetch(`${api.baseUrl}/api/deployments/${MISSING_ID}/logs/stream`, {
+      headers: { cookie: api.cookie },
+    });
     assert.equal(missing.status, 404);
     assert.deepEqual(await missing.json(), { success: false, error: { message: 'Deployment not found' } });
 
-    const malformed = await fetch(`${api.baseUrl}/api/deployments/nope/logs/stream`);
+    const malformed = await fetch(`${api.baseUrl}/api/deployments/nope/logs/stream`, { headers: { cookie: api.cookie } });
     assert.equal(malformed.status, 400);
   });
 });

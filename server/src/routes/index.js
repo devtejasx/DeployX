@@ -1,5 +1,6 @@
 import { Router } from 'express';
-import { devUser } from '../middleware/devUser.js';
+import { authenticate, requireAuth } from '../middleware/auth.js';
+import authRoutes from './auth.routes.js';
 import healthRoutes from './health.routes.js';
 import systemRoutes from './system.routes.js';
 import projectRoutes from './project.routes.js';
@@ -8,11 +9,17 @@ import logRoutes from './log.routes.js';
 
 const router = Router();
 
+// Liveness: answers without touching PostgreSQL or Redis.
 router.use('/health', healthRoutes);
-router.use('/system', systemRoutes);
 
-// Resource routes act on behalf of the (temporary) current user.
-router.use(['/projects', '/deployments'], devUser);
+// Everything below knows who is signed in (req.user, or null).
+router.use(authenticate);
+router.use('/system', systemRoutes);
+router.use('/auth', authRoutes);
+
+// Resource routes require a signed-in user. Which projects and deployments
+// that user may reach is decided by the services (see services/access.js).
+router.use(['/projects', '/deployments'], requireAuth);
 router.use('/projects', projectRoutes);
 router.use('/projects/:projectId/deployments', projectDeploymentRoutes);
 router.use('/deployments', deploymentRoutes);

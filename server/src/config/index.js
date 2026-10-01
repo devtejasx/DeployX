@@ -15,8 +15,17 @@ function positiveInt(value, fallback) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+// "true"/"false"; anything else (including unset) means `fallback`.
+function booleanSetting(value, fallback) {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return fallback;
+}
+
+const env = process.env.NODE_ENV || 'development';
+
 const config = {
-  env: process.env.NODE_ENV || 'development',
+  env,
   port: Number(process.env.PORT) || 5000,
   clientUrl: process.env.CLIENT_URL || 'http://localhost:3000',
   databaseUrl: process.env.DATABASE_URL || 'postgresql://deployx:deployx@localhost:5432/deployx',
@@ -41,10 +50,18 @@ const config = {
   github: {
     webhookSecret: process.env.GITHUB_WEBHOOK_SECRET || '',
   },
-  // Temporary stand-in for authentication (see middleware/devUser.js).
-  devUser: {
-    email: (process.env.DEV_USER_EMAIL || 'dev@deployx.local').toLowerCase(),
-    name: process.env.DEV_USER_NAME || 'DeployX Developer',
+  // Sign-in (services/session.service.js, services/password.js).
+  auth: {
+    // Absolute lifetime of a session, and how long it survives without a request.
+    sessionTtlHours: positiveInt(process.env.SESSION_TTL_HOURS, 12),
+    idleTimeoutMinutes: positiveInt(process.env.SESSION_IDLE_TIMEOUT_MINUTES, 60),
+    // Secure (HTTPS-only) session cookie; on by default in production.
+    cookieSecure: booleanSetting(process.env.SESSION_COOKIE_SECURE, env === 'production'),
+    // Self-service sign-up; off by default in production, where accounts are
+    // created with `npm run user:create`.
+    allowRegistration: booleanSetting(process.env.ALLOW_REGISTRATION, env !== 'production'),
+    // log2 of scrypt's N (17 = 128 MiB per hash, the OWASP recommendation).
+    passwordHashCost: Math.min(Math.max(positiveInt(process.env.PASSWORD_HASH_COST, 17), 10), 20),
   },
 };
 

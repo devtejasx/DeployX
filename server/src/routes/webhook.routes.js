@@ -9,7 +9,7 @@ const WEBHOOK_BODY_LIMIT = '5mb';
 // the exact bytes GitHub sent, so the body is kept raw (whatever its content
 // type) and only parsed once the signature has been verified.
 //
-// Not behind devUser: webhooks act for a repository, and are authenticated by
+// Not behind sign-in: webhooks act for a repository, and are authenticated by
 // their signature instead.
 const router = Router();
 

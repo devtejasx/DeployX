@@ -242,6 +242,8 @@ describe('schema', () => {
       assert.equal((await pool.query('SELECT count(*)::int AS n FROM deployments WHERE id = $1', [deployment.id])).rows[0].n, 1);
     } finally {
       await runMigrations({ databaseUrl: testDatabaseUrl, log: () => {} });
+      // Sessions, roles and passwords were dropped with the Phase 8 migration.
+      await api.relogin();
     }
 
     const { rows } = await pool.query('SELECT trigger, deployment_target FROM deployments WHERE id = $1', [deployment.id]);
@@ -366,6 +368,7 @@ describe('Phase 8 schema: users, sessions and audit log', () => {
       assert.ok(!(await tables()).includes('audit_logs'));
     } finally {
       await runMigrations({ databaseUrl: testDatabaseUrl, log: () => {} });
+      await api.relogin();
     }
     assert.ok((await tables()).includes('sessions'));
     const { rows } = await pool.query('SELECT u.role FROM projects p JOIN users u ON u.id = p.user_id WHERE p.id = $1', [

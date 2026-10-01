@@ -75,6 +75,12 @@ services:
       DEPLOYMENT_JOB_BACKOFF_MS: ${DEPLOYMENT_JOB_BACKOFF_MS:-2000}
       # Verifies GitHub webhook signatures; only the API gets it.
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      # Sign-in sessions (see .env.example).
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      SESSION_IDLE_TIMEOUT_MINUTES: ${SESSION_IDLE_TIMEOUT_MINUTES:-60}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-}
+      PASSWORD_HASH_COST: ${PASSWORD_HASH_COST:-17}
     ports:
       - "127.0.0.1:${PORT:-5000}:5000"
     depends_on:
