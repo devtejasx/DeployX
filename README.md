@@ -2,7 +2,9 @@
 
 A self-service deployment platform: connect a GitHub repository, build it into a Docker image, deploy it, watch it run and roll back automatically when a release goes bad.
 
-> **Status: Phase 8 of 8. Production security and monitoring.** A deployment is queued from the dashboard or API, or **automatically by a signed GitHub push webhook**. The worker clones the repository at the exact commit (private repositories through a **GitHub App**), builds a Docker image, and runs it either as a local container or on **Amazon ECS** after pushing it to **Amazon ECR**. It then **checks the application's health over HTTP**: only a healthy deployment becomes `SUCCESS`, and an unhealthy one is **rolled back to the last stable version automatically**. Every status change goes through a database-enforced state machine, and the dashboard shows each application's deployment history with **live logs over Server-Sent Events**. Phase 8 adds **accounts and sessions, ADMIN/USER authorization, request hardening, rate limits, timeouts and recovery for every deployment, structured logs, Prometheus metrics, health probes, alerts and an audit log**. See [Phase 8 — Production Security & Monitoring](#phase-8--production-security--monitoring) and its [production checklist](#production-checklist) before running DeployX for others.
+> **Status: Phase 9 of 9. Production validation.** The whole system was run against real GitHub webhooks, real Docker deployments, rollbacks and injected failures: everything passed except the **real AWS deployment, which has not been run** (no AWS account), so the release is **not ready** and not tagged. See [Phase 9 — Production Validation & Release](#phase-9--production-validation--release).
+>
+> A deployment is queued from the dashboard or API, or **automatically by a signed GitHub push webhook**. The worker clones the repository at the exact commit (private repositories through a **GitHub App**), builds a Docker image, and runs it either as a local container or on **Amazon ECS** after pushing it to **Amazon ECR**. It then **checks the application's health over HTTP**: only a healthy deployment becomes `SUCCESS`, and an unhealthy one is **rolled back to the last stable version automatically**. Every status change goes through a database-enforced state machine, and the dashboard shows each application's deployment history with **live logs over Server-Sent Events**. Phase 8 adds **accounts and sessions, ADMIN/USER authorization, request hardening, rate limits, timeouts and recovery for every deployment, structured logs, Prometheus metrics, health probes, alerts and an audit log**. See [Phase 8 — Production Security & Monitoring](#phase-8--production-security--monitoring) and its [production checklist](#production-checklist) before running DeployX for others.
 
 ## Overview
 
@@ -1725,7 +1727,7 @@ What happens *inside* a deployment (build, health check, rollback triggered and 
   ```
 
   Sessions in the backup are as old as the backup; users simply sign in again if theirs expired.
-- **Migration recovery:** migrations run in a transaction each and take an advisory lock; a failed one leaves the schema unchanged. Fix it and run `npm run migrate` again, or revert the last one with `npm run migrate:down` (every migration has a tested down step). Take a backup before migrating production.
+- **Migration recovery:** migrations run in a transaction each and take an advisory lock; a failed one leaves the schema unchanged. Fix it and run `npm run migrate` again, or revert the last one with `npm run migrate:down` (every migration has a tested down step). Take a backup before migrating production. A down step removes what its migration added: reverting the Phase 8 migration drops roles, password hashes, sessions and the audit log (deployment history is kept; verified in Phase 9). So in production, recover from a bad migration by **restoring the backup taken before it**, not with `migrate:down`. The whole procedure (dump, deleting all deployment history, restore, migrate) was run in Phase 9 and restored every row identically.
 - **Redis recovery:** with AOF the queue survives restarts. If Redis data is lost, start Redis empty: the API and workers reconnect, and within `STUCK_DEPLOYMENT_AFTER_MS` the recovery check ends the deployments whose jobs vanished as `FAILED`, with the reason. Deploy them again. Rate-limit counters and heartbeats rebuild themselves.
 - **Deployment recovery:** deployments always end in a final state (timeouts, recovery check). The last **stable** deployment of each project is derived from the history, so after any incident redeploy it, or push again. A `ROLLBACK_FAILED` deployment needs a person: check its logs, then redeploy a known-good commit.
 - **AWS recovery:** images are in ECR by digest and every deployment records its task definition revision. To restore a version by hand, update the ECS service to the recorded `aws_task_definition_arn` (or redeploy it in DeployX). Keep ECR lifecycle rules from deleting images younger than your rollback window, and enable the ECS deployment circuit breaker.
@@ -1810,13 +1812,19 @@ Without the indexes the cost grows with the whole deployment history; with them 
 | A deployment ended *Deployment timed out after …* | it exceeded `DEPLOYMENT_TIMEOUT_MS` (or a step's own limit); the log says where |
 | *Deployment marked FAILED by the recovery check* | its job disappeared from Redis (data loss, manual removal); deploy again |
 | AWS deployment fails with `AccessDeniedException` | the worker's IAM role lacks one of the [listed actions](#aws-security-least-privilege); it is not retried |
+| Every client shares one rate limit; the audit log shows one proxy address for everybody | `TRUST_PROXY` is not set behind nginx or a load balancer: set it to the number of proxies |
+| Deployed apps are `Exited` after the Docker host restarted, but show `SUCCESS` | `LOCAL` apps are not restarted automatically; redeploy each project's stable commit (see [Phase 9](#limitations-found-in-phase-9)) |
+| `docker compose ps` shows the worker `unhealthy` | fixed in Phase 9 (the healthcheck used `localhost`); rebuild with the current `docker-compose.yml` |
+| GitHub lists a delivery as failed (timeout) | GitHub waits 10 s; the API may have been down or slow. Redeliver it from the webhook's settings: duplicates are ignored |
 
 ### Production checklist
 
 - [ ] `NODE_ENV=production` on the API and the worker; the API starts (configuration check passes)
 - [ ] Strong, unique `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `GITHUB_WEBHOOK_SECRET` (≥ 20 random characters), `METRICS_TOKEN`, all from a secret store
 - [ ] PostgreSQL and Redis on private networks, TLS on, never published publicly
-- [ ] API and dashboard only behind HTTPS; `CLIENT_URL` = the public HTTPS origin; `TRUST_PROXY` set
+- [ ] API and dashboard only behind HTTPS; `CLIENT_URL` = the public HTTPS origin; `TRUST_PROXY` = the number of proxies in front of the API (check that the audit log shows real client addresses), and the API port reachable only through them
+- [ ] GitHub webhook points at the production origin, push events only, content type JSON; a test push delivered (`202`) and a redelivery answered *Already deployed*
+- [ ] `AWS_REGION`, `AWS_ECR_REPOSITORY`, `AWS_ECS_CLUSTER` and each project's ECS service and service URL checked against the AWS console; one real deployment and one rollback done on AWS
 - [ ] Dashboard served from the `production` image (CSP, HSTS)
 - [ ] First ADMIN created with `user:create`; `ALLOW_REGISTRATION=false`
 - [ ] Worker on a dedicated build host; AWS access through an IAM role with the least-privilege policy; no access keys
@@ -1834,6 +1842,77 @@ Without the indexes the cost grows with the whole deployment history; with them 
 - Rate limits fall back to per-instance memory while Redis is down (each API instance then allows the full limit).
 - Sign-in is email and password only: no OAuth/SSO, MFA, password reset by email, or user management UI (use `user:create`). There is one ADMIN/USER role pair and no per-project sharing.
 - The Docker Compose file is a development stack; see [Production configuration](#production-configuration).
+- Deployed `LOCAL` apps do not come back after the Docker host restarts (found in Phase 9, see [below](#limitations-found-in-phase-9)).
+
+## Phase 9 — Production Validation & Release
+
+Phase 9 added no architecture. It ran the system from Phases 1–8 in a real environment, broke it on purpose, and recorded the results. The full report, with every deployment ID, commit, image, timing and check, is **[docs/PHASE9_VALIDATION.md](docs/PHASE9_VALIDATION.md)**.
+
+```text
+GitHub ─ push ─▶ Webhook (HMAC) ─▶ API ─▶ PostgreSQL (source of truth)
+                                    │
+                                    ▼
+                             BullMQ / Redis ─▶ Worker ─▶ git clone ─▶ Docker build
+                                                           │
+                                     ┌─────────────────────┴──────────────────────┐
+                                  LOCAL: docker run                  AWS_ECS: ECR push ─▶ ECS service
+                                     └─────────────────────┬──────────────────────┘
+                                                           ▼
+                                        Health check ─▶ SUCCESS (stable)
+                                              │
+                                              └─ unhealthy ─▶ Rollback to the last stable version
+                                                                ─▶ FAILED, or ROLLBACK_FAILED
+            Every status and log line ─▶ PostgreSQL + Redis Pub/Sub ─▶ SSE ─▶ dashboard
+```
+
+### Result
+
+| Area | Result |
+| ---- | ------ |
+| Real GitHub webhook (ping, unknown repository, wrong branch, correct branch, duplicate delivery, invalid signature) | **PASS**: deliveries sent by GitHub itself |
+| Real deployment: push → webhook → queue → worker → build → container → health check → `SUCCESS` | **PASS**: 12.85 s from creation, 19 s from `git push` |
+| Automatic rollback (A stable, B unhealthy) | **PASS**: A answered 190/190 requests during B's deployment and rollback |
+| First deployment failure (`NOT_AVAILABLE`), rollback failure (`ROLLBACK_FAILED`) | **PASS**: no impossible rollback, no false `SUCCESS` |
+| Concurrency (3 projects pushed at once) | **PASS**: 0 isolation problems |
+| Injected failures (GitHub, webhook delivery, PostgreSQL, Redis, worker crash, build, start-up, health-check timeout) | **PASS**: every case ends in a meaningful state |
+| SSE: live statuses, client disconnect, proxy restart in a real browser | **PASS**: 0 lost, 0 duplicated lines |
+| Security (78 live checks), secrets scan of the whole history | **PASS** |
+| Monitoring, backup/restore (history deleted and restored identically) | **PASS** |
+| Tests | **413/413**: 380 API/worker/integration/security, 11 Docker, 22 frontend; frontend build passes |
+| **Real AWS (ECR, ECS, health check and rollback on AWS)** | **NOT RUN**: no AWS account; verified only against fakes |
+
+**Release: NOT READY.** The release checklist requires a real AWS deployment, which has never been run, so no `v1.0.0` tag was created. To complete it, follow [Repeating the validation](docs/PHASE9_VALIDATION.md#repeating-the-validation) with an AWS account.
+
+**State machine:** a failed health check runs `HEALTH_CHECK → ROLLING_BACK → FAILED` (or `ROLLBACK_FAILED`), not `FAILED → ROLLING_BACK`. `FAILED` is final and ends the live stream, and the stable version's health check is logged inside `ROLLING_BACK` (unchanged since Phase 6).
+
+### Defects found and fixed
+
+- The Compose **worker was always `unhealthy`**: its healthcheck used `localhost`, which is `::1` only in the Alpine image, while the worker listens on IPv4. It now uses `127.0.0.1`.
+- During a **Redis outage** the worker printed raw stack traces outside the JSON logs (a BullMQ queue without an `error` listener). They now go through the logger as `recovery_queue_error`.
+- A **paused** stable container gave the rollback reason *no published port* (Docker hides ports while paused). It now says *the stable container is paused*.
+- `.env.example` lacked 8 variables the code reads. They were added.
+
+### Limitations found in Phase 9
+
+- **Deployed `LOCAL` apps do not survive a Docker host restart.** They run with `--restart no` (on purpose: a crashing app must fail its deployment, not restart in a loop) on ephemeral host ports. After a restart DeployX itself comes back, but the apps stay `Exited` while their deployments still read `SUCCESS`. `docker start` revives them on **new** ports (rollbacks still work, as they read the live port from Docker). **Recover by redeploying each project's stable commit.** On AWS ECS the service scheduler replaces stopped tasks.
+- **Reverting the Phase 8 migration** (`migrate:down`) drops roles, password hashes, sessions and the audit log. Recover from a bad migration with the backup taken before it.
+- GitHub waits 10 s per delivery. A delivery GitHub reports as failed can still have reached DeployX through a proxy that held the connection. Redeliver it: duplicates are ignored.
+
+### Documentation index
+
+| Topic | Section |
+| ----- | ------- |
+| Local setup | [Local Development](#local-development), [Running with Docker Compose](#running-with-docker-compose) |
+| Production setup | [Production configuration](#production-configuration), [Production checklist](#production-checklist), [`.env.production.example`](.env.production.example) |
+| GitHub configuration | [Webhook configuration](#webhook-configuration), [Webhook security](#webhook-security), [Private repositories (GitHub App)](#private-repositories-github-app) |
+| AWS setup | [ECR setup](#ecr-setup), [AWS deployment architecture](#aws-deployment-architecture) (incl. the IAM policy) |
+| Environment variables | [Environment Variables](#environment-variables), [`.env.example`](.env.example) |
+| Deployment process | [Deployment Jobs (BullMQ)](#deployment-jobs-bullmq), [Deployment lifecycle](#deployment-lifecycle), [Deployment State Machine](#deployment-state-machine-phase-5) |
+| Rollback | [Rollback](#rollback), [Rollback on AWS](#rollback-on-aws) |
+| Troubleshooting | [Troubleshooting](#troubleshooting), [Troubleshooting (Phase 8)](#troubleshooting-phase-8) |
+| Monitoring | [Metrics](#metrics), [Deployment monitoring](#deployment-monitoring-dashboard), [Alerting](#alerting) |
+| Backup and recovery | [Backup and recovery](#backup-and-recovery) |
+| Testing | [Testing](#testing), [Phase 9 validation report](docs/PHASE9_VALIDATION.md) |
 
 
 ## Dashboard (Phase 5)
@@ -1965,7 +2044,8 @@ DeployX/
 │   │   └── db/postgres.js          # pool, query(), per-project advisory lock
 │   └── Dockerfile                  # adds git + Docker CLI (buildx)
 │
-├── examples/                       # test apps for deployments (hello-app, unhealthy-app, crash-app, broken-dockerfile)
+├── examples/                       # test apps for deployments (hello-app, unhealthy-app, crash-app, broken-dockerfile, validation-app)
+├── docs/PHASE9_VALIDATION.md       # Phase 9 real-environment validation report
 ├── monitoring/                     # prometheus.yml, alert-rules.yml, alertmanager.example.yml
 ├── docker-compose.yml
 ├── .env.example                    # development settings
@@ -2373,7 +2453,7 @@ npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The default suite (378 tests, about 100 s, no Docker, AWS or network needed) covers:
+The default suite (380 tests, about 90 s, no Docker, AWS or network needed) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
@@ -2424,6 +2504,9 @@ The default suite (378 tests, about 100 s, no Docker, AWS or network needed) cov
 - **Phase 8, graceful shutdown** ([`graceful-shutdown.test.js`](server/test/graceful-shutdown.test.js)): on a real server, readiness off, new connections refused, live streams ended, the running request answered, then timers, subscriber, queue and connections closed in that order and exit 0; exit 1 when requests do not finish in time; expired and idle sessions removed on a schedule
 - **Phase 8, security regression** ([`security-regression.test.js`](server/test/security-regression.test.js)): webhook signature bypasses, cross-user access and deployment, SSRF to private and metadata addresses (incl. DNS rebinding), Docker and repository-URL injection, secrets in logs and child environments, invalid state transitions, password/session storage, committed secrets and `VITE_*` variables
 - **live stream race** ([`log-stream.test.js`](server/test/log-stream.test.js)): the last log line, committed together with the final status between the stream's two reads, is still sent before `end` (found by the AWS end-to-end test and fixed in the SSE controller)
+- **Phase 9 regressions** (found in the real-environment validation): a paused stable container ends the rollback as `ROLLBACK_FAILED` with the reason *the stable container is paused* ([`rollback.test.js`](server/test/rollback.test.js)); Redis errors of the worker's recovery queue go through the JSON logger ([`deployment-timeouts.test.js`](server/test/deployment-timeouts.test.js))
+
+The real-environment validation (real GitHub webhooks, deployments, rollbacks, injected failures, live security checks, backup/restore) is not an automated suite; how it was done and how to repeat it is in [docs/PHASE9_VALIDATION.md](docs/PHASE9_VALIDATION.md).
 
 ### Frontend tests
 
@@ -2621,9 +2704,22 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 - [x] GitHub and AWS configuration changes audited separately; graceful shutdown tested end to end; expired sessions cleaned up; indexes measured
 - [ ] Real AWS deployment verified against an AWS account (still only against fakes)
 
+**Phase 9: production validation & release**
+
+- [x] Audit of every component before changes; nothing rewritten
+- [x] Real environment: Compose services, production dashboard image, dedicated database and queue prefix; every variable documented
+- [x] Real GitHub webhook: ping, unknown repository, wrong branch, correct branch, duplicate delivery, invalid signature
+- [x] Real deployment, rollback, first-deployment failure and rollback failure on Docker, with IDs, commits, images and timings recorded
+- [x] Concurrency across three projects; GitHub, webhook, PostgreSQL, Redis, worker, build, start-up and health-check failures; SSE recovery in a real browser
+- [x] 78 live security checks; secrets scan of the whole history; performance measured (no optimisation without evidence)
+- [x] PostgreSQL backup and restore executed; migration recovery documented
+- [x] 3 defects fixed with regression tests (worker healthcheck, raw Redis error logs, paused-container rollback reason); `.env.example` completed
+- [x] 380 regular, 11 Docker and 22 frontend tests pass; client build passes
+- [ ] **Real AWS deployment (ECR, ECS, health check, rollback) — not run, so the release is not ready and `v1.0.0` is not tagged**
+
 ## Future Phases
 
-DeployX is developed incrementally across **8 phases**:
+DeployX is developed incrementally across **9 phases**:
 
 | Phase | Focus                                                                 |
 | ----- | --------------------------------------------------------------------- |
@@ -2634,4 +2730,5 @@ DeployX is developed incrementally across **8 phases**:
 | 5     | Deployment history, state machine, real-time logs (SSE) ✅            |
 | 6     | Health checks for deployed apps, automatic rollback, stable versions ✅ |
 | 7     | GitHub webhooks and App, AWS deployment: ECR + ECS/Fargate ✅ |
-| **8** | **Production security, authentication, monitoring and hardening (this phase)** ✅ |
+| 8     | Production security, authentication, monitoring and hardening ✅ |
+| **9** | **Production validation & release (this phase)**: validated except real AWS; release not ready |
