@@ -337,7 +337,7 @@ describe('secrets', () => {
 
   test('No secrets are committed; none reach the browser bundle', () => {
     const files = execFileSync('git', ['ls-files'], { cwd: ROOT, encoding: 'utf8' }).split('\n').filter(Boolean);
-    assert.ok(!files.some((file) => /(^|\/)\.env(\.|$)/.test(file) && !file.endsWith('.env.example') && !file.endsWith('docker-tests.env')));
+    assert.ok(!files.some((file) => /(^|\/)\.env(\.|$)/.test(file) && !/\.env(\.[a-z]+)?\.example$/.test(file) && !file.endsWith('docker-tests.env')));
     assert.ok(!files.some((file) => /\.(pem|key|p12|pfx)$/.test(file)));
 
     // Real-looking credentials: long private keys, AWS keys, GitHub tokens.

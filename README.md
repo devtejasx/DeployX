@@ -1454,12 +1454,12 @@ Phase 8 makes DeployX safe to run for more than one person and observable in pro
 | Timeouts | per step (git, build, run, health, ECS) | + `DEPLOYMENT_TIMEOUT_MS` for a whole attempt, AWS SDK timeouts, PostgreSQL statement timeouts |
 | Monitoring | `/api/health`, `/api/system/status` | `/health`, `/ready`, Prometheus `/metrics` (API and worker), worker heartbeats, monitoring overview + dashboard panel, alert rules |
 | Logging | ad-hoc `console` lines | structured JSON with request, deployment, project and job IDs; secrets redacted |
-| Tests | 274 regular + 11 Docker | 374 regular + 11 Docker (security, reliability, monitoring suites added) |
+| Tests | 274 regular + 11 Docker, no frontend tests | 378 regular + 11 Docker (security, reliability, monitoring, shutdown suites added) + 22 frontend tests |
 
 ### Authentication
 
 - **Accounts** have a name, an email (stored lower-case) and a password hashed with **scrypt** (Node's built-in memory-hard KDF; N = 2^17, r = 8, p = 1, 128 MiB, the OWASP recommendation; `PASSWORD_HASH_COST`). Hashes carry their parameters, so the cost can be raised later; weaker hashes are re-hashed at the next sign-in. Passwords: 12–256 characters.
-- **Sessions** are server-side (`sessions` table). The browser gets a random 256-bit token in a cookie that is **HttpOnly** (JavaScript cannot read it), **SameSite=Strict** (other sites cannot send it), **Secure** and `__Host-` prefixed in production. PostgreSQL stores only the token's **SHA-256**. Sessions end after `SESSION_TTL_HOURS` (12), after `SESSION_IDLE_TIMEOUT_MINUTES` (60) without a request, on sign-out, or when the user is deleted.
+- **Sessions** are server-side (`sessions` table). The browser gets a random 256-bit token in a cookie that is **HttpOnly** (JavaScript cannot read it), **SameSite=Strict** (other sites cannot send it), **Secure** and `__Host-` prefixed in production. PostgreSQL stores only the token's **SHA-256**. Sessions end after `SESSION_TTL_HOURS` (12), after `SESSION_IDLE_TIMEOUT_MINUTES` (60) without a request, on sign-out, or when the user is deleted. Expired and idle sessions are deleted every `SESSION_CLEANUP_INTERVAL_MS` (1 h).
 - Tokens are **never** in a URL, a response body, `localStorage` or a log. The dashboard does not see them at all.
 - **Sign-in errors are uniform**: an unknown email, an account without a password and a wrong password all answer `401 Invalid email or password`, after the same amount of hashing work.
 - **Registration** (`POST /api/auth/register`) is on in development and **off by default in production** (`ALLOW_REGISTRATION`). The first account created while no ADMIN exists becomes ADMIN (serialized by an advisory lock, so only one can); every later one is a USER. The role can never be chosen by the client.
@@ -1697,13 +1697,13 @@ The same conditions are evaluated in two places: by the API for the dashboard (t
 
 Security-sensitive actions are written to `audit_logs` (who, what, target, IP, request ID, a few non-secret details) and readable through `GET /api/audit-logs?limit=50&before=<id>` (USER: own entries; ADMIN: all):
 
-`auth.register`, `auth.login`, `auth.login_failed`, `auth.logout`, `project.created`, `project.updated` (the fields sent and their new values, which covers GitHub repository/branch and AWS target changes), `project.deleted`, `deployment.created`, `deployment.status_changed`, `deployment.log_added`, `webhook.push`, `webhook.rejected`, `access.denied`.
+`auth.register`, `auth.login`, `auth.login_failed`, `auth.logout`, `project.created`, `project.updated` (the fields sent and their new values), **`project.github_changed`** (repository or branch, with old and new values), **`project.aws_changed`** (deployment target, ECS service or service URL, with old and new values), `project.deleted`, `deployment.created`, `deployment.status_changed`, `deployment.log_added`, `webhook.push`, `webhook.rejected`, `access.denied`.
 
 What happens *inside* a deployment (build, health check, rollback triggered and its outcome, timeouts, recovery) is not duplicated: it is already in `deployments` (`rollback_status`, `rollback_deployment_id`, `error_message`, timestamps) and `deployment_logs`. Deployments cannot be cancelled in DeployX, so there is no cancel event. Passwords, tokens and signatures are never passed to the audit log.
 
 ### Graceful shutdown
 
-- **API** (`SIGTERM`/`SIGINT`): readiness turns `503` → the server stops accepting connections and closes idle keep-alive ones → live log streams end (browsers reconnect elsewhere) → running requests finish → queue, Redis and PostgreSQL close → exit. Forced after `API_SHUTDOWN_TIMEOUT_MS` (10 s). The API holds no deployment state of its own.
+- **API** (`SIGTERM`/`SIGINT`, [`lib/shutdown.js`](server/src/lib/shutdown.js), tested on a real server in [`graceful-shutdown.test.js`](server/test/graceful-shutdown.test.js)): readiness turns `503` → the server stops accepting connections and closes idle keep-alive ones → live log streams end (browsers reconnect elsewhere) → running requests finish → background timers stop → event subscriber, queue, Redis and PostgreSQL close → exit. Forced after `API_SHUTDOWN_TIMEOUT_MS` (10 s). The API holds no deployment state of its own.
 - **Worker**: heartbeat `stopping` and readiness `503` → no new jobs → running jobs finish (up to `WORKER_SHUTDOWN_TIMEOUT_MS`) → recovery check, heartbeat, metrics server, Redis and PostgreSQL close → exit. A job still running when the timeout hits is resumed by the next worker (see the table above); nothing is left in a state that cannot be recovered.
 - Both log `unhandledRejection`; an `uncaughtException` is logged and the process exits for the orchestrator to restart it.
 
@@ -1732,12 +1732,13 @@ What happens *inside* a deployment (build, health check, rollback triggered and 
 
 ### Production configuration
 
-`NODE_ENV=production` changes the defaults that matter: Secure session cookies, registration off, HSTS on, `/metrics` closed without a token, and the startup configuration check. Development and test use their own databases and queue prefixes (the tests use `<db>_test` and `deployx-test`), so they cannot touch production data. Every variable is in [`.env.example`](.env.example); the Phase 8 additions:
+`NODE_ENV=production` changes the defaults that matter: Secure session cookies, registration off, HSTS on, `/metrics` closed without a token, and the startup configuration check. [`.env.production.example`](.env.production.example) lists every production setting with placeholders (never real values); development starts from [`.env.example`](.env.example). Development and test use their own databases and queue prefixes (the tests use `<db>_test` and `deployx-test`), so they cannot touch production data. Every variable is in [`.env.example`](.env.example); the Phase 8 additions:
 
 | Variable | Default | Purpose |
 | -------- | ------- | ------- |
 | `ALLOW_REGISTRATION` | `true`, `false` in production | self-service sign-up |
 | `SESSION_TTL_HOURS` / `SESSION_IDLE_TIMEOUT_MINUTES` | `12` / `60` | session lifetime / idle timeout |
+| `SESSION_CLEANUP_INTERVAL_MS` | `3600000` | how often expired sessions are deleted |
 | `SESSION_COOKIE_SECURE` | `true` in production | HTTPS-only cookie |
 | `PASSWORD_HASH_COST` | `17` | log2 of scrypt's N |
 | `CLIENT_URL` | `http://localhost:3000` | dashboard origin(s), comma-separated: CORS and cross-site checks |
@@ -1776,6 +1777,7 @@ What happens *inside* a deployment (build, health check, rollback triggered and 
 - Authentication state comes from `GET /api/auth/me`; any `401` returns the dashboard to the sign-in form. No token is stored in the browser (`document.cookie` and `localStorage` stay empty).
 - The production build has no inline scripts or styles and runs under a CSP that allows only its own origin. Verified in a browser: sign-in, monitoring, the deployment history and live SSE logs work with no CSP violations.
 - No `VITE_*` variables are used; the bundle contains no configuration or secret.
+- **Frontend tests** ([`client/test/`](client/test), Vitest + Testing Library in jsdom, `npm run test:client`): the API client (cookies only, error codes, 401 signs out), signed-out view requests no data, sign-in and registration errors, session expiry and sign-out, nothing stored in the browser, API data rendered as text (an `<img onerror>` project name stays text), the monitoring panel showing real values and "unavailable" instead of zeros, and source scans: no raw HTML, no browser storage, no build-time variables, no tokens in URLs, a CSP without `unsafe-inline` that matches nginx.
 
 ### Dependency security
 
@@ -1783,7 +1785,15 @@ What happens *inside* a deployment (build, health check, rollback triggered and 
 
 ### Performance notes
 
-Measured against the actual query patterns rather than tuned blindly: the only queries that run continually are the dashboard overview (every 5 s per open dashboard), the `/metrics` gauges (every scrape), the recovery check (every minute) and session lookups (every request, by unique hash). The two new deployment indexes cover the first three; everything else already had an index. Memory stays bounded: SSE streams read logs in batches of 500 and hold no backlog, log lines are capped at 10,000 characters, stored build output at 150 lines per attempt, one shared Redis subscriber serves all streams, BullMQ keeps completed jobs for 24 h / 1,000 and failed jobs for 7 days, metric labels use route patterns (never IDs), and the in-memory rate-limit fallback sweeps expired windows.
+Measured against the actual query patterns rather than tuned blindly: the only queries that run continually are the dashboard overview (every 5 s per open dashboard), the `/metrics` gauges (every scrape), the recovery check (every minute) and session lookups (every request, by unique hash). Session lookups use the unique token-hash index; the other three were measured with `EXPLAIN ANALYZE` on a seeded database (200 projects, 100,000 finished and 20 unfinished deployments; median of 7 runs):
+
+| Query | Without the Phase 8 indexes | With them |
+| ----- | --------------------------- | --------- |
+| Recovery check (unfinished, unchanged for 10 min) | 11.9 ms, sequential scan | 0.04 ms, `deployments_unfinished_idx` |
+| `deployx_deployments_in_progress` gauge | 10.9 ms, sequential scan | 0.04 ms, `deployments_unfinished_idx` |
+| Overview: outcomes of the last 24 hours | 6.4 ms, sequential scan | 0.05 ms, `deployments_finished_at_idx` |
+
+Without the indexes the cost grows with the whole deployment history; with them it depends only on the unfinished or recent deployments. No other index was added. Memory stays bounded: SSE streams read logs in batches of 500 and hold no backlog, log lines are capped at 10,000 characters, stored build output at 150 lines per attempt, one shared Redis subscriber serves all streams, BullMQ keeps completed jobs for 24 h / 1,000 and failed jobs for 7 days, metric labels use route patterns (never IDs), and the in-memory rate-limit fallback sweeps expired windows.
 
 ### Troubleshooting (Phase 8)
 
@@ -1815,7 +1825,7 @@ Measured against the actual query patterns rather than tuned blindly: the only q
 - [ ] Redis with AOF and `noeviction`
 - [ ] Prometheus scraping the API and every worker; alert rules loaded; Alertmanager (or CloudWatch alarms) delivering to a real channel; a test alert received
 - [ ] Logs shipped and retained; nothing secret in them
-- [ ] `npm audit` clean; the full test suite and the Docker tests pass
+- [ ] `npm audit` clean; the full test suite, the frontend tests and the Docker tests pass
 
 ### Known limitations
 
@@ -1875,7 +1885,8 @@ DeployX/
 │   │   ├── App.jsx
 │   │   ├── index.css
 │   │   └── main.jsx
-│   ├── vite.config.js              # dev server on :3000, /api proxy; preview with the security headers
+│   ├── test/                       # frontend tests (Vitest, Testing Library)
+│   ├── vite.config.js              # dev server on :3000, /api proxy; preview with the security headers; test config
 │   ├── nginx.conf.template         # production image: static files + /api proxy
 │   ├── security-headers.conf       # production CSP and headers
 │   └── Dockerfile                  # targets: development (Vite) and production (nginx)
@@ -1889,7 +1900,7 @@ DeployX/
 │   │   │                           # githubWebhook.service.js: signature, push parsing, queueDeployment()
 │   │   │                           # password.js (scrypt), session.service.js, auth.service.js, access.js (RBAC),
 │   │   │                           # audit.service.js, monitoring.service.js (overview + alerts), metricsCollectors.js
-│   │   ├── lib/                    # logger.js (JSON, redaction), metrics.js (prom-client), lifecycle.js
+│   │   ├── lib/                    # logger.js (JSON, redaction), metrics.js (prom-client), lifecycle.js, shutdown.js
 │   │   ├── scripts/createUser.js   # npm run user:create
 │   │   ├── validators/             # zod schemas for request bodies
 │   │   ├── middleware/
@@ -1957,7 +1968,8 @@ DeployX/
 ├── examples/                       # test apps for deployments (hello-app, unhealthy-app, crash-app, broken-dockerfile)
 ├── monitoring/                     # prometheus.yml, alert-rules.yml, alertmanager.example.yml
 ├── docker-compose.yml
-├── .env.example
+├── .env.example                    # development settings
+├── .env.production.example         # production settings (placeholders only)
 └── package.json                    # convenience scripts for the whole repo
 ```
 
@@ -2361,7 +2373,7 @@ npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The default suite (374 tests, about 80 s, no Docker, AWS or network needed) covers:
+The default suite (378 tests, about 100 s, no Docker, AWS or network needed) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
@@ -2409,8 +2421,17 @@ The default suite (374 tests, about 80 s, no Docker, AWS or network needed) cove
 - **Phase 8, HTTP hardening and rate limits** ([`http-security.test.js`](server/test/http-security.test.js), [`rate-limit.test.js`](server/test/rate-limit.test.js)): security headers, CORS allow-list, cross-site requests refused, `415`/`413`, error codes without internals, the production configuration check; sign-in, registration, webhook, deployment, project and API limits, shared through Redis, memory fallback when Redis is down or hangs
 - **Phase 8, observability** ([`observability.test.js`](server/test/observability.test.js), [`worker-monitoring.test.js`](server/test/worker-monitoring.test.js), [`monitoring.test.js`](server/test/monitoring.test.js)): request IDs, JSON logs with IDs and without secrets, redaction, liveness vs readiness (database down, shutdown), API and worker metrics from real events, metrics token, heartbeats, the monitoring overview and every alert, scoping per user
 - **Phase 8, reliability** ([`deployment-timeouts.test.js`](server/test/deployment-timeouts.test.js), [`reliability.test.js`](server/test/reliability.test.js)): deployment timeout kills the running command and fails without retry, cleanup still runs, health checks stop early; AWS and SQL timeouts; recovery of deployments whose job was lost (one worker at a time); Redis outage and recovery for the API; Redis connections killed under a running worker; PostgreSQL failing when a job starts; a worker dying mid-deployment
+- **Phase 8, graceful shutdown** ([`graceful-shutdown.test.js`](server/test/graceful-shutdown.test.js)): on a real server, readiness off, new connections refused, live streams ended, the running request answered, then timers, subscriber, queue and connections closed in that order and exit 0; exit 1 when requests do not finish in time; expired and idle sessions removed on a schedule
 - **Phase 8, security regression** ([`security-regression.test.js`](server/test/security-regression.test.js)): webhook signature bypasses, cross-user access and deployment, SSRF to private and metadata addresses (incl. DNS rebinding), Docker and repository-URL injection, secrets in logs and child environments, invalid state transitions, password/session storage, committed secrets and `VITE_*` variables
 - **live stream race** ([`log-stream.test.js`](server/test/log-stream.test.js)): the last log line, committed together with the final status between the stream's two reads, is still sent before `end` (found by the AWS end-to-end test and fixed in the SSE controller)
+
+### Frontend tests
+
+```bash
+npm run test:client       # 22 tests, about 2 s (Vitest, jsdom; no API needed)
+```
+
+See [Frontend security](#frontend-security) for what they cover.
 
 ### Docker end-to-end tests
 
@@ -2596,7 +2617,8 @@ If 5432 is inside one of the ranges, pick a free port in `.env`. Set both `POSTG
 - [x] `/health` and `/ready` for the API and the worker; worker heartbeats
 - [x] Structured logs; Prometheus metrics; deployment failures and rollbacks observable; dashboard monitoring panel and alerts; Prometheus alert rules
 - [x] Audit log; graceful shutdown; backup and recovery procedure; production configuration and checklist
-- [x] 374 regular tests (incl. security regression) and 11 Docker tests pass; client build passes
+- [x] 378 regular tests (incl. security regression), 22 frontend tests and 11 Docker tests pass; client build passes
+- [x] GitHub and AWS configuration changes audited separately; graceful shutdown tested end to end; expired sessions cleaned up; indexes measured
 - [ ] Real AWS deployment verified against an AWS account (still only against fakes)
 
 ## Future Phases
