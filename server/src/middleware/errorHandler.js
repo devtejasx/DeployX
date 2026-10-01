@@ -1,5 +1,5 @@
 import { recordAudit } from '../services/audit.service.js';
-import { ApiError } from '../utils/ApiError.js';
+import { ApiError, defaultErrorCode } from '../utils/ApiError.js';
 
 // PostgreSQL error codes that indicate bad input rather than a server fault.
 // Validation should catch these first; this is the safety net.
@@ -13,15 +13,18 @@ const PG_ERRORS = {
 
 function toClientError(err) {
   if (err instanceof ApiError) {
-    return { statusCode: err.statusCode, message: err.message, details: err.details, extra: err.extra };
+    return { statusCode: err.statusCode, code: err.code, message: err.message, details: err.details, extra: err.extra };
   }
 
-  // Raised by express.json() for unparsable or oversized bodies.
+  // Raised by the body parsers for unparsable or oversized bodies.
   if (err.type === 'entity.parse.failed') {
     return { statusCode: 400, message: 'Malformed JSON in request body' };
   }
   if (err.type === 'entity.too.large') {
     return { statusCode: 413, message: 'Request body too large' };
+  }
+  if (err.type === 'encoding.unsupported' || err.type === 'charset.unsupported') {
+    return { statusCode: 415, message: 'Unsupported request body encoding' };
   }
 
   if (err.code && PG_ERRORS[err.code]) {
@@ -33,11 +36,14 @@ function toClientError(err) {
 
 // Global error handler. Express recognises it by its four-argument signature,
 // so `next` must stay in the parameter list even though it is unused.
+//
+// Every error response has the same shape, in development and production:
+//   { success: false, error: { code, message, details? } }
+// Internal details (SQL, stack traces, connection strings, file paths) are
+// only logged, never sent to the client.
 export function errorHandler(err, req, res, next) {
-  const { statusCode, message, details, extra } = toClientError(err);
+  const { statusCode, code, message, details, extra } = toClientError(err);
 
-  // Internal details (SQL, stack traces, connection strings) are only logged,
-  // never sent to the client.
   // Deliberate ApiErrors (e.g. 503 queue unavailable) are logged where they
   // are raised; only unexpected failures need a stack trace here.
   if (statusCode >= 500 && !(err instanceof ApiError)) {
@@ -49,7 +55,11 @@ export function errorHandler(err, req, res, next) {
     recordAudit({ req, action: 'access.denied', details: { method: req.method, path: req.originalUrl.slice(0, 300), reason: message } });
   }
 
-  const error = { message, ...extra };
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  const error = { code: code ?? defaultErrorCode(statusCode, details), message, ...extra };
   if (details) error.details = details;
 
   res.status(statusCode).json({ success: false, error });

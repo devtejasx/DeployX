@@ -168,6 +168,7 @@ describe('rollback fields on a deployment', () => {
     const early = await patch('ROLLING_BACK');
     assert.equal(early.status, 409);
     assert.deepEqual(early.body.error, {
+      code: 'INVALID_STATE_TRANSITION',
       message: 'Invalid deployment state transition',
       from: 'QUEUED',
       to: 'ROLLING_BACK',
@@ -191,6 +192,7 @@ describe('rollback fields on a deployment', () => {
     const tooEarly = await patch('ROLLBACK_FAILED');
     assert.equal(tooEarly.status, 409);
     assert.deepEqual(tooEarly.body.error, {
+      code: 'INVALID_STATE_TRANSITION',
       message: 'Invalid deployment state transition',
       from: 'HEALTH_CHECK',
       to: 'ROLLBACK_FAILED',

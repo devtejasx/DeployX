@@ -149,7 +149,7 @@ describe('GET /api/projects/:id', () => {
   test('returns 404 for a project that does not exist', async () => {
     const { status, body } = await api.get(`/api/projects/${MISSING_ID}`);
     assert.equal(status, 404);
-    assert.deepEqual(body, { success: false, error: { message: 'Project not found' } });
+    assert.deepEqual(body, { success: false, error: { code: 'NOT_FOUND', message: 'Project not found' } });
   });
 
   test('returns 400 for a malformed ID', async () => {

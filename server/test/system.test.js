@@ -42,7 +42,7 @@ test('GET /api/system/status checks PostgreSQL and Redis', async () => {
 test('unknown routes return 404 in the standard error format', async () => {
   const { status, body } = await api.get('/api/does-not-exist');
   assert.equal(status, 404);
-  assert.deepEqual(body, { success: false, error: { message: 'Route not found: GET /api/does-not-exist' } });
+  assert.deepEqual(body, { success: false, error: { code: 'NOT_FOUND', message: 'Route not found: GET /api/does-not-exist' } });
 });
 
 test('malformed JSON returns 400', async () => {

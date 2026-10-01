@@ -68,7 +68,7 @@ describe('POST /api/projects/:projectId/deployments', () => {
     assert.equal(status, 503);
     assert.deepEqual(body, {
       success: false,
-      error: { message: 'Deployment queue is unavailable; the deployment was marked as FAILED' },
+      error: { code: 'SERVICE_UNAVAILABLE', message: 'Deployment queue is unavailable; the deployment was marked as FAILED' },
     });
 
     const { rows } = await pool.query(
@@ -228,7 +228,7 @@ describe('deployment state machine through the API', () => {
     assert.equal(skip.status, 409);
     assert.deepEqual(skip.body, {
       success: false,
-      error: { message: 'Invalid deployment state transition', from: 'QUEUED', to: 'SUCCESS' },
+      error: { code: 'INVALID_STATE_TRANSITION', message: 'Invalid deployment state transition', from: 'QUEUED', to: 'SUCCESS' },
     });
 
     await patch('BUILDING');
@@ -237,6 +237,7 @@ describe('deployment state machine through the API', () => {
     const unchecked = await patch('SUCCESS');
     assert.equal(unchecked.status, 409);
     assert.deepEqual(unchecked.body.error, {
+      code: 'INVALID_STATE_TRANSITION',
       message: 'Invalid deployment state transition',
       from: 'DEPLOYING',
       to: 'SUCCESS',
@@ -251,7 +252,7 @@ describe('deployment state machine through the API', () => {
     ]) {
       const { status, body } = await patch(to);
       assert.equal(status, 409, `${from} -> ${to}`);
-      assert.deepEqual(body.error, { message: 'Invalid deployment state transition', from, to });
+      assert.deepEqual(body.error, { code: 'INVALID_STATE_TRANSITION', message: 'Invalid deployment state transition', from, to });
     }
 
     const unchanged = await api.get(`/api/deployments/${deployment.id}`);
@@ -263,7 +264,7 @@ describe('deployment state machine through the API', () => {
     await api.patch(`/api/deployments/${deployment.id}/status`, { status: 'FAILED' });
     const { status, body } = await api.patch(`/api/deployments/${deployment.id}/status`, { status: 'DEPLOYING' });
     assert.equal(status, 409);
-    assert.deepEqual(body.error, { message: 'Invalid deployment state transition', from: 'FAILED', to: 'DEPLOYING' });
+    assert.deepEqual(body.error, { code: 'INVALID_STATE_TRANSITION', message: 'Invalid deployment state transition', from: 'FAILED', to: 'DEPLOYING' });
   });
 
   test('setting the current status again changes nothing', async () => {

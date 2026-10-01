@@ -72,7 +72,7 @@ describe('webhook security', () => {
     const before = await deploymentCount();
     const { status, body } = await send({ payload: pushPayload({ repo: project.github_repo }), signature: null });
     assert.equal(status, 401);
-    assert.deepEqual(body, { success: false, error: { message: 'Missing X-Hub-Signature-256 header' } });
+    assert.deepEqual(body, { success: false, error: { code: 'UNAUTHORIZED', message: 'Missing X-Hub-Signature-256 header' } });
     assert.equal(await deploymentCount(), before);
   });
 

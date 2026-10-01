@@ -68,6 +68,7 @@ services:
       NODE_ENV: ${NODE_ENV:-development}
       PORT: 5000
       CLIENT_URL: ${CLIENT_URL:-http://localhost:3000}
+      TRUST_PROXY: ${TRUST_PROXY:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-deployx}:${POSTGRES_PASSWORD:-deployx}@postgres:5432/${POSTGRES_DB:-deployx}
       REDIS_URL: redis://:${REDIS_PASSWORD:-deployx-dev-redis}@redis:6379
       QUEUE_PREFIX: ${QUEUE_PREFIX:-deployx}

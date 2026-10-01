@@ -279,7 +279,7 @@ describe('database errors', () => {
     const { status, body } = await api.get('/api/projects');
 
     assert.equal(status, 500);
-    assert.deepEqual(body, { success: false, error: { message: 'Internal server error' } });
+    assert.deepEqual(body, { success: false, error: { code: 'INTERNAL_ERROR', message: 'Internal server error' } });
     assert.ok(!JSON.stringify(body).includes('deployx'));
   });
 });

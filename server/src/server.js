@@ -1,10 +1,20 @@
 import app from './app.js';
-import config from './config/index.js';
+import config, { productionConfigProblems } from './config/index.js';
 import { closePostgres } from './db/postgres.js';
 import { connectRedis, closeRedis } from './db/redis.js';
 import { closeAllLogStreams } from './controllers/logStream.controller.js';
 import { closeSubscriber } from './events/deploymentSubscriber.js';
 import { closeDeploymentQueue } from './queues/deploymentQueue.js';
+
+// Development defaults (passwords, insecure cookies, "*" origins) must never
+// reach production: refuse to start instead.
+if (config.env === 'production') {
+  const problems = productionConfigProblems();
+  if (problems.length > 0) {
+    console.error(`[api] refusing to start: unsafe production configuration:\n  - ${problems.join('\n  - ')}`);
+    process.exit(1);
+  }
+}
 
 connectRedis();
 

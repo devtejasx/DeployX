@@ -22,7 +22,7 @@ export async function transitionDeploymentStatus(deploymentId, newStatus, { erro
   } catch (err) {
     if (err.code === INVALID_TRANSITION) {
       const { from, to } = JSON.parse(err.detail);
-      throw new ApiError(409, 'Invalid deployment state transition', undefined, { from, to });
+      throw new ApiError(409, 'Invalid deployment state transition', undefined, { from, to }, 'INVALID_STATE_TRANSITION');
     }
     throw err;
   }

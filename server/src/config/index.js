@@ -24,10 +24,40 @@ function booleanSetting(value, fallback) {
 
 const env = process.env.NODE_ENV || 'development';
 
+// CLIENT_URL: the dashboard's origin, or several separated by commas. Only
+// these origins get CORS headers and may send state-changing requests from a
+// browser; "*" is never accepted.
+function parseOrigins(value) {
+  const origins = new Set();
+  for (const entry of (value || 'http://localhost:3000').split(',')) {
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed === '*') continue;
+    try {
+      const url = new URL(trimmed);
+      if (['http:', 'https:'].includes(url.protocol)) origins.add(url.origin);
+    } catch {
+      // Not a URL: ignored (and reported by productionConfigProblems).
+    }
+  }
+  return [...origins];
+}
+
+// TRUST_PROXY: unset/false when clients connect directly; the number of proxy
+// hops (e.g. 1 behind one load balancer) or Express's names ("loopback") so
+// req.ip is the real client address - rate limits and audit entries use it.
+function trustProxySetting(value) {
+  if (value === undefined || value === '' || value === 'false') return false;
+  if (value === 'true') return true;
+  if (/^\d+$/.test(value)) return Number(value);
+  return value;
+}
+
 const config = {
   env,
   port: Number(process.env.PORT) || 5000,
   clientUrl: process.env.CLIENT_URL || 'http://localhost:3000',
+  clientOrigins: parseOrigins(process.env.CLIENT_URL),
+  trustProxy: trustProxySetting(process.env.TRUST_PROXY),
   databaseUrl: process.env.DATABASE_URL || 'postgresql://deployx:deployx@localhost:5432/deployx',
   redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
   // BullMQ deployment queue. The worker must use the same prefix.
@@ -64,5 +94,44 @@ const config = {
     passwordHashCost: Math.min(Math.max(positiveInt(process.env.PASSWORD_HASH_COST, 17), 10), 20),
   },
 };
+
+// Settings that must never reach production. Returns a list of problems
+// (empty when the configuration is safe); server.js refuses to start in
+// production while there are any.
+export function productionConfigProblems(settings = config, rawClientUrl = process.env.CLIENT_URL) {
+  const problems = [];
+  const credentials = (url) => {
+    try {
+      const parsed = new URL(url);
+      return { user: decodeURIComponent(parsed.username), password: decodeURIComponent(parsed.password) };
+    } catch {
+      return { user: '', password: '' };
+    }
+  };
+  const db = credentials(settings.databaseUrl);
+  if (!db.password || ['deployx', 'postgres', 'password'].includes(db.password)) {
+    problems.push('DATABASE_URL uses a missing or development password');
+  }
+  const redis = credentials(settings.redisUrl);
+  if (!redis.password || redis.password === 'deployx-dev-redis') {
+    problems.push('REDIS_URL has no password or the development one');
+  }
+  if (!rawClientUrl) problems.push('CLIENT_URL is not set');
+  if (rawClientUrl && rawClientUrl.split(',').some((entry) => entry.trim() === '*')) {
+    problems.push('CLIENT_URL must list origins, not "*"');
+  }
+  for (const origin of settings.clientOrigins) {
+    const { hostname, protocol } = new URL(origin);
+    if (protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(hostname)) {
+      problems.push(`CLIENT_URL origin ${origin} is not HTTPS`);
+    }
+  }
+  if (!settings.auth.cookieSecure) problems.push('SESSION_COOKIE_SECURE must not be false');
+  if (settings.auth.passwordHashCost < 15) problems.push('PASSWORD_HASH_COST must be at least 15');
+  if (settings.github.webhookSecret && settings.github.webhookSecret.length < 20) {
+    problems.push('GITHUB_WEBHOOK_SECRET is too short (use at least 20 random characters)');
+  }
+  return problems;
+}
 
 export default config;
