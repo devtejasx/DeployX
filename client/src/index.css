@@ -226,7 +226,9 @@ button:disabled {
   min-width: 0;
 }
 
-@media (max-width: 800px) {
+/* Side by side, the deployment history needs a 1200 px window to show every
+   column; below that the applications go above it. */
+@media (max-width: 1199px) {
   .deployments {
     grid-template-columns: minmax(0, 1fr);
   }
