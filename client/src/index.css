@@ -3,7 +3,8 @@
   --surface: #ffffff;
   --border: #e2e8f0;
   --text: #0f172a;
-  --muted: #64748b;
+  /* At least 4.5:1 (WCAG AA) on the page, cards and the selected-row tint. */
+  --muted: #5b6b80;
   --accent: #2563eb;
   --ok: #15803d;
   --bad: #b91c1c;
@@ -530,7 +531,8 @@ button:disabled {
 }
 
 .log-line__time {
-  color: #64748b;
+  /* 7:1 on the log background in both themes. */
+  color: #94a3b8;
 }
 
 .log-line__message {

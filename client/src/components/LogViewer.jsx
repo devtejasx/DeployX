@@ -17,7 +17,10 @@ const FAILURE_NOTES = {
 };
 
 // Deployment log lines, following new lines while the reader is at the bottom
-// (scrolling up to read earlier output pauses the auto-scroll).
+// (scrolling up to read earlier output pauses the auto-scroll). The list is
+// not a live region: a build writes dozens of lines a second, and screen
+// readers would read every one. Progress is announced by the deployment's
+// activity line, the stream state and the closing notice instead.
 export default function LogViewer({ logs, connection, status, rollbackStatus, ended }) {
   const listRef = useRef(null);
   const stickToBottom = useRef(true);
@@ -42,7 +45,7 @@ export default function LogViewer({ logs, connection, status, rollbackStatus, en
         </span>
       </div>
 
-      <ol className="log-view" ref={listRef} onScroll={onScroll} aria-label="Deployment logs" aria-live="polite">
+      <ol className="log-view" ref={listRef} onScroll={onScroll} aria-label="Deployment logs" tabIndex={0}>
         {logs.map((line) => (
           <li key={line.id} className={`log-line log-line--${line.level.toLowerCase()}`}>
             <time className="log-line__time" dateTime={line.created_at}>
@@ -54,9 +57,15 @@ export default function LogViewer({ logs, connection, status, rollbackStatus, en
         {logs.length === 0 && <li className="muted">Waiting for log lines…</li>}
       </ol>
 
-      {ended && status === 'SUCCESS' && <p className="notice notice--ok">Deployment completed successfully.</p>}
+      {ended && status === 'SUCCESS' && (
+        <p className="notice notice--ok" role="status">
+          Deployment completed successfully.
+        </p>
+      )}
       {ended && (status === 'FAILED' || status === 'ROLLBACK_FAILED') && (
-        <p className="notice notice--error">{FAILURE_NOTES[rollbackStatus] ?? 'Deployment failed.'}</p>
+        <p className="notice notice--error" role="status">
+          {FAILURE_NOTES[rollbackStatus] ?? 'Deployment failed.'}
+        </p>
       )}
     </div>
   );
