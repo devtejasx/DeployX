@@ -4,7 +4,7 @@ A repeatable, local demonstration of DeployX's main promise: **a bad release nev
 
 Everything runs on your machine against this repository's [example apps](../examples): no GitHub webhook, no tunnel, no cloud account. The demo creates one application, `demo-rollback`, owned by the account you sign in with. It does not touch other applications, and the steps to remove it are [at the end](#cleaning-up).
 
-**Status of this guide:** the automated demo (`npm run demo`) was **executed twice on 2026-10-13** against the Docker Compose stack, on Windows 11 with Docker Desktop 29.8, and passed both times. The output below is from the second run. The [dashboard walkthrough](#3-the-same-walkthrough-in-the-dashboard) was then performed in a browser on the same stack (application `demo-live`): the healthy deployment reached `SUCCESS` in 12 s, the unhealthy one showed `ROLLING_BACK` and ended `FAILED` with the rollback completed 21 s after **Deploy**, and the first version kept answering. The [screenshots](#screenshots) were captured from the demo data.
+**Status of this guide:** the automated demo (`npm run demo`) was **executed three times on 2026-10-13** against the Docker Compose stack, on Windows 11 with Docker Desktop 29.8, and passed every time (32.0–33.4 s); it also passed on a fresh clone with empty volumes. The output below is from the second run; the third, on the final code of the day, produced the same sequence in 32.1 s. The [dashboard walkthrough](#3-the-same-walkthrough-in-the-dashboard) was then performed in a browser on the same stack (application `demo-live`): the healthy deployment reached `SUCCESS` in 12 s, the unhealthy one showed `ROLLING_BACK` and ended `FAILED` with the rollback completed 21 s after **Deploy**, and the first version kept answering. The [screenshots](#screenshots) were captured from the demo data.
 
 ## 1. Start the stack and create an account
 
@@ -120,7 +120,7 @@ Set the Dockerfile path back to `examples/hello-app/Dockerfile` afterwards if yo
 
 ## Screenshots
 
-Genuine screenshots of the running dashboard, captured on 2026-10-13 from the stack and data of the demo run above (headless Chrome, 1440 px wide, light theme; the phone view at 390 px). None are mock-ups.
+Genuine screenshots of the running dashboard, captured on 2026-10-13 after the third demo run, on the final code of the day (headless Chrome, 1440 px wide, light theme; the phone view at 390 px). None are mock-ups.
 
 | Screenshot | Shows |
 | ---------- | ----- |
@@ -131,8 +131,10 @@ Genuine screenshots of the running dashboard, captured on 2026-10-13 from the st
 | ![Monitoring](screenshots/monitoring.png) | [`monitoring.png`](screenshots/monitoring.png): the monitoring panel: alerts, applications by state, worker heartbeat, queue, last 24 hours, recent failures |
 | ![New application](screenshots/new-application.png) | [`new-application.png`](screenshots/new-application.png): the form that creates an application |
 | ![Phone](screenshots/mobile.png) | [`mobile.png`](screenshots/mobile.png): the top of the dashboard at phone width |
+| ![Deployment in progress](screenshots/deployment-live.png) | [`deployment-live.png`](screenshots/deployment-live.png): a deployment captured during `HEALTH_CHECK`: steps, activity line, the health check running and the log stream **Live** |
+| ![Sign-in](screenshots/sign-in.png) | [`sign-in.png`](screenshots/sign-in.png): the signed-out page: public system status and the sign-in form |
 
-Not captured: the sign-in form and a live, in-progress deployment (both are easy to see by following the walkthrough). To capture fresh screenshots, run the demo, open the dashboard links it prints, and take them at the same sizes.
+To capture fresh screenshots, run the demo, open the dashboard links it prints, and take them at the same sizes. Not captured: the dark theme and the tablet layout.
 
 ## Cleaning up
 
