@@ -111,3 +111,37 @@ describe('new application', () => {
     expect(within(form).getByLabelText('Name').value).toBe('hello');
   });
 });
+
+describe('application settings', () => {
+  test('the Dockerfile path, container port and health-check path can be changed', async () => {
+    let stored = PROJECT;
+    const { calls } = fakeApi(
+      routes({
+        'GET /api/projects': () => ok([stored]),
+        [`PUT /api/projects/${PROJECT.id}`]: ({ body }) => {
+          stored = { ...stored, ...body };
+          return ok(stored);
+        },
+        [`GET /api/projects/${PROJECT.id}/deployments`]: ok([]),
+      }),
+    );
+    window.location.hash = `#/projects/${PROJECT.id}`;
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    const form = screen.getByRole('region', { name: 'Settings · hello' });
+    expect(within(form).getByLabelText('Container port').value).toBe('3000');
+    type(form, 'Dockerfile path', 'examples/unhealthy-app/Dockerfile');
+    type(form, 'Container port', '8080');
+    type(form, 'Health-check path', '/ready');
+    fireEvent.click(within(form).getByRole('button', { name: 'Save' }));
+
+    expect(await within(form).findByRole('status')).toBeTruthy();
+    const put = calls.find((call) => call.method === 'PUT');
+    expect(JSON.parse(put.options.body)).toMatchObject({
+      dockerfile_path: 'examples/unhealthy-app/Dockerfile',
+      container_port: 8080,
+      health_check_path: '/ready',
+    });
+    expect(within(form).getByLabelText('Dockerfile path').value).toBe('examples/unhealthy-app/Dockerfile');
+  });
+});

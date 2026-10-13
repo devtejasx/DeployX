@@ -6,13 +6,17 @@ function formFrom(project) {
   return {
     github_repo: project.github_repo,
     github_branch: project.github_branch,
+    dockerfile_path: project.dockerfile_path,
+    container_port: project.container_port == null ? '' : String(project.container_port),
+    health_check_path: project.health_check_path,
     deployment_target: project.deployment_target,
     aws_ecs_service: project.aws_ecs_service ?? '',
     aws_service_url: project.aws_service_url ?? '',
   };
 }
 
-// An application's repository, branch and deployment target, saved with
+// An application's repository, branch, Dockerfile, runtime and deployment
+// target, saved with
 // PUT /api/projects/:id. The API validates everything and its messages are
 // shown as they are; nothing is kept here once it is saved. No secret (the
 // webhook secret, GitHub or AWS credentials) ever reaches the browser.
@@ -50,6 +54,10 @@ export default function ProjectSettings({ project, onSaved, onClose }) {
       const updated = await updateProject(project.id, {
         github_repo: form.github_repo,
         github_branch: form.github_branch,
+        dockerfile_path: form.dockerfile_path,
+        // An empty port is sent as it is, so the API names the problem.
+        container_port: form.container_port === '' ? null : Number(form.container_port),
+        health_check_path: form.health_check_path,
         deployment_target: form.deployment_target,
         aws_ecs_service: form.aws_ecs_service.trim() || null,
         aws_service_url: form.aws_service_url.trim() || null,
@@ -88,10 +96,39 @@ export default function ProjectSettings({ project, onSaved, onClose }) {
             <span>Branch</span>
             <input value={form.github_branch} onChange={change('github_branch')} placeholder="main" required />
           </label>
+          <label>
+            <span>Dockerfile path</span>
+            <input value={form.dockerfile_path} onChange={change('dockerfile_path')} placeholder="Dockerfile" required />
+          </label>
           <p className="settings__hint muted">
             Owner <code>{repositoryName(project.github_repo).split('/')[0]}</code> · repository{' '}
             <code>{repositoryName(project.github_repo).split('/')[1]}</code>. Pushes to this branch are deployed
             automatically, each at its exact commit.
+          </p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Runtime</legend>
+          <label>
+            <span>Container port</span>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={65535}
+              value={form.container_port}
+              onChange={change('container_port')}
+              placeholder="3000"
+              required
+            />
+          </label>
+          <label>
+            <span>Health-check path</span>
+            <input value={form.health_check_path} onChange={change('health_check_path')} placeholder="/health" required />
+          </label>
+          <p className="settings__hint muted">
+            A deployment becomes <code>SUCCESS</code> only when this path answers with a 2xx status on the container
+            port (or on the service URL on AWS); otherwise the last stable version is restored.
           </p>
         </fieldset>
 
