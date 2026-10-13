@@ -6,6 +6,7 @@ import { usePolling } from '../hooks/usePolling.js';
 import { isTerminal } from '../utils/format.js';
 import DeploymentDetails from './DeploymentDetails.jsx';
 import DeploymentHistory from './DeploymentHistory.jsx';
+import NewProject from './NewProject.jsx';
 import ProjectList from './ProjectList.jsx';
 import ProjectSettings from './ProjectSettings.jsx';
 
@@ -23,6 +24,15 @@ export default function Deployments() {
   // is selected.
   const [settingsOpen, setSettingsOpen] = useState(false);
   useEffect(() => setSettingsOpen(false), [projectId]);
+
+  // The form that creates an application, in place of the selected one.
+  const [newOpen, setNewOpen] = useState(false);
+
+  async function created(newProject) {
+    await projects.reload();
+    setNewOpen(false);
+    navigate(newProject.id);
+  }
 
   // Refreshed every few seconds while any deployment is still running.
   const history = usePolling(() => (projectId ? listProjectDeployments(projectId) : Promise.resolve(null)), [projectId], {
@@ -59,20 +69,26 @@ export default function Deployments() {
         error={projects.error}
         loading={projects.loading}
         selectedId={projectId}
-        onSelect={(id) => navigate(id)}
+        onSelect={(id) => {
+          setNewOpen(false);
+          navigate(id);
+        }}
+        onNew={() => setNewOpen(true)}
       />
 
       <div className="deployments__main">
-        {!projectId && <p className="card muted">Select an application to see its deployments.</p>}
-        {projectId && projects.data && !project && (
+        {newOpen && <NewProject onCreated={created} onClose={() => setNewOpen(false)} />}
+
+        {!newOpen && !projectId && <p className="card muted">Select an application to see its deployments.</p>}
+        {!newOpen && projectId && projects.data && !project && (
           <p className="card notice notice--error">Application not found.</p>
         )}
 
-        {project && settingsOpen && (
+        {!newOpen && project && settingsOpen && (
           <ProjectSettings project={project} onSaved={projects.reload} onClose={() => setSettingsOpen(false)} />
         )}
 
-        {project && (
+        {!newOpen && project && (
           <DeploymentHistory
             project={project}
             deployments={history.data}
@@ -85,7 +101,7 @@ export default function Deployments() {
           />
         )}
 
-        {project && deploymentId && (
+        {!newOpen && project && deploymentId && (
           <DeploymentDetails
             stream={stream}
             project={project}

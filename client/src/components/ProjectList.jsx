@@ -1,15 +1,24 @@
 import { repositoryName } from '../utils/format.js';
 
-export default function ProjectList({ projects, error, loading, selectedId, onSelect }) {
+export default function ProjectList({ projects, error, loading, selectedId, onSelect, onNew }) {
   return (
     <section className="card projects" aria-labelledby="projects-heading">
-      <h2 id="projects-heading">Applications</h2>
+      <div className="card__header">
+        <h2 id="projects-heading">Applications</h2>
+        <button type="button" onClick={onNew}>
+          New
+        </button>
+      </div>
 
       {error && <p className="notice notice--error">Could not load applications: {error}</p>}
       {!error && loading && !projects && <p className="muted">Loading…</p>}
       {projects?.length === 0 && (
         <p className="muted">
-          No applications yet. Create one with <code>POST /api/projects</code> (see the README).
+          No applications yet.{' '}
+          <button type="button" className="link-button" onClick={onNew}>
+            Create your first application
+          </button>{' '}
+          to deploy a GitHub repository.
         </p>
       )}
 
