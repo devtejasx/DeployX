@@ -4,6 +4,21 @@ import SignIn from './components/SignIn.jsx';
 import SystemStatus from './components/SystemStatus.jsx';
 import { useAuth } from './hooks/useAuth.js';
 
+// The monitoring panel sits between the header and the applications, so
+// keyboard users would tab through all of its links first. The routes live in
+// the URL hash, so an ordinary "#applications" link would replace the selected
+// application: this one moves the focus instead.
+function SkipLink() {
+  function skip() {
+    document.getElementById('projects-heading')?.focus();
+  }
+  return (
+    <button type="button" className="skip-link" onClick={skip}>
+      Skip to applications
+    </button>
+  );
+}
+
 function Header({ user, onSignOut }) {
   return (
     <header className="page__header">
@@ -50,6 +65,7 @@ export default function App() {
 
   return (
     <main className="page">
+      <SkipLink />
       <Header user={auth.user} onSignOut={auth.signOut} />
       <SystemStatus />
       <Monitoring />

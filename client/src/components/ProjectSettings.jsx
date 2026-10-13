@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { updateProject } from '../api/deploymentsApi.js';
 import { repositoryName } from '../utils/format.js';
 
@@ -25,6 +25,8 @@ export default function ProjectSettings({ project, onSaved, onClose }) {
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState(null);
   const [saved, setSaved] = useState(false);
+  const id = useId();
+  const hint = { repository: `${id}-repository`, runtime: `${id}-runtime`, aws: `${id}-aws` };
 
   // The form shows what the API stored (e.g. the normalized service URL)
   // whenever the project is reloaded; messages belong to one application.
@@ -90,17 +92,24 @@ export default function ProjectSettings({ project, onSaved, onClose }) {
               onChange={change('github_repo')}
               placeholder="https://github.com/owner/repo"
               required
+              aria-describedby={hint.repository}
             />
           </label>
           <label>
             <span>Branch</span>
-            <input value={form.github_branch} onChange={change('github_branch')} placeholder="main" required />
+            <input
+              value={form.github_branch}
+              onChange={change('github_branch')}
+              placeholder="main"
+              required
+              aria-describedby={hint.repository}
+            />
           </label>
           <label>
             <span>Dockerfile path</span>
             <input value={form.dockerfile_path} onChange={change('dockerfile_path')} placeholder="Dockerfile" required />
           </label>
-          <p className="settings__hint muted">
+          <p className="settings__hint muted" id={hint.repository}>
             Owner <code>{repositoryName(project.github_repo).split('/')[0]}</code> · repository{' '}
             <code>{repositoryName(project.github_repo).split('/')[1]}</code>. Pushes to this branch are deployed
             automatically, each at its exact commit.
@@ -120,13 +129,20 @@ export default function ProjectSettings({ project, onSaved, onClose }) {
               onChange={change('container_port')}
               placeholder="3000"
               required
+              aria-describedby={hint.runtime}
             />
           </label>
           <label>
             <span>Health-check path</span>
-            <input value={form.health_check_path} onChange={change('health_check_path')} placeholder="/health" required />
+            <input
+              value={form.health_check_path}
+              onChange={change('health_check_path')}
+              placeholder="/health"
+              required
+              aria-describedby={hint.runtime}
+            />
           </label>
-          <p className="settings__hint muted">
+          <p className="settings__hint muted" id={hint.runtime}>
             A deployment becomes <code>SUCCESS</code> only when this path answers with a 2xx status on the container
             port (or on the service URL on AWS); otherwise the last stable version is restored.
           </p>
@@ -145,7 +161,13 @@ export default function ProjectSettings({ project, onSaved, onClose }) {
             <>
               <label>
                 <span>ECS service</span>
-                <input value={form.aws_ecs_service} onChange={change('aws_ecs_service')} placeholder="my-app" required />
+                <input
+                  value={form.aws_ecs_service}
+                  onChange={change('aws_ecs_service')}
+                  placeholder="my-app"
+                  required
+                  aria-describedby={hint.aws}
+                />
               </label>
               <label>
                 <span>Service URL</span>
@@ -155,9 +177,10 @@ export default function ProjectSettings({ project, onSaved, onClose }) {
                   onChange={change('aws_service_url')}
                   placeholder="https://my-app.example.com"
                   required
+                  aria-describedby={hint.aws}
                 />
               </label>
-              <p className="settings__hint muted">
+              <p className="settings__hint muted" id={hint.aws}>
                 The service must already exist in the worker's ECS cluster. Each deployment pushes the image to ECR,
                 updates this service to it, and checks <code>{project.health_check_path}</code> on the service URL.
               </p>

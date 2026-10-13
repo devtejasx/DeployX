@@ -74,3 +74,35 @@ describe('log viewer', () => {
     expect(statuses).toContain('Deployment failed its health check. The previous stable version was restored.');
   });
 });
+
+describe('keyboard and form help', () => {
+  test('the skip link moves the focus to the applications without changing the route', async () => {
+    const { default: App } = await import('../src/App.jsx');
+    const { fakeApi, ok, overview, SYSTEM_STATUS } = await import('./fakeApi.js');
+    fakeApi({
+      'GET /api/auth/me': ok({ user: { id: 'u1', name: 'Ada', email: 'ada@example.com', role: 'USER' } }),
+      'GET /api/system/status': SYSTEM_STATUS,
+      'GET /api/monitoring/overview': ok(overview()),
+      'GET /api/projects': ok([]),
+    });
+    window.location.hash = '#/projects/0f8fad5b-d9cb-469f-a165-70867728950e';
+    render(<App />);
+    const skip = await screen.findByRole('button', { name: 'Skip to applications' });
+    skip.click();
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Applications' }));
+    expect(window.location.hash).toBe('#/projects/0f8fad5b-d9cb-469f-a165-70867728950e');
+    window.location.hash = '';
+  });
+
+  test('form hints are read out with the fields they explain', async () => {
+    const { default: NewProject } = await import('../src/components/NewProject.jsx');
+    render(<NewProject onCreated={() => {}} onClose={() => {}} />);
+    const describedBy = (label) => {
+      const ids = screen.getByLabelText(label).getAttribute('aria-describedby');
+      return document.getElementById(ids).textContent;
+    };
+    expect(describedBy('Dockerfile path')).toContain('Relative to the repository root');
+    expect(describedBy('Container port')).toContain('The port the app listens on');
+    expect(describedBy('Health-check path')).toContain('2xx status');
+  });
+});

@@ -4,7 +4,9 @@ export default function ProjectList({ projects, error, loading, selectedId, onSe
   return (
     <section className="card projects" aria-labelledby="projects-heading">
       <div className="card__header">
-        <h2 id="projects-heading">Applications</h2>
+        <h2 id="projects-heading" tabIndex={-1}>
+          Applications
+        </h2>
         <button type="button" onClick={onNew}>
           New
         </button>

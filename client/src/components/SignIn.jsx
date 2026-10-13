@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { register, signIn } from '../api/authApi.js';
 
 // Sign-in and (where the server allows it) registration. The password only
@@ -11,6 +11,7 @@ export default function SignIn({ onSignedIn }) {
   const [errors, setErrors] = useState(null);
 
   const registering = mode === 'register';
+  const passwordHint = useId();
 
   function change(field) {
     return (event) => setForm((current) => ({ ...current, [field]: event.target.value }));
@@ -63,9 +64,14 @@ export default function SignIn({ onSignedIn }) {
             required
             minLength={registering ? 12 : 1}
             maxLength={256}
+            aria-describedby={registering ? passwordHint : undefined}
           />
         </label>
-        {registering && <p className="settings__hint muted">At least 12 characters.</p>}
+        {registering && (
+          <p className="settings__hint muted" id={passwordHint}>
+            At least 12 characters.
+          </p>
+        )}
 
         {errors && (
           <div className="notice notice--error" role="alert">

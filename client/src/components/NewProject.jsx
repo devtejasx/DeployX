@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { createProject } from '../api/deploymentsApi.js';
 
 const EMPTY_FORM = {
@@ -18,6 +18,8 @@ export default function NewProject({ onCreated, onClose }) {
   const [form, setForm] = useState(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState(null);
+  const id = useId();
+  const hint = { repository: `${id}-repository`, runtime: `${id}-runtime` };
 
   function change(field) {
     return (event) => setForm((current) => ({ ...current, [field]: event.target.value }));
@@ -73,6 +75,7 @@ export default function NewProject({ onCreated, onClose }) {
               onChange={change('github_repo')}
               placeholder="https://github.com/owner/repo"
               required
+              aria-describedby={hint.repository}
             />
           </label>
           <label>
@@ -81,9 +84,15 @@ export default function NewProject({ onCreated, onClose }) {
           </label>
           <label>
             <span>Dockerfile path</span>
-            <input value={form.dockerfile_path} onChange={change('dockerfile_path')} placeholder="Dockerfile" required />
+            <input
+              value={form.dockerfile_path}
+              onChange={change('dockerfile_path')}
+              placeholder="Dockerfile"
+              required
+              aria-describedby={hint.repository}
+            />
           </label>
-          <p className="settings__hint muted">
+          <p className="settings__hint muted" id={hint.repository}>
             Relative to the repository root, which is also the build context. To try DeployX, use{' '}
             <code>https://github.com/devtejasx/DeployX</code> with <code>examples/hello-app/Dockerfile</code>.
           </p>
@@ -102,13 +111,20 @@ export default function NewProject({ onCreated, onClose }) {
               onChange={change('container_port')}
               placeholder="3000"
               required
+              aria-describedby={hint.runtime}
             />
           </label>
           <label>
             <span>Health-check path</span>
-            <input value={form.health_check_path} onChange={change('health_check_path')} placeholder="/health" required />
+            <input
+              value={form.health_check_path}
+              onChange={change('health_check_path')}
+              placeholder="/health"
+              required
+              aria-describedby={hint.runtime}
+            />
           </label>
-          <p className="settings__hint muted">
+          <p className="settings__hint muted" id={hint.runtime}>
             The port the app listens on inside its container. A deployment becomes <code>SUCCESS</code> only when this
             path answers with a 2xx status; otherwise the last stable version is restored.
           </p>
