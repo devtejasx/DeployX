@@ -143,7 +143,7 @@ The demo data lives in your local development database. To remove the demo appli
 curl -X DELETE -b cookies.txt http://localhost:5000/api/projects/<projectId>
 # the API deliberately has no Docker access, so remove the app containers and images yourself:
 docker rm -f $(docker ps -aq --filter label=deployx.project=<projectId>)
-docker image rm $(docker image ls -q "deployx/demo-rollback-*")
+docker image rm $(docker image ls "deployx/demo-rollback-*" --format "{{.Repository}}:{{.Tag}}")   # by tag: each image has several
 ```
 
 `docker compose down -v` removes everything instead, including all DeployX data.

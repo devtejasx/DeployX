@@ -134,7 +134,7 @@ In the dashboard: **New** (under Applications) → repository `https://github.co
 
 | Suite | Command | Result (2026-10-13) |
 | ----- | ------- | ------------------- |
-| API, worker, integration, security, reliability (needs `npm run infra:up`) | `npm test` | **380/380** passed, ~100 s |
+| API, worker, integration, security, reliability (needs `npm run infra:up`) | `npm test` | **382/382** passed, ~95 s |
 | Dashboard (Vitest, jsdom) | `npm run test:client` | **30/30** passed, ~2 s |
 | Docker end to end: real clone from GitHub, build, run, health check, rollback | `npm run test:docker` | **11/11** passed, ~2.5 min |
 | Dashboard production build | `npm run build:client` | passes |

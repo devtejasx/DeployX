@@ -303,5 +303,7 @@ GitHub ─ push ─▶ Webhook (HMAC) ─▶ API ─▶ PostgreSQL (source of tr
 - [x] Dashboard usability fixes, each with frontend tests (22 → 30)
 - [x] Repeatable demo (`npm run demo`) run against the local stack; demo guide with the recorded output
 - [x] Genuine screenshots of the running dashboard
-- [x] 380 regular, 30 frontend and 11 Docker tests pass; client build passes
+- [x] Setup verified from a fresh clone with empty volumes; a malformed line in `.env.example` that made Compose refuse the file fixed, with a test for both example files
+- [x] `npm audit` clean for the API, worker and dashboard
+- [x] 382 regular, 30 frontend and 11 Docker tests pass; client build passes
 - [ ] **Real AWS deployment: still not run; no `v1.0.0` tag**

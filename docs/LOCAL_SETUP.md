@@ -34,6 +34,8 @@ Then create the first administrator, in either of two ways:
 
   Running on the host instead (`npm run install:all` done), `npm run user:create -- --email … --role ADMIN` does the same from the repository root.
 
+**Verified from scratch on 2026-10-13:** a fresh clone of `main` with `.env` copied from `.env.example` (after fixing a malformed comment line in it that made Compose refuse the file; a test now checks both example files), empty volumes and the default ports came up with every service healthy, `user:create` created the first ADMIN, and `npm run demo` passed (healthy deploy, failed health check, rollback completed) in 32 s.
+
 Sign in at http://localhost:3000, click **New** under Applications and create an application from this repository (`https://github.com/devtejasx/DeployX`, Dockerfile path `examples/hello-app/Dockerfile`, port `3000`), then **Deploy**. For the full walkthrough, including an automatic rollback, follow the [demo guide](DEMO_GUIDE.md) or run `npm run demo`.
 
 On Windows, if PostgreSQL's port is reserved by the system, set `POSTGRES_PORT` and the port in `DATABASE_URL` to a free one such as `15432` (see [Troubleshooting](TROUBLESHOOTING.md#setup-and-local-development)).
@@ -158,7 +160,7 @@ npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The default suite (380 tests, about 100 s; last run 2026-10-13: 380 passed; no Docker, AWS or network needed) covers:
+The default suite (382 tests, about 95 s; last run 2026-10-13: 382 passed; no Docker, AWS or network needed) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
