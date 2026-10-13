@@ -13,8 +13,10 @@ Small apps used to test the Docker deployment pipeline (Phase 4) and health chec
 
 Each Dockerfile has a `Dockerfile.dockerignore` next to it, so the build context sent to Docker contains only the files that app needs, not the whole repository.
 
+In the dashboard, click **New** under Applications and enter these values. With the API (after [signing in with curl](../docs/API.md#calling-the-api-from-the-command-line)):
+
 ```bash
-curl -X POST http://localhost:5000/api/projects -H "Content-Type: application/json" -d '{
+curl -X POST -b cookies.txt http://localhost:5000/api/projects -H "Content-Type: application/json" -d '{
   "name": "hello-app",
   "github_repo": "https://github.com/devtejasx/DeployX",
   "github_branch": "main",
@@ -27,12 +29,12 @@ DeployX checks each app on the project's `health_check_path`, which defaults to 
 
 ## Trying a rollback
 
-Deploy `hello-app` first, so the project has a stable deployment. Then point the same project at `unhealthy-app` and deploy again:
+`npm run demo` does this whole scenario and checks every outcome (see the [demo guide](../docs/DEMO_GUIDE.md)). By hand: deploy `hello-app` first, so the project has a stable deployment. Then point the same project at `unhealthy-app` (**Settings** → Dockerfile path) and deploy again:
 
 ```bash
-curl -X PUT http://localhost:5000/api/projects/<projectId> -H "Content-Type: application/json" \
+curl -X PUT -b cookies.txt http://localhost:5000/api/projects/<projectId> -H "Content-Type: application/json" \
   -d '{ "dockerfile_path": "examples/unhealthy-app/Dockerfile" }'
-curl -X POST http://localhost:5000/api/projects/<projectId>/deployments -H "Content-Type: application/json" -d '{}'
+curl -X POST -b cookies.txt http://localhost:5000/api/projects/<projectId>/deployments -H "Content-Type: application/json" -d '{}'
 ```
 
-The second deployment fails its health check, ends as `FAILED` with `rollback_status: "COMPLETED"`, and `hello-app` keeps answering on its port. Deployed as a project's **first** deployment, `unhealthy-app` ends as `FAILED` with `rollback_status: "NOT_AVAILABLE"`: there is no stable deployment to go back to. See "Phase 6 — Health Checks & Automatic Rollback" in the main [README](../README.md).
+The second deployment fails its health check, ends as `FAILED` with `rollback_status: "COMPLETED"`, and `hello-app` keeps answering on its port. Deployed as a project's **first** deployment, `unhealthy-app` ends as `FAILED` with `rollback_status: "NOT_AVAILABLE"`: there is no stable deployment to go back to. See [Health checks and automatic rollback](../docs/DEPLOYMENT_LIFECYCLE.md#health-checks-and-automatic-rollback).
