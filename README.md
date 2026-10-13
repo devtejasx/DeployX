@@ -4,7 +4,7 @@ A self-service deployment platform: connect a GitHub repository, and every deplo
 
 ![Deployment that failed its health check and was rolled back automatically](docs/screenshots/deployment-rollback.png)
 
-> **Status.** Built in nine phases and validated in a real environment (real GitHub webhooks, real Docker deployments and rollbacks, injected outages, 78 live security checks, backup and restore): see the [Phase 9 validation report](docs/PHASE9_VALIDATION.md). **The AWS ECR/ECS target is implemented and tested against fake AWS endpoints, but it has not been validated against real AWS infrastructure**, so there is no `v1.0.0` release yet.
+> **Status.** Built in nine phases and validated in a real environment (real GitHub webhooks, real Docker deployments and rollbacks, injected outages, 78 live security checks, backup and restore): see the [Phase 9 validation report](docs/PHASE9_VALIDATION.md). **The AWS ECR/ECS target is implemented and tested against fake AWS endpoints, but it has not been validated against real AWS infrastructure**, so there is no `v1.0.0` release yet. For a one-page summary of the problem, the engineering decisions and the evidence, see the [project overview](docs/PROJECT_OVERVIEW.md).
 
 ## Key capabilities
 
@@ -70,6 +70,8 @@ Captured from the running application on 2026-10-13 (local Docker Compose stack,
 | Dashboard and monitoring | Healthy deployment |
 | ------------------------ | ------------------ |
 | ![Dashboard with system status, monitoring and deployment history](docs/screenshots/dashboard.png) | ![A healthy deployment with its health check and live logs](docs/screenshots/deployment-success.png) |
+| **Deployment in progress, live logs** | **Sign-in** |
+| ![A deployment during its health check, logs streaming live](docs/screenshots/deployment-live.png) | ![The sign-in page](docs/screenshots/sign-in.png) |
 
 ## Getting started
 
@@ -110,7 +112,7 @@ read -rs DEMO_PASSWORD && export DEMO_PASSWORD           # its password, not ech
 npm run demo
 ```
 
-`npm run demo` creates an application for `examples/hello-app`, deploys it to `SUCCESS`, points it at `examples/unhealthy-app`, deploys again, checks that the health check fails five times and the rollback restores the first version, verifies that version still answers, and prints dashboard links. Run twice on 2026-10-13, it completed in 33 s each time. The [demo guide](docs/DEMO_GUIDE.md) has the recorded output and the same walkthrough in the dashboard, step by step with what to expect.
+`npm run demo` creates an application for `examples/hello-app`, deploys it to `SUCCESS`, points it at `examples/unhealthy-app`, deploys again, checks that the health check fails five times and the rollback restores the first version, verifies that version still answers, and prints dashboard links. Run three times on 2026-10-13, it passed each time in 32–33 s. The [demo guide](docs/DEMO_GUIDE.md) has the recorded output and the same walkthrough in the dashboard, step by step with what to expect.
 
 In the dashboard: **New** (under Applications) → repository `https://github.com/devtejasx/DeployX`, Dockerfile path `examples/hello-app/Dockerfile`, port `3000` → **Deploy**. To see a rollback, change the Dockerfile path to `examples/unhealthy-app/Dockerfile` in **Settings** and deploy again.
 
@@ -128,15 +130,17 @@ In the dashboard: **New** (under Applications) → repository `https://github.co
 
 **Live logs.** `GET /api/deployments/:id/logs/stream` sends the stored lines, then every new line and status change as Server-Sent Events, resumes after a disconnect with `Last-Event-ID`, and falls back to reading PostgreSQL if Redis events are lost. → [Real-time deployment logs](docs/DEPLOYMENT_LIFECYCLE.md#real-time-deployment-logs)
 
+**Dashboard.** Applications, settings, deployment history and details with lifecycle steps, health-check and rollback boxes, and live logs; it follows the system light or dark theme, works from phone width up, meets WCAG AA text contrast, and can be used with the keyboard (a skip link, form hints read with their fields, live regions that announce progress without reading every log line). → [Dashboard](docs/ARCHITECTURE.md#dashboard)
+
 **Monitoring.** The dashboard's monitoring panel shows alerts, applications by state, worker heartbeats, the queue and recent failures. The API and worker expose `/health`, `/ready` and Prometheus `/metrics`; alert rules are in [`monitoring/`](monitoring). → [Operations](docs/OPERATIONS.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
 ## Tests
 
 | Suite | Command | Result (2026-10-13) |
 | ----- | ------- | ------------------- |
-| API, worker, integration, security, reliability (needs `npm run infra:up`) | `npm test` | **382/382** passed, ~95 s |
-| Dashboard (Vitest, jsdom) | `npm run test:client` | **30/30** passed, ~2 s |
-| Docker end to end: real clone from GitHub, build, run, health check, rollback | `npm run test:docker` | **11/11** passed, ~2.5 min |
+| API, worker, integration, security, reliability (needs `npm run infra:up`) | `npm test` | **382/382** passed, ~90 s |
+| Dashboard (Vitest, jsdom) | `npm run test:client` | **38/38** passed, ~2 s |
+| Docker end to end: real clone from GitHub, build, run, health check, rollback | `npm run test:docker` | **11/11** passed, ~2.3 min |
 | Dashboard production build | `npm run build:client` | passes |
 
 No suite needs AWS: the AWS path is tested against fake ECR and ECS endpoints. The real-environment validation (real webhooks, outages, security checks, backup and restore) is in the [Phase 9 report](docs/PHASE9_VALIDATION.md). → [Testing](docs/LOCAL_SETUP.md#testing)
@@ -148,6 +152,19 @@ No suite needs AWS: the AWS path is tested against fake ECR and ECS endpoints. T
 - **Local apps do not come back after a Docker host restart** (they run with `--restart no`); redeploy each application's stable commit.
 - No build secrets or per-application environment variables; no OAuth/SSO, MFA, password reset or user-management UI; one ADMIN/USER role pair.
 - The Compose file is a development stack: production needs HTTPS, private PostgreSQL/Redis, real secrets and the [production checklist](docs/OPERATIONS.md#production-checklist).
+
+## Release checklist
+
+The state of the release checklist from the [Phase 9 report](docs/PHASE9_VALIDATION.md#step-17--release-checklist), brought up to date:
+
+- [x] Working tree clean, no secrets committed (history scanned in Phase 9; changed files scanned since)
+- [x] Documentation complete; `.env.example` and `.env.production.example` complete and valid for Docker Compose (checked by a test)
+- [x] Database migrations verified on an empty database, by restore and by down/up on a copy
+- [x] API/worker, frontend and Docker end-to-end tests pass; frontend production build passes; `npm audit` clean
+- [x] Setup verified from a fresh clone with empty volumes; the repeatable demo passes
+- [x] Real GitHub webhook, health check, rollback, monitoring, backup/restore and 78 live security checks (Phase 9, local Docker)
+- [ ] **Real AWS deployment: ECR push, ECS rollout, health check and rollback against a real account**
+- [ ] Tag `v1.0.0`, only after the item above passes
 
 ## Roadmap
 
@@ -169,4 +186,5 @@ No suite needs AWS: the AWS path is tested against fake ECR and ECS endpoints. T
 | [API reference](docs/API.md) | endpoints, request and response formats, calling the API with curl |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | common problems and fixes |
 | [Phase 9 validation report](docs/PHASE9_VALIDATION.md) | real-environment validation evidence |
-| [Development history](docs/PHASES.md) | what each of the nine phases added |
+| [Project overview](docs/PROJECT_OVERVIEW.md) | the problem, key engineering decisions, evidence and limitations on one page |
+| [Development history](docs/PHASES.md) | what each phase added |

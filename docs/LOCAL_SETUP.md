@@ -160,7 +160,7 @@ npm run infra:up          # PostgreSQL + Redis must be running
 npm test                  # = npm --prefix server test
 ```
 
-The default suite (382 tests, about 95 s; last run 2026-10-13: 382 passed; no Docker, AWS or network needed) covers:
+The default suite (382 tests, about 90 s; last run 2026-10-13: 382 passed; no Docker, AWS or network needed) covers:
 
 - every endpoint with valid requests
 - missing and invalid fields, read-only fields, and non-object bodies
@@ -218,17 +218,17 @@ The real-environment validation (real GitHub webhooks, deployments, rollbacks, i
 ### Frontend tests
 
 ```bash
-npm run test:client       # 30 tests, about 2 s (Vitest, jsdom; no API needed)
+npm run test:client       # 38 tests, about 2 s (Vitest, jsdom; no API needed)
 ```
 
-They cover the API client, sign-in and session expiry, nothing stored in the browser, API data rendered as text, the monitoring panel, creating an application and editing its settings (the request sent and the API's validation messages), the empty states, the deployment history's times, and source scans for the security rules; see [Frontend security](SECURITY.md#frontend-security).
+They cover the API client, sign-in and session expiry, nothing stored in the browser, API data rendered as text, the monitoring panel, creating an application and editing its settings (the request sent and the API's validation messages), the empty states, the deployment history's times, accessibility (text contrast computed from `index.css` in both themes, live regions, the skip link, form hints tied to their fields), and source scans for the security rules; see [Frontend security](SECURITY.md#frontend-security).
 
 ### Docker end-to-end tests
 
 These tests run the **real pipeline**: they clone this repository from GitHub, build the [example apps](../examples) with Docker and start containers. They need network access and a Docker daemon, so they're **opt-in**:
 
 ```bash
-npm run test:docker       # 11 tests, about 2.5 min
+npm run test:docker       # 11 tests, about 2.5 min (last run 2026-10-13: 11 passed)
 ```
 
 | Test | Checks |

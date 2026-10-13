@@ -79,7 +79,7 @@ DeployX was built in nine phases, each delivered as a series of commits straight
 **Phase 10 (documentation, usability and demo)**
 
 - The phase-ordered README became a short overview plus topic documents in `docs/`, checked against the code (stale schema, curl examples without a session, an outdated audit result corrected)
-- Dashboard: create applications, edit the Dockerfile path, port and health-check path, one time format, clearer empty states, a history table that fits
+- Dashboard: create applications, edit the Dockerfile path, port and health-check path, one time format, clearer empty states, a history table that fits, WCAG AA contrast, a skip link, form hints for screen readers, quieter live regions
 - `npm run demo`: a repeatable healthy → unhealthy → rollback demo through the API, and genuine screenshots captured from the running stack
 
 ## Phase 7 audit: what existed and what was added
@@ -305,5 +305,7 @@ GitHub ─ push ─▶ Webhook (HMAC) ─▶ API ─▶ PostgreSQL (source of tr
 - [x] Genuine screenshots of the running dashboard
 - [x] Setup verified from a fresh clone with empty volumes; a malformed line in `.env.example` that made Compose refuse the file fixed, with a test for both example files
 - [x] `npm audit` clean for the API, worker and dashboard
-- [x] 382 regular, 30 frontend and 11 Docker tests pass; client build passes
+- [x] Accessibility audit of the running dashboard (contrast, live regions, keyboard, form hints) and the issues it found fixed; the history fits from 1024 px
+- [x] Project overview for reviewers (problem, engineering decisions, evidence, limitations) and a release checklist in the README
+- [x] 382 regular, 38 frontend and 11 Docker tests pass; client build passes
 - [ ] **Real AWS deployment: still not run; no `v1.0.0` tag**
