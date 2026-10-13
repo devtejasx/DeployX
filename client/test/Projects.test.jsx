@@ -4,6 +4,7 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import App from '../src/App.jsx';
+import { formatDateTime, formatDayTime, formatTime } from '../src/utils/format.js';
 import { SYSTEM_STATUS, fail, fakeApi, ok, overview } from './fakeApi.js';
 
 afterEach(() => {
@@ -143,5 +144,69 @@ describe('application settings', () => {
       health_check_path: '/ready',
     });
     expect(within(form).getByLabelText('Dockerfile path').value).toBe('examples/unhealthy-app/Dockerfile');
+  });
+});
+
+describe('empty states and times', () => {
+  test('with no applications only the list explains what to do', async () => {
+    fakeApi(routes({ 'GET /api/projects': ok([]) }));
+    render(<App />);
+    await screen.findByRole('button', { name: 'Create your first application' });
+    expect(screen.queryByText('Select an application to see its deployments.')).toBeNull();
+  });
+
+  test('an application without deployments says what Deploy does', async () => {
+    fakeApi(
+      routes({
+        'GET /api/projects': ok([PROJECT]),
+        [`GET /api/projects/${PROJECT.id}/deployments`]: ok([]),
+      }),
+    );
+    window.location.hash = `#/projects/${PROJECT.id}`;
+    render(<App />);
+    expect((await screen.findByText(/No deployments yet/)).textContent).toContain('builds the head of main');
+  });
+
+  test('system status and monitoring show times in the same format', async () => {
+    fakeApi(routes({ 'GET /api/projects': ok([]) }));
+    render(<App />);
+    const checked = await screen.findByText(/^Last checked /);
+    const updated = await screen.findByText(/^Updated /);
+    // Both come from the same timestamp in the fake API.
+    expect(checked.textContent.replace('Last checked ', '')).toBe(updated.textContent.replace('Updated ', ''));
+  });
+});
+
+describe('deployment history', () => {
+  test('times are short so every column fits, with the full date in the tooltip', async () => {
+    const deployment = {
+      id: '7c9e6679-7425-40de-944b-e07fc1f90ae7',
+      project_id: PROJECT.id,
+      status: 'SUCCESS',
+      trigger: 'MANUAL',
+      deployment_target: 'LOCAL',
+      commit_sha: 'fa0221c1c14cdf37eb62b74615188684c437432d',
+      created_at: '2026-10-13T12:52:18Z',
+      started_at: '2026-10-13T12:52:18Z',
+      finished_at: '2026-10-13T12:52:31Z',
+      is_stable: true,
+    };
+    fakeApi(
+      routes({
+        'GET /api/projects': ok([PROJECT]),
+        [`GET /api/projects/${PROJECT.id}/deployments`]: ok([deployment]),
+      }),
+    );
+    window.location.hash = `#/projects/${PROJECT.id}`;
+    render(<App />);
+    const row = (await screen.findByText('#1')).closest('tr');
+    const cells = within(row).getAllByRole('cell');
+    const finished = cells.at(-2);
+    expect(finished.textContent).toBe(formatTime(deployment.finished_at));
+    expect(finished.getAttribute('title')).toBe(formatDateTime(deployment.finished_at));
+    expect(cells.at(-1).textContent).toBe('13s');
+    const created = cells.at(-4);
+    expect(created.textContent).toBe(formatDayTime(deployment.created_at));
+    expect(created.getAttribute('title')).toBe(formatDateTime(deployment.created_at));
   });
 });

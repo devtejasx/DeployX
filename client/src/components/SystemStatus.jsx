@@ -1,5 +1,6 @@
 import StatusRow from './StatusRow.jsx';
 import { useSystemStatus } from '../hooks/useSystemStatus.js';
+import { formatTime } from '../utils/format.js';
 
 // The Phase 1 system status card (API, database, Redis), unchanged.
 export default function SystemStatus() {
@@ -28,7 +29,7 @@ export default function SystemStatus() {
 
       <p className="card__footer">
         {error && `Could not reach the API: ${error}`}
-        {status && `Last checked ${new Date(status.checkedAt).toLocaleTimeString()}`}
+        {status && `Last checked ${formatTime(status.checkedAt)}`}
       </p>
     </section>
   );

@@ -79,7 +79,10 @@ export default function Deployments() {
       <div className="deployments__main">
         {newOpen && <NewProject onCreated={created} onClose={() => setNewOpen(false)} />}
 
-        {!newOpen && !projectId && <p className="card muted">Select an application to see its deployments.</p>}
+        {/* With no applications at all, the list itself says how to create one. */}
+        {!newOpen && !projectId && projects.data?.length > 0 && (
+          <p className="card muted">Select an application to see its deployments.</p>
+        )}
         {!newOpen && projectId && projects.data && !project && (
           <p className="card notice notice--error">Application not found.</p>
         )}

@@ -13,6 +13,7 @@ const dateTimeFormat = new Intl.DateTimeFormat(undefined, {
   hour: '2-digit',
   minute: '2-digit',
   second: '2-digit',
+  hour12: false,
 });
 
 const timeFormat = new Intl.DateTimeFormat(undefined, {
@@ -24,6 +25,20 @@ const timeFormat = new Intl.DateTimeFormat(undefined, {
 
 export function formatDateTime(value) {
   return value ? dateTimeFormat.format(new Date(value)) : '—';
+}
+
+// '13 Oct, 15:05:19': a date and time without the year, for tables.
+const dayTimeFormat = new Intl.DateTimeFormat(undefined, {
+  month: 'short',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
+export function formatDayTime(value) {
+  return value ? dayTimeFormat.format(new Date(value)) : '—';
 }
 
 export function formatTime(value) {

@@ -2,7 +2,9 @@ import { useState } from 'react';
 import StatusBadge from './StatusBadge.jsx';
 import {
   formatDateTime,
+  formatDayTime,
   formatDuration,
+  formatTime,
   repositoryName,
   shortId,
   shortSha,
@@ -92,7 +94,12 @@ export default function DeploymentHistory({
       {deployError && <p className="notice notice--error">{deployError}</p>}
       {error && <p className="notice notice--error">Could not load deployments: {error}</p>}
       {!error && loading && !deployments && <p className="muted">Loading…</p>}
-      {deployments?.length === 0 && <p className="muted">No deployments yet.</p>}
+      {deployments?.length === 0 && (
+        <p className="muted">
+          No deployments yet. <strong>Deploy</strong> builds the head of <code>{project.github_branch}</code>; pushes to
+          that branch are deployed automatically once the GitHub webhook is set up (see Settings).
+        </p>
+      )}
 
       {deployments?.length > 0 && (
         <div className="table-scroll">
@@ -148,9 +155,15 @@ export default function DeploymentHistory({
                       </div>
                     )}
                   </td>
-                  <td>{formatDateTime(deployment.created_at)}</td>
-                  <td>{formatDateTime(deployment.started_at)}</td>
-                  <td>{formatDateTime(deployment.finished_at)}</td>
+                  <td title={formatDateTime(deployment.created_at)}>{formatDayTime(deployment.created_at)}</td>
+                  {/* The table shows short times so that every column fits on a laptop
+                      screen; the full dates are in the tooltips. */}
+                  <td title={deployment.started_at ? formatDateTime(deployment.started_at) : undefined}>
+                    {formatTime(deployment.started_at) || '—'}
+                  </td>
+                  <td title={deployment.finished_at ? formatDateTime(deployment.finished_at) : undefined}>
+                    {formatTime(deployment.finished_at) || '—'}
+                  </td>
                   <td>{formatDuration(deployment.started_at, deployment.finished_at)}</td>
                 </tr>
               ))}
